@@ -89,6 +89,7 @@ def _read_xlsx_urls(path: str) -> List[str]:
 
 
 def read_url_list(path: str) -> List[str]:
+    """Load URLs from text/CSV/XLSX (or text-like XLS) list files."""
     lower = path.lower()
     try:
         with open(path, "rb") as f:
@@ -114,10 +115,12 @@ def read_url_list(path: str) -> List[str]:
 
 
 def ensure_dir(path: str) -> None:
+    """Create a directory if it does not already exist."""
     os.makedirs(path, exist_ok=True)
 
 
 def derive_base_name(url: str, fallback_index: int) -> str:
+    """Derive a safe base filename from a URL, with index fallback."""
     parsed = urlsplit(url)
     candidate = os.path.basename(parsed.path)
     if not candidate:
@@ -128,6 +131,7 @@ def derive_base_name(url: str, fallback_index: int) -> str:
 
 
 def download_dem(url: str, download_dir: str, fallback_index: int) -> str:
+    """Download a GeoTIFF with caching; return the local path."""
     ensure_dir(download_dir)
     ensure_dir(CACHE_DIR)
     base_name = derive_base_name(url, fallback_index)

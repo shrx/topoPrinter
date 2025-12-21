@@ -19,6 +19,7 @@ def dem_to_vertices_and_faces(
     lake_range_percent: float = 0.0,
     lake_lowering_mm: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, float, Optional[np.ndarray]]:
+    """Convert a DEM grid into watertight mesh vertices/faces and optional lake faces."""
     rows, cols = dem.shape
     aspect_ratio = (rows * px_size_y) / (cols * px_size_x)
     model_y_mm = x_size_mm * aspect_ratio
@@ -189,6 +190,7 @@ def dem_to_vertices_and_faces(
 
 
 def save_stl(vertices: np.ndarray, faces: np.ndarray, output_path: str) -> None:
+    """Write vertices/faces to a binary STL file."""
     vectors = np.zeros((faces.shape[0], 3, 3), dtype=np.float32)
     for i, face in enumerate(faces):
         vectors[i] = vertices[face]

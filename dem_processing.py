@@ -10,6 +10,7 @@ from rasterio.merge import merge
 
 
 def fill_nodata(arr: np.ndarray, nodata_value) -> np.ndarray:
+    """Replace nodata/NaN cells with the minimum valid elevation."""
     data = arr.astype(np.float64, copy=False)
     mask = ~np.isfinite(data)
     if nodata_value is not None:
@@ -26,6 +27,7 @@ def fill_nodata(arr: np.ndarray, nodata_value) -> np.ndarray:
 
 
 def _gather_metadata(paths: Iterable[str]) -> Tuple[float, float, float, object]:
+    """Collect pixel sizes, nodata, and CRS consistency checks for merge."""
     paths = list(paths)
     if not paths:
         raise ValueError("No DEM datasets provided for merge.")
@@ -49,6 +51,7 @@ def _gather_metadata(paths: Iterable[str]) -> Tuple[float, float, float, object]
 
 
 def load_and_merge(paths: Iterable[str], downsample: int) -> Tuple[np.ndarray, float, float]:
+    """Merge DEM tiles, fill nodata, and optionally downsample the grid."""
     if downsample < 1:
         raise ValueError("downsample must be >= 1")
 

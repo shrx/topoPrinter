@@ -44,8 +44,7 @@ All URLs in the list are merged into a single mosaic.
 
 ## Getting SwissTopo URLs (step-by-step)
 
-Use the SwissTopo swissALTI3D coordinate tool to define your rectangle, then export the link list as CSV.
-Page: https://www.swisstopo.admin.ch/en/height-model-swissalti3d
+Define your rectangle area in the SwissTopo swissALTI3D tool (https://www.swisstopo.admin.ch/en/height-model-swissalti3d), then export the link list as CSV.
 Place the CSV in your project folder (or a subfolder like `xls_inputs/`) and pass it to `--url-list`.
 
 ![SwissTopo coordinate-based region selection](docs/images/Alti3D_RegionSelection.png)
