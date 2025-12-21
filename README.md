@@ -64,6 +64,12 @@ You can import the generated `.stl` into Blender to preview the terrain mesh.
 
 ![Blender preview of a swissALTI3D tile](docs/images/BlenderRender_Rigi_40x20.png)
 
+## Physical 3D-printed result
+
+Example of what a finished print can look like after generating the STL from SwissTopo data and previewing it in Blender.
+
+![Physical 3D-printed relief block](docs/images/PrintedReliefBlock_PhysicalOutput.jpeg)
+
 ## Outputs
 
 - A single STL named after the URL list file and first tile, with `_mosaic` if more than one DEM is used.
