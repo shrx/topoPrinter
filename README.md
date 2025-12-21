@@ -66,7 +66,7 @@ You can import the generated `.stl` into Blender to preview the terrain mesh.
 
 ## Physical 3D-printed result
 
-Example of what a finished print can look like after generating the STL from SwissTopo data and previewing it in Blender.
+Example of what a finished print can look like:
 
 ![Physical 3D-printed relief block](docs/images/PrintedReliefBlock_PhysicalOutput.jpeg)
 
