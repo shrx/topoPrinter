@@ -42,6 +42,28 @@ pip install -r requirements.txt
 
 All URLs in the list are merged into a single mosaic.
 
+## Getting SwissTopo URLs (step-by-step)
+
+Use the SwissTopo swissALTI3D coordinate tool to define your rectangle, then export the link list as CSV.
+Page: https://www.swisstopo.admin.ch/en/height-model-swissalti3d
+Place the CSV in your project folder (or a subfolder like `xls_inputs/`) and pass it to `--url-list`.
+
+![SwissTopo coordinate-based region selection](docs/images/Alti3D_RegionSelection.png)
+
+Description of the screenshot:
+1. Enter coordinate bounds for your rectangle region.
+2. Generate and copy the list of links in CSV form.
+3. Save the CSV and use it with `--url-list` (for example, place it under `xls_inputs/`).
+
+SwissTopo provides GeoTIFF (`.tif`) DEM tiles. This tool converts those `.tif` files into a printable `.stl`,
+which you can preview in Blender before sending to your 3D printer.
+
+## Visualizing the STL in Blender
+
+You can import the generated `.stl` into Blender to preview the terrain mesh.
+
+![Blender preview of a swissALTI3D tile](docs/images/BlenderRender_Rigi_40x20.png)
+
 ## Outputs
 
 - A single STL named after the URL list file and first tile, with `_mosaic` if more than one DEM is used.
