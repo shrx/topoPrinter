@@ -52,7 +52,7 @@ Place the CSV in your project folder (or a subfolder like `xls_inputs/`) and pas
 
 Description of the screenshot:
 1. Enter coordinate bounds for your rectangle region.
-2. Generate and copy the list of links in CSV form.
+2. Press the "Export all links" button (bottom-right) to generate and copy the list of links in CSV form.
 3. Save the CSV and use it with `--url-list` (for example, place it under `xls_inputs/`).
 
 SwissTopo provides GeoTIFF (`.tif`) DEM tiles. This tool converts those `.tif` files into a printable `.stl`,
