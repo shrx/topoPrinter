@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+cache/
+stl_output/
+tmp_dem/
+*.stl
+
+.DS_Store
+Thumbs.db

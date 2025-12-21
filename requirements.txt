@@ -1,0 +1,4 @@
+numpy
+rasterio
+numpy-stl
+requests
