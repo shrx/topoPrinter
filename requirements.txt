@@ -2,3 +2,4 @@ numpy
 rasterio
 numpy-stl
 requests
+GDAL

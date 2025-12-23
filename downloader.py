@@ -1,5 +1,5 @@
 """
-Helpers for reading URL lists (text, CSV, or Excel) and downloading GeoTIFFs with caching.
+Helpers for reading URL lists (text, CSV, or Excel) and downloading DEMs with caching.
 """
 
 import os
@@ -42,7 +42,6 @@ def _read_xlsx_urls(path: str) -> List[str]:
     # Minimal XLSX reader using stdlib to avoid extra dependencies.
     urls: List[str] = []
     ns_main = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-    ns_rel = {"r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
 
     with zipfile.ZipFile(path, "r") as zf:
         wb_xml = ET.fromstring(zf.read("xl/workbook.xml"))
@@ -125,34 +124,39 @@ def derive_base_name(url: str, fallback_index: int) -> str:
     candidate = os.path.basename(parsed.path)
     if not candidate:
         return f"tile_{fallback_index}"
-    if candidate.lower().endswith(".tif"):
-        candidate = candidate[:-4]
-    return candidate or f"tile_{fallback_index}"
+
+    # Auto-detect extension and strip it
+    name, _ext = os.path.splitext(candidate)
+    return name or f"tile_{fallback_index}"
 
 
-def download_dem(url: str, download_dir: str, fallback_index: int) -> str:
-    """Download a GeoTIFF with caching; return the local path."""
-    ensure_dir(download_dir)
+def download_dem(url: str, fallback_index: int) -> str:
+    """Download DEM file directly to cache."""
     ensure_dir(CACHE_DIR)
-    base_name = derive_base_name(url, fallback_index)
-    tif_name = f"{base_name}.tif"
-    cache_path = os.path.join(CACHE_DIR, tif_name)
+
+    parsed = urlsplit(url)
+    filename_from_url = os.path.basename(parsed.path)
+    base_name, ext = os.path.splitext(filename_from_url)
+
+    if not base_name:
+        base_name = f"tile_{fallback_index}"
+    if not ext:
+        ext = ".tif"
+
+    file_name = f"{base_name}{ext}"
+    cache_path = os.path.join(CACHE_DIR, file_name)
+
     if os.path.exists(cache_path):
         return cache_path
 
-    dest_path = os.path.join(download_dir, tif_name)
     try:
         with requests.get(url, stream=True, timeout=120) as resp:
             resp.raise_for_status()
-            with open(dest_path, "wb") as f:
+            with open(cache_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"Failed to download {url}: {exc}") from exc
 
-    try:
-        os.replace(dest_path, cache_path)
-        return cache_path
-    except OSError:
-        return dest_path
+    return cache_path

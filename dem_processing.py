@@ -2,11 +2,108 @@
 DEM loading, nodata handling, and merging.
 """
 
-from typing import Iterable, Tuple
+import os
+from typing import Iterable, Tuple, List
 
 import numpy as np
 import rasterio
 from rasterio.merge import merge
+from osgeo import gdal, ogr
+
+
+def preprocess_dem_files(paths: Iterable[str]) -> List[str]:
+    """Preprocess DEM files, converting XYZ point clouds to gridded rasters if needed."""
+    processed_paths = []
+
+    for path in paths:
+        # Try to open as raster
+        try:
+            with rasterio.open(path):
+                processed_paths.append(path)
+                continue
+        except:
+            pass
+
+        # Check if it's XYZ point cloud (3 numeric values per line)
+        try:
+            with open(path, 'r') as f:
+                parts = f.readline().strip().replace(';', ' ').replace(',', ' ').split()
+                if len(parts) >= 3:
+                    float(parts[0]), float(parts[1]), float(parts[2])
+                    print(f"[INFO] Detected XYZ point cloud: {path}, converting to grid...")
+                    processed_paths.append(_convert_xyz_to_grid(path))
+                    continue
+        except (FileNotFoundError, OSError):
+            raise
+        except:
+            pass
+
+        raise ValueError(f"Unable to read file as raster or XYZ point cloud: {path}")
+
+    return processed_paths
+
+
+def _convert_xyz_to_grid(xyz_path: str) -> str:
+    """Convert XYZ point cloud to gridded GeoTIFF (stored in cache)."""
+    gdal.UseExceptions()
+
+    from downloader import CACHE_DIR, ensure_dir
+    ensure_dir(CACHE_DIR)
+
+    base_name = os.path.splitext(os.path.basename(xyz_path))[0]
+    output_path = os.path.join(CACHE_DIR, f'{base_name}_gridded.tif')
+
+    if os.path.exists(output_path):
+        return output_path
+
+    vrt_content = f"""<OGRVRTDataSource>
+  <OGRVRTLayer name="{base_name}">
+    <SrcDataSource>CSV:{os.path.abspath(xyz_path)}</SrcDataSource>
+    <SrcLayer>{base_name}</SrcLayer>
+    <GeometryType>wkbPoint25D</GeometryType>
+    <GeometryField encoding="PointFromColumns" x="field_1" y="field_2" z="field_3"/>
+  </OGRVRTLayer>
+</OGRVRTDataSource>"""
+
+    vrt_path = f'/vsimem/{base_name}.vrt'
+    gdal.FileFromMemBuffer(vrt_path, vrt_content)
+
+    vrt_ds = ogr.Open(vrt_path)
+    if vrt_ds is None:
+        gdal.Unlink(vrt_path)
+        raise ValueError(f"Failed to parse XYZ file: {xyz_path}")
+
+    data_extent = vrt_ds.GetLayer(0).GetExtent()
+    vrt_ds = None
+
+    # Expand to 1km tile boundaries to eliminate gaps between adjacent tiles
+    extent = (
+        int(data_extent[0] / 1000) * 1000,
+        (int(data_extent[1] / 1000) + 1) * 1000,
+        int(data_extent[2] / 1000) * 1000,
+        (int(data_extent[3] / 1000) + 1) * 1000,
+    )
+
+    cellsize = 1.0
+    width = int((extent[1] - extent[0]) / cellsize)
+    height = int((extent[3] - extent[2]) / cellsize)
+
+    print(f"[INFO] Gridding {width}x{height} at {cellsize}m resolution...")
+
+    gdal.Grid(
+        output_path,
+        vrt_path,
+        algorithm='nearest:radius1=2.0:radius2=2.0:nodata=-9999',
+        outputBounds=[extent[0], extent[2], extent[1], extent[3]],
+        width=width,
+        height=height,
+        outputType=gdal.GDT_Float32,
+        zfield='field_3'
+    )
+
+    gdal.Unlink(vrt_path)
+    print(f"[INFO] Created gridded raster: {output_path}")
+    return output_path
 
 
 def fill_nodata(arr: np.ndarray, nodata_value) -> np.ndarray:
@@ -56,6 +153,10 @@ def load_and_merge(paths: Iterable[str], downsample: int) -> Tuple[np.ndarray, f
         raise ValueError("downsample must be >= 1")
 
     path_list = list(paths)
+
+    # Preprocess files (convert XYZ to grid if needed)
+    path_list = preprocess_dem_files(path_list)
+
     px_size_x, px_size_y, nodata_value, _ = _gather_metadata(path_list)
     merged, _transform = merge(
         path_list,
