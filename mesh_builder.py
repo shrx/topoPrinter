@@ -25,8 +25,15 @@ def dem_to_vertices_and_faces(
     aspect_ratio = (rows * px_size_y) / (cols * px_size_x)
     model_y_mm = x_size_mm * aspect_ratio
 
-    min_elev = float(np.min(dem))
-    max_elev = float(np.max(dem))
+    # Create mask for valid data (not NaN or infinite)
+    valid_mask = np.isfinite(dem)
+    if not valid_mask.any():
+        raise ValueError("DEM contains no valid data (all NaN/infinite)")
+
+    # Calculate min/max only from valid data
+    valid_data = dem[valid_mask]
+    min_elev = float(np.min(valid_data))
+    max_elev = float(np.max(valid_data))
     height_range = max_elev - min_elev
 
     if use_true_scale:
@@ -58,18 +65,47 @@ def dem_to_vertices_and_faces(
     ys = np.linspace(0, model_y_mm, rows)
     X, Y = np.meshgrid(xs, ys)
 
-    top_vertices = np.column_stack((X.ravel(), Y.ravel(), z_surface_mm.ravel()))
-    base_vertices = np.column_stack((X.ravel(), Y.ravel(), np.zeros(rows * cols)))
-    vertices = np.vstack((top_vertices, base_vertices))
+    # Create vertex index mapping - only for valid cells
+    vertex_map = np.full((rows, cols), -1, dtype=np.int32)
+    vertex_list = []
+    vertex_idx = 0
+
+    for i in range(rows):
+        for j in range(cols):
+            if valid_mask[i, j]:
+                # Add top vertex
+                x_pos = X[i, j]
+                y_pos = Y[i, j]
+                z_pos = z_surface_mm[i, j]
+                vertex_list.append([x_pos, y_pos, z_pos])
+                vertex_map[i, j] = vertex_idx
+                vertex_idx += 1
+
+    # Add base vertices for valid cells
+    base_offset = len(vertex_list)
+    for i in range(rows):
+        for j in range(cols):
+            if valid_mask[i, j]:
+                x_pos = X[i, j]
+                y_pos = Y[i, j]
+                vertex_list.append([x_pos, y_pos, 0.0])
+
+    vertices = np.array(vertex_list, dtype=np.float32)
 
     def idx(i: int, j: int) -> int:
-        return i * cols + j
+        """Get vertex index for valid cell at (i,j). Returns -1 if invalid."""
+        return vertex_map[i, j]
 
     faces: List[Tuple[int, int, int]] = []
 
-    # Top surface (upward normals).
+    # Top surface (upward normals) - only create faces where all 4 corners are valid.
     for i in range(rows - 1):
         for j in range(cols - 1):
+            # Check if all 4 corners of this quad are valid
+            if not (valid_mask[i, j] and valid_mask[i+1, j] and
+                    valid_mask[i+1, j+1] and valid_mask[i, j+1]):
+                continue
+
             v00 = idx(i, j)
             v10 = idx(i + 1, j)
             v11 = idx(i + 1, j + 1)
@@ -77,11 +113,14 @@ def dem_to_vertices_and_faces(
             faces.append((v00, v10, v11))
             faces.append((v00, v11, v01))
 
-    base_offset = rows * cols
-
-    # Base surface (downward normals).
+    # Base surface (downward normals) - only create faces where all 4 corners are valid.
     for i in range(rows - 1):
         for j in range(cols - 1):
+            # Check if all 4 corners of this quad are valid
+            if not (valid_mask[i, j] and valid_mask[i+1, j] and
+                    valid_mask[i+1, j+1] and valid_mask[i, j+1]):
+                continue
+
             b00 = base_offset + idx(i, j)
             b10 = base_offset + idx(i + 1, j)
             b11 = base_offset + idx(i + 1, j + 1)
@@ -89,41 +128,61 @@ def dem_to_vertices_and_faces(
             faces.append((b00, b11, b10))
             faces.append((b00, b01, b11))
 
-    # Left wall (x = 0, outward normal ~ -X).
+    # Perimeter walls - create walls at boundaries between valid and invalid cells.
+    # Check vertical edges (between columns).
+    for i in range(rows):
+        for j in range(cols - 1):
+            current_valid = valid_mask[i, j]
+            next_valid = valid_mask[i, j + 1]
+
+            # Create wall if one side is valid and the other is not
+            if current_valid and not next_valid:
+                # Wall on right side of current cell (facing outward)
+                if i < rows - 1 and valid_mask[i + 1, j]:
+                    t0 = idx(i, j)
+                    t1 = idx(i + 1, j)
+                    b0 = base_offset + idx(i, j)
+                    b1 = base_offset + idx(i + 1, j)
+                    faces.append((t0, b0, t1))
+                    faces.append((t1, b0, b1))
+            elif not current_valid and next_valid:
+                # Wall on left side of next cell (facing outward)
+                if i < rows - 1 and valid_mask[i + 1, j + 1]:
+                    t0 = idx(i, j + 1)
+                    t1 = idx(i + 1, j + 1)
+                    b0 = base_offset + idx(i, j + 1)
+                    b1 = base_offset + idx(i + 1, j + 1)
+                    faces.append((t0, t1, b0))
+                    faces.append((t1, b1, b0))
+
+    # Check horizontal edges (between rows).
     for i in range(rows - 1):
-        t0 = idx(i, 0)
-        t1 = idx(i + 1, 0)
-        b0 = base_offset + idx(i, 0)
-        b1 = base_offset + idx(i + 1, 0)
-        faces.append((t0, t1, b0))
-        faces.append((t1, b1, b0))
+        for j in range(cols):
+            current_valid = valid_mask[i, j]
+            next_valid = valid_mask[i + 1, j]
 
-    # Right wall (x = max, outward normal ~ +X).
-    for i in range(rows - 1):
-        t0 = idx(i, cols - 1)
-        t1 = idx(i + 1, cols - 1)
-        b0 = base_offset + idx(i, cols - 1)
-        b1 = base_offset + idx(i + 1, cols - 1)
-        faces.append((t0, b0, t1))
-        faces.append((t1, b0, b1))
+            # Create wall if one side is valid and the other is not
+            if current_valid and not next_valid:
+                # Wall on bottom side of current cell (facing outward)
+                if j < cols - 1 and valid_mask[i, j + 1]:
+                    t0 = idx(i, j)
+                    t1 = idx(i, j + 1)
+                    b0 = base_offset + idx(i, j)
+                    b1 = base_offset + idx(i, j + 1)
+                    faces.append((t0, t1, b0))
+                    faces.append((t1, b1, b0))
+            elif not current_valid and next_valid:
+                # Wall on top side of next cell (facing outward)
+                if j < cols - 1 and valid_mask[i + 1, j + 1]:
+                    t0 = idx(i + 1, j)
+                    t1 = idx(i + 1, j + 1)
+                    b0 = base_offset + idx(i + 1, j)
+                    b1 = base_offset + idx(i + 1, j + 1)
+                    faces.append((t0, b0, t1))
+                    faces.append((t1, b0, b1))
 
-    # Top edge (y = 0, outward normal ~ -Y).
-    for j in range(cols - 1):
-        t0 = idx(0, j)
-        t1 = idx(0, j + 1)
-        b0 = base_offset + idx(0, j)
-        b1 = base_offset + idx(0, j + 1)
-        faces.append((t0, t1, b0))
-        faces.append((t1, b0, b1))
-
-    # Bottom edge (y = max, outward normal ~ +Y).
-    for j in range(cols - 1):
-        t0 = idx(rows - 1, j)
-        t1 = idx(rows - 1, j + 1)
-        b0 = base_offset + idx(rows - 1, j)
-        b1 = base_offset + idx(rows - 1, j + 1)
-        faces.append((t0, t1, b1))
-        faces.append((t0, b1, b0))
+    # Note: No walls at array boundaries - all walls should be internal
+    # (at valid/invalid cell boundaries) for circular/rectangular cutouts.
 
     faces_array = np.array(faces, dtype=np.int64)
 

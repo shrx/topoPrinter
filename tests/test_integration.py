@@ -17,7 +17,7 @@ def test_swiss_geotiff_loads() -> None:
     """Test that Swiss GeoTIFF file loads and processes."""
     assert os.path.exists(SWISS_TEST_FILE), "Swiss test fixture missing"
 
-    dem, px_size_x, px_size_y = load_and_merge([SWISS_TEST_FILE], downsample=1)
+    dem, px_size_x, px_size_y, _, _ = load_and_merge([SWISS_TEST_FILE], downsample=1)
 
     assert dem.shape[0] > 0
     assert dem.shape[1] > 0
@@ -29,7 +29,7 @@ def test_slovenian_asc_loads() -> None:
     """Test that Slovenian ASC file loads and processes."""
     assert os.path.exists(SLOVENIA_TEST_FILE), "Slovenian test fixture missing"
 
-    dem, px_size_x, px_size_y = load_and_merge([SLOVENIA_TEST_FILE], downsample=1)
+    dem, px_size_x, px_size_y, _, _ = load_and_merge([SLOVENIA_TEST_FILE], downsample=1)
 
     assert dem.shape[0] > 0
     assert dem.shape[1] > 0
@@ -41,7 +41,7 @@ def test_swiss_geotiff_to_stl() -> None:
     """Test complete Swiss GeoTIFF to STL pipeline."""
     assert os.path.exists(SWISS_TEST_FILE), "Swiss test fixture missing"
 
-    dem, px_size_x, px_size_y = load_and_merge([SWISS_TEST_FILE], downsample=4)
+    dem, px_size_x, px_size_y, _, _ = load_and_merge([SWISS_TEST_FILE], downsample=4)
 
     vertices, faces, max_z, water_faces = dem_to_vertices_and_faces(
         dem, px_size_x, px_size_y,
@@ -75,7 +75,7 @@ def test_slovenian_asc_to_stl() -> None:
     assert os.path.exists(SLOVENIA_TEST_FILE), "Slovenian test fixture missing"
 
     # Use higher downsample for the larger Slovenian file
-    dem, px_size_x, px_size_y = load_and_merge([SLOVENIA_TEST_FILE], downsample=8)
+    dem, px_size_x, px_size_y, _, _ = load_and_merge([SLOVENIA_TEST_FILE], downsample=8)
 
     vertices, faces, max_z, water_faces = dem_to_vertices_and_faces(
         dem, px_size_x, px_size_y,

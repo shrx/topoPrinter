@@ -55,11 +55,48 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         default=0.0,
         help="Lower identified lake cells by this many millimeters (0 disables lake lowering).",
     )
+    parser.add_argument(
+        "--center",
+        type=str,
+        default=None,
+        help="Center point for cutout as LAT,LON (e.g., '46.9876,8.6543').",
+    )
+    cutout_group = parser.add_mutually_exclusive_group()
+    cutout_group.add_argument(
+        "--diameter",
+        type=float,
+        default=None,
+        help="Diameter in kilometers for circular cutout (requires --center).",
+    )
+    cutout_group.add_argument(
+        "--side-length",
+        type=float,
+        default=None,
+        help="Side length in kilometers for square cutout (requires --center).",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Iterable[str]) -> int:
     args = parse_args(argv)
+
+    # Validate cutout arguments
+    center_lat, center_lon = None, None
+    if args.diameter is not None or args.side_length is not None:
+        if args.center is None:
+            print("[ERROR] --center required with --diameter or --side-length.", file=sys.stderr)
+            return 1
+        try:
+            parts = args.center.split(',')
+            if len(parts) != 2:
+                raise ValueError("must be LAT,LON format")
+            center_lat, center_lon = float(parts[0]), float(parts[1])
+            if not (-90 <= center_lat <= 90) or not (-180 <= center_lon <= 180):
+                raise ValueError("coordinates out of range")
+        except ValueError as e:
+            print(f"[ERROR] Invalid --center: {e}", file=sys.stderr)
+            return 1
+
     urls = read_url_list(args.url_list)
     if not urls:
         print("No URLs found in url list.", file=sys.stderr)
@@ -85,11 +122,22 @@ def main(argv: Iterable[str]) -> int:
 
     print(f"[INFO] Merging {len(downloaded)} DEM(s)...", flush=True)
     try:
-        dem, px_size_x, px_size_y = load_and_merge(downloaded, args.downsample)
+        dem, px_size_x, px_size_y, ref_crs, ref_transform = load_and_merge(
+            downloaded,
+            args.downsample,
+            center_lat=center_lat,
+            center_lon=center_lon,
+            radius_km=args.diameter / 2.0 if args.diameter is not None else None,
+            side_length_km=args.side_length,
+        )
         print(
             f"[INFO] Merge complete. DEM shape: {dem.shape[0]} x {dem.shape[1]} "
             f"(downsample={args.downsample}), pixel size (m): {px_size_x:.3f} x {px_size_y:.3f}"
         )
+        if args.center:
+            cutout_type = "circular" if args.diameter else "rectangular"
+            cutout_size = f"{args.diameter}km diameter" if args.diameter else f"{args.side_length}km side"
+            print(f"[INFO] Applied {cutout_type} cutout at ({center_lat}, {center_lon}), {cutout_size}")
         print("[INFO] Building mesh...", flush=True)
 
         if args.max_height_mm is not None:

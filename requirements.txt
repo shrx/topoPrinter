@@ -3,3 +3,4 @@ rasterio
 numpy-stl
 requests
 GDAL
+pyproj
