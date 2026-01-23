@@ -149,6 +149,14 @@ def main(argv: Iterable[str]) -> int:
             max_height_mm = 30.0
             z_exaggeration = args.z_exaggeration if args.z_exaggeration is not None else 1.0
 
+        # Prepare cutout parameters for mesh builder
+        cutout_type_for_mesh = None
+        cutout_radius_m = None
+        if args.center:
+            cutout_type_for_mesh = "circular" if args.diameter else "rectangular"
+            if args.diameter:
+                cutout_radius_m = (args.diameter / 2.0) * 1000.0  # Convert km to m
+
         vertices, faces, max_z, water_faces = dem_to_vertices_and_faces(
             dem,
             px_size_x,
@@ -160,6 +168,12 @@ def main(argv: Iterable[str]) -> int:
             args.lake_range_percent,
             args.lake_lowering_mm,
             use_true_scale=use_true_scale,
+            cutout_type=cutout_type_for_mesh,
+            cutout_center_lat=center_lat,
+            cutout_center_lon=center_lon,
+            cutout_radius_m=cutout_radius_m,
+            ref_transform=ref_transform,
+            ref_crs=ref_crs,
         )
         water_info = f", water faces: {water_faces.shape[0]}" if water_faces is not None else ""
         print(f"[INFO] Mesh built: {faces.shape[0]} faces, {vertices.shape[0]} vertices{water_info}.")

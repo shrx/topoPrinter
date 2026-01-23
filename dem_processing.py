@@ -185,6 +185,8 @@ def load_and_merge(
             center_lon,
             radius_km,
             side_length_km,
+            px_size_x,
+            px_size_y,
             np.nan  # Always NaN, not the file's nodata value
         )
         # Validate cutout didn't remove all data
@@ -199,6 +201,8 @@ def load_and_merge(
         arr = arr[::downsample, ::downsample]
         px_size_x *= downsample
         px_size_y *= downsample
+        # Update transform to reflect downsampling
+        ref_transform = ref_transform * ref_transform.scale(downsample, downsample)
 
     if arr.size == 0 or arr.shape[0] < 2 or arr.shape[1] < 2:
         raise ValueError("DEM too small after downsampling to form a mesh.")
@@ -214,10 +218,15 @@ def apply_cutout_mask(
     center_lon: float,
     radius_km: float = None,
     side_length_km: float = None,
+    px_size_x: float = None,
+    px_size_y: float = None,
     nodata_value: float = np.nan,
 ) -> np.ndarray:
     """
     Apply circular or rectangular cutout mask to DEM array.
+
+    For circular cutouts, includes a buffer to keep pixels partially within the circle.
+    This buffer allows later interpolation to n-gon perimeter vertices.
 
     Args:
         arr: DEM array (rows x cols)
@@ -227,6 +236,8 @@ def apply_cutout_mask(
         center_lon: Center longitude (EPSG:4326)
         radius_km: Radius for circular cutout (km), or None
         side_length_km: Side length for square cutout (km), or None
+        px_size_x: Pixel size in X direction (meters), required for circular cutouts
+        px_size_y: Pixel size in Y direction (meters), required for circular cutouts
         nodata_value: Value to set for masked areas
 
     Returns:
@@ -251,10 +262,13 @@ def apply_cutout_mask(
 
     # Create mask based on cutout type
     if radius_km is not None:
-        # Circular cutout
+        # Circular cutout with buffer to include partially-intersecting pixels
+        # Buffer = half diagonal of pixel, so we keep all pixels at least partially within circle
+        pixel_half_diagonal = np.sqrt(px_size_x**2 + px_size_y**2) / 2.0
         radius_m = radius_km * 1000.0
+        buffer_radius_m = radius_m + pixel_half_diagonal
         distances = np.sqrt(dx**2 + dy**2)
-        mask = distances > radius_m  # True = outside = mask out
+        mask = distances > buffer_radius_m  # True = outside = mask out
     else:
         # Rectangular (square) cutout
         half_side_m = (side_length_km * 1000.0) / 2.0
