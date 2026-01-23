@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Batch convert swissALTI3D GeoTIFF DEMs into watertight relief STL models.
+Batch convert DEM tiles (GeoTIFF or ASCII Grid) into watertight relief STL models.
 Uses: numpy, rasterio, numpy-stl, requests (plus Python stdlib).
 """
 
@@ -16,13 +16,31 @@ from mesh_builder import dem_to_vertices_and_faces, save_stl
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert swissALTI3D GeoTIFF DEMs into watertight STL relief models."
+        description="Convert DEM tiles (GeoTIFF or ASC) into watertight STL relief models."
     )
-    parser.add_argument("--url-list", required=True, help="Path to text file with one GeoTIFF URL per line.")
+    parser.add_argument(
+        "--url-list",
+        required=True,
+        help="Path to file with DEM URLs (supports .txt, .csv, .xlsx).",
+    )
     parser.add_argument("--output-dir", required=True, help="Directory to write STL files into.")
     parser.add_argument("--x-size-mm", type=float, default=200.0, help="Model size in X (mm).")
-    parser.add_argument("--max-height-mm", type=float, default=30.0, help="Total model height including base (mm).")
-    parser.add_argument("--z-exaggeration", type=float, default=1.0, help="Vertical exaggeration factor.")
+
+    # Mutually exclusive scaling modes
+    scale_group = parser.add_mutually_exclusive_group()
+    scale_group.add_argument(
+        "--max-height-mm",
+        type=float,
+        default=None,
+        help="Total model height including base (mm). Uses normalized scale (fits elevation range into this height).",
+    )
+    scale_group.add_argument(
+        "--z-exaggeration",
+        type=float,
+        default=None,
+        help="Vertical exaggeration multiplier for true 1:1 scale. Default (no scale args) is true 1:1 scale with no exaggeration.",
+    )
+
     parser.add_argument("--downsample", type=int, default=1, help="Downsample factor to reduce mesh density.")
     parser.add_argument("--base-thickness-mm", type=float, default=2.0, help="Thickness of flat base (mm).")
     parser.add_argument(
@@ -49,24 +67,20 @@ def main(argv: Iterable[str]) -> int:
 
     print(f"[INFO] Found {len(urls)} URL(s) in list.")
     ensure_dir(args.output_dir)
-    download_dir = os.path.join(args.output_dir, "tmp_dem")
-    ensure_dir(download_dir)
     ensure_dir(CACHE_DIR)
-    cache_dir_abs = os.path.abspath(CACHE_DIR)
 
     downloaded: List[str] = []
     for idx, url in enumerate(urls):
         print(f"[INFO] Downloading ({idx + 1}/{len(urls)}): {url}", flush=True)
         try:
-            tif_path = download_dem(url, download_dir, idx + 1)
-            downloaded.append(tif_path)
-            loc = "cache" if os.path.abspath(tif_path).startswith(cache_dir_abs) else "download"
-            print(f"[INFO]   -> {loc}: {tif_path}")
+            dem_path = download_dem(url, idx + 1)
+            downloaded.append(dem_path)
+            print(f"[INFO]   -> cache: {dem_path}")
         except Exception as exc:  # noqa: BLE001
             print(f"[ERROR] {exc}", file=sys.stderr)
 
     if not downloaded:
-        print("No GeoTIFFs were downloaded successfully; nothing to process.", file=sys.stderr)
+        print("No DEM files were downloaded successfully; nothing to process.", file=sys.stderr)
         return 1
 
     print(f"[INFO] Merging {len(downloaded)} DEM(s)...", flush=True)
@@ -77,16 +91,27 @@ def main(argv: Iterable[str]) -> int:
             f"(downsample={args.downsample}), pixel size (m): {px_size_x:.3f} x {px_size_y:.3f}"
         )
         print("[INFO] Building mesh...", flush=True)
+
+        if args.max_height_mm is not None:
+            use_true_scale = False
+            max_height_mm = args.max_height_mm
+            z_exaggeration = 1.0
+        else:
+            use_true_scale = True
+            max_height_mm = 30.0
+            z_exaggeration = args.z_exaggeration if args.z_exaggeration is not None else 1.0
+
         vertices, faces, max_z, water_faces = dem_to_vertices_and_faces(
             dem,
             px_size_x,
             px_size_y,
             args.x_size_mm,
-            args.max_height_mm,
-            args.z_exaggeration,
+            max_height_mm,
+            z_exaggeration,
             args.base_thickness_mm,
             args.lake_range_percent,
             args.lake_lowering_mm,
+            use_true_scale=use_true_scale,
         )
         water_info = f", water faces: {water_faces.shape[0]}" if water_faces is not None else ""
         print(f"[INFO] Mesh built: {faces.shape[0]} faces, {vertices.shape[0]} vertices{water_info}.")
@@ -121,9 +146,10 @@ def main(argv: Iterable[str]) -> int:
     print(
         f"[OK] Merged {len(downloaded)} DEM(s): {rows} x {cols} samples -> "
         f"model {args.x_size_mm:.2f} mm x {model_y:.2f} mm x {max_z:.2f} mm\n"
-        f"     -> {stl_path}"
+        f"     -> {stl_path}\n"
+        f"Cached DEM files at: {os.path.abspath(CACHE_DIR)}"
     )
-    print(f"Temporary GeoTIFFs kept at {download_dir}.")
+
     return 0
 
 

@@ -18,8 +18,9 @@ def dem_to_vertices_and_faces(
     base_thickness_mm: float,
     lake_range_percent: float = 0.0,
     lake_lowering_mm: float = 0.0,
+    use_true_scale: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, float, Optional[np.ndarray]]:
-    """Convert a DEM grid into watertight mesh vertices/faces and optional lake faces."""
+    """Convert DEM grid into watertight mesh vertices/faces."""
     rows, cols = dem.shape
     aspect_ratio = (rows * px_size_y) / (cols * px_size_x)
     model_y_mm = x_size_mm * aspect_ratio
@@ -27,15 +28,21 @@ def dem_to_vertices_and_faces(
     min_elev = float(np.min(dem))
     max_elev = float(np.max(dem))
     height_range = max_elev - min_elev
-    relief_mm = max(max_height_mm - base_thickness_mm, 0.0)
 
-    if height_range == 0:
-        normalized = np.zeros_like(dem, dtype=np.float64)
+    if use_true_scale:
+        terrain_width_m = cols * px_size_x
+        horizontal_scale = (terrain_width_m * 1000.0) / x_size_mm
+        z_relief_mm = (dem - min_elev) * 1000.0 / horizontal_scale
+        z_relief_mm = z_relief_mm * z_exaggeration
+        z_surface_mm = base_thickness_mm + z_relief_mm
     else:
-        normalized = (dem - min_elev) / height_range
-
-    z_relief_mm = normalized * relief_mm * z_exaggeration
-    z_surface_mm = base_thickness_mm + z_relief_mm
+        relief_mm = max(max_height_mm - base_thickness_mm, 0.0)
+        if height_range == 0:
+            normalized = np.zeros_like(dem, dtype=np.float64)
+        else:
+            normalized = (dem - min_elev) / height_range
+        z_relief_mm = normalized * relief_mm * z_exaggeration
+        z_surface_mm = base_thickness_mm + z_relief_mm
 
     lake_mask = None
     if lake_lowering_mm > 0 and lake_range_percent > 0:
