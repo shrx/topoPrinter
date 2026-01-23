@@ -172,24 +172,32 @@ def load_and_merge(
         method="first",
     )
     arr = merged[0]
-    arr = fill_nodata(arr, nodata_value)
+
+    # Convert nodata values to NaN so missing areas are truly missing
+    # (not modeled as flat surfaces at nodata_value elevation)
+    if nodata_value is not None:
+        arr = np.where(arr == nodata_value, np.nan, arr)
+
+    # Skip fill_nodata to preserve missing data areas as holes
+    # arr = fill_nodata(arr, nodata_value)
 
     # Apply cutout mask if specified
-    if center_lat is not None and (radius_km is not None or side_length_km is not None):
-        # Always use NaN for cutout masking so cells are truly invalid
+    # For circular cutouts, skip masking - will use boolean intersection in mesh_builder
+    # For rectangular cutouts, apply mask as before
+    if center_lat is not None and side_length_km is not None:
+        # Rectangular cutout - apply mask
         arr = apply_cutout_mask(
             arr,
             ref_transform,
             ref_crs,
             center_lat,
             center_lon,
-            radius_km,
+            None,  # no radius
             side_length_km,
             px_size_x,
             px_size_y,
-            np.nan  # Always NaN, not the file's nodata value
+            np.nan
         )
-        # Validate cutout didn't remove all data
         valid_count = np.sum(np.isfinite(arr))
         if valid_count == 0:
             raise ValueError(
@@ -262,13 +270,12 @@ def apply_cutout_mask(
 
     # Create mask based on cutout type
     if radius_km is not None:
-        # Circular cutout with buffer to include partially-intersecting pixels
-        # Buffer = half diagonal of pixel, so we keep all pixels at least partially within circle
-        pixel_half_diagonal = np.sqrt(px_size_x**2 + px_size_y**2) / 2.0
+        # Circular cutout - use exact radius for min/max calculation
+        # For boolean intersection approach, we'll build a larger rectangular mesh
+        # and let the boolean op cut it precisely
         radius_m = radius_km * 1000.0
-        buffer_radius_m = radius_m + pixel_half_diagonal
         distances = np.sqrt(dx**2 + dy**2)
-        mask = distances > buffer_radius_m  # True = outside = mask out
+        mask = distances > radius_m  # True = outside = mask out
     else:
         # Rectangular (square) cutout
         half_side_m = (side_length_km * 1000.0) / 2.0

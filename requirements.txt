@@ -4,3 +4,5 @@ numpy-stl
 requests
 GDAL
 pyproj
+trimesh
+manifold3d
