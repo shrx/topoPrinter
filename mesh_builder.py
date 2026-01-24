@@ -6,8 +6,127 @@ from typing import List, Tuple, Optional
 
 import numpy as np
 from pyproj import Transformer
-from stl import Mode, mesh
 import trimesh
+
+
+def _build_rectangular_mesh(
+    rows: int,
+    cols: int,
+    X: np.ndarray,
+    Y: np.ndarray,
+    z_surface_mm: np.ndarray,
+    valid_mask: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build rectangular watertight mesh from DEM grid.
+
+    Returns:
+        Tuple of (vertices, faces, vertex_map)
+    """
+    # A cell is valid if all 4 corners have valid data
+    cell_is_valid = (
+        valid_mask[:-1, :-1] &
+        valid_mask[1:, :-1] &
+        valid_mask[1:, 1:] &
+        valid_mask[:-1, 1:]
+    )
+
+    # Generate vertices for all valid DEM cells
+    vertex_map = np.full((rows, cols), -1, dtype=np.int32)
+    vertex_list = []
+    vertex_idx = 0
+
+    # Add DEM vertices that are part of valid cells
+    for i in range(rows):
+        for j in range(cols):
+            # Check if this vertex is used by any valid cell
+            used = False
+            if i > 0 and j > 0 and cell_is_valid[i - 1, j - 1]:
+                used = True
+            elif i > 0 and j < cols - 1 and cell_is_valid[i - 1, j]:
+                used = True
+            elif i < rows - 1 and j > 0 and cell_is_valid[i, j - 1]:
+                used = True
+            elif i < rows - 1 and j < cols - 1 and cell_is_valid[i, j]:
+                used = True
+
+            if used and valid_mask[i, j]:
+                vertex_list.append([X[i, j], Y[i, j], z_surface_mm[i, j]])
+                vertex_map[i, j] = vertex_idx
+                vertex_idx += 1
+
+    # Add base vertices for DEM cells
+    base_offset = len(vertex_list)
+    for i in range(rows):
+        for j in range(cols):
+            if vertex_map[i, j] >= 0:
+                vertex_list.append([X[i, j], Y[i, j], 0.0])
+
+    vertices = np.array(vertex_list, dtype=np.float32)
+
+    faces: List[Tuple[int, int, int]] = []
+
+    # Top surface faces
+    for i in range(rows - 1):
+        for j in range(cols - 1):
+            if not cell_is_valid[i, j]:
+                continue
+
+            v00, v10, v11, v01 = vertex_map[i, j], vertex_map[i + 1, j], vertex_map[i + 1, j + 1], vertex_map[i, j + 1]
+            if v00 >= 0 and v10 >= 0 and v11 >= 0 and v01 >= 0:
+                faces.append((v00, v10, v11))
+                faces.append((v00, v11, v01))
+
+    # Base surface faces
+    for i in range(rows - 1):
+        for j in range(cols - 1):
+            if not cell_is_valid[i, j]:
+                continue
+
+            v00, v10, v11, v01 = vertex_map[i, j], vertex_map[i + 1, j], vertex_map[i + 1, j + 1], vertex_map[i, j + 1]
+            if v00 >= 0 and v10 >= 0 and v11 >= 0 and v01 >= 0:
+                b00 = base_offset + v00
+                b10 = base_offset + v10
+                b11 = base_offset + v11
+                b01 = base_offset + v01
+                faces.append((b00, b11, b10))
+                faces.append((b00, b01, b11))
+
+    # Perimeter walls
+    for i in range(rows - 1):
+        for j in range(cols - 1):
+            if not (valid_mask[i, j] and valid_mask[i+1, j] and
+                    valid_mask[i+1, j+1] and valid_mask[i, j+1]):
+                continue
+
+            v00, v10, v11, v01 = vertex_map[i, j], vertex_map[i + 1, j], vertex_map[i + 1, j + 1], vertex_map[i, j + 1]
+            if v00 < 0 or v10 < 0 or v11 < 0 or v01 < 0:
+                continue
+
+            # Left edge
+            if not (j > 0 and valid_mask[i, j-1] and valid_mask[i+1, j-1]):
+                b00, b10 = base_offset + v00, base_offset + v10
+                faces.append((v00, b00, v10))
+                faces.append((v10, b00, b10))
+
+            # Right edge
+            if not (j < cols - 2 and valid_mask[i, j+2] and valid_mask[i+1, j+2]):
+                b01, b11 = base_offset + v01, base_offset + v11
+                faces.append((v01, v11, b01))
+                faces.append((v11, b11, b01))
+
+            # Top edge
+            if not (i > 0 and valid_mask[i-1, j] and valid_mask[i-1, j+1]):
+                b00, b01 = base_offset + v00, base_offset + v01
+                faces.append((v00, v01, b00))
+                faces.append((v01, b01, b00))
+
+            # Bottom edge
+            if not (i < rows - 2 and valid_mask[i+2, j] and valid_mask[i+2, j+1]):
+                b10, b11 = base_offset + v10, base_offset + v11
+                faces.append((v10, b10, v11))
+                faces.append((v11, b10, b11))
+
+    return vertices, np.array(faces, dtype=np.int64), vertex_map
 
 
 def _build_circular_cutout_mesh(
@@ -75,133 +194,9 @@ def _build_circular_cutout_mesh(
     ngon_y = center_y_mm + radius_mm * np.sin(angles)
 
     # Build rectangular DEM mesh for boolean intersection
+    vertices_dem, faces_dem, _ = _build_rectangular_mesh(rows, cols, X, Y, z_surface_mm, valid_mask)
 
-    # A cell is valid if all 4 corners have valid data
-    cell_is_valid = (
-        valid_mask[:-1, :-1] &
-        valid_mask[1:, :-1] &
-        valid_mask[1:, 1:] &
-        valid_mask[:-1, 1:]
-    )
-
-    # Step 7: Generate vertices for all valid DEM cells
-    vertex_map = np.full((rows, cols), -1, dtype=np.int32)
-    vertex_list = []
-    vertex_idx = 0
-
-    # Add DEM vertices that are part of valid cells
-    for i in range(rows):
-        for j in range(cols):
-            # Check if this vertex is used by any valid cell
-            used = False
-            if i > 0 and j > 0 and cell_is_valid[i - 1, j - 1]:
-                used = True
-            elif i > 0 and j < cols - 1 and cell_is_valid[i - 1, j]:
-                used = True
-            elif i < rows - 1 and j > 0 and cell_is_valid[i, j - 1]:
-                used = True
-            elif i < rows - 1 and j < cols - 1 and cell_is_valid[i, j]:
-                used = True
-
-            if used and valid_mask[i, j]:
-                vertex_list.append([X[i, j], Y[i, j], z_surface_mm[i, j]])
-                vertex_map[i, j] = vertex_idx
-                vertex_idx += 1
-
-    # Add base vertices for DEM cells
-    base_offset = len(vertex_list)
-    for i in range(rows):
-        for j in range(cols):
-            if vertex_map[i, j] >= 0:  # This vertex was added
-                vertex_list.append([X[i, j], Y[i, j], 0.0])
-
-    vertices_dem = np.array(vertex_list, dtype=np.float32)
-
-    def idx(i: int, j: int) -> int:
-        """Get vertex index for DEM cell at (i,j). Returns -1 if not used."""
-        return vertex_map[i, j]
-
-    faces: List[Tuple[int, int, int]] = []
-
-    # Step 8: Generate top surface faces for valid cells
-    for i in range(rows - 1):
-        for j in range(cols - 1):
-            if not cell_is_valid[i, j]:
-                continue
-
-            v00 = idx(i, j)
-            v10 = idx(i + 1, j)
-            v11 = idx(i + 1, j + 1)
-            v01 = idx(i, j + 1)
-
-            if v00 >= 0 and v10 >= 0 and v11 >= 0 and v01 >= 0:
-                faces.append((v00, v10, v11))
-                faces.append((v00, v11, v01))
-
-    # Step 9: Generate base faces for valid cells
-    for i in range(rows - 1):
-        for j in range(cols - 1):
-            if not cell_is_valid[i, j]:
-                continue
-
-            v00 = idx(i, j)
-            v10 = idx(i + 1, j)
-            v11 = idx(i + 1, j + 1)
-            v01 = idx(i, j + 1)
-
-            if v00 >= 0 and v10 >= 0 and v11 >= 0 and v01 >= 0:
-                b00 = base_offset + v00
-                b10 = base_offset + v10
-                b11 = base_offset + v11
-                b01 = base_offset + v01
-                faces.append((b00, b11, b10))
-                faces.append((b00, b01, b11))
-
-    # Step 10: Add walls at boundaries of valid cells (including around interior holes)
-    # Iterate over all valid cells and create walls on edges where neighbor is invalid
-    for i in range(rows - 1):
-        for j in range(cols - 1):
-            if not cell_is_valid[i, j]:
-                continue
-
-            # This cell is valid, check each of its 4 edges
-            v00 = vertex_map[i, j]
-            v10 = vertex_map[i + 1, j]
-            v11 = vertex_map[i + 1, j + 1]
-            v01 = vertex_map[i, j + 1]
-
-            # Left edge (between v00 and v10)
-            if j == 0 or not cell_is_valid[i, j - 1]:
-                b00 = base_offset + v00
-                b10 = base_offset + v10
-                faces.append((v00, b00, v10))
-                faces.append((v10, b00, b10))
-
-            # Right edge (between v01 and v11)
-            if j == cols - 2 or not cell_is_valid[i, j + 1]:
-                b01 = base_offset + v01
-                b11 = base_offset + v11
-                faces.append((v01, v11, b01))
-                faces.append((v11, b11, b01))
-
-            # Top edge (between v00 and v01)
-            if i == 0 or not cell_is_valid[i - 1, j]:
-                b00 = base_offset + v00
-                b01 = base_offset + v01
-                faces.append((v00, v01, b00))
-                faces.append((v01, b01, b00))
-
-            # Bottom edge (between v10 and v11)
-            if i == rows - 2 or not cell_is_valid[i + 1, j]:
-                b10 = base_offset + v10
-                b11 = base_offset + v11
-                faces.append((v10, b10, v11))
-                faces.append((v11, b10, b11))
-
-    faces_dem = np.array(faces, dtype=np.int64)
-
-    # Step 11: Boolean intersection with n-gon cylinder for smooth walls
-    # Create DEM trimesh
+    # Boolean intersection with n-gon cylinder for smooth walls
     dem_mesh = trimesh.Trimesh(vertices=vertices_dem, faces=faces_dem)
 
     # Create n-gon cylinder (from base to well above terrain)
@@ -350,126 +345,13 @@ def dem_to_vertices_and_faces(
             ref_transform, ref_crs, n_gon_sides, base_thickness_mm
         )
 
-    # Create vertex index mapping - only for valid cells
-    vertex_map = np.full((rows, cols), -1, dtype=np.int32)
-    vertex_list = []
-    vertex_idx = 0
-
-    for i in range(rows):
-        for j in range(cols):
-            if valid_mask[i, j]:
-                # Add top vertex
-                x_pos = X[i, j]
-                y_pos = Y[i, j]
-                z_pos = z_surface_mm[i, j]
-                vertex_list.append([x_pos, y_pos, z_pos])
-                vertex_map[i, j] = vertex_idx
-                vertex_idx += 1
-
-    # Add base vertices for valid cells
-    base_offset = len(vertex_list)
-    for i in range(rows):
-        for j in range(cols):
-            if valid_mask[i, j]:
-                x_pos = X[i, j]
-                y_pos = Y[i, j]
-                vertex_list.append([x_pos, y_pos, 0.0])
-
-    vertices = np.array(vertex_list, dtype=np.float32)
+    # Build rectangular mesh
+    vertices, faces_array, vertex_map = _build_rectangular_mesh(rows, cols, X, Y, z_surface_mm, valid_mask)
+    base_offset = len(vertices) // 2
 
     def idx(i: int, j: int) -> int:
         """Get vertex index for valid cell at (i,j). Returns -1 if invalid."""
         return vertex_map[i, j]
-
-    faces: List[Tuple[int, int, int]] = []
-
-    # Top surface (upward normals) - only create faces where all 4 corners are valid.
-    for i in range(rows - 1):
-        for j in range(cols - 1):
-            # Check if all 4 corners of this quad are valid
-            if not (valid_mask[i, j] and valid_mask[i+1, j] and
-                    valid_mask[i+1, j+1] and valid_mask[i, j+1]):
-                continue
-
-            v00 = idx(i, j)
-            v10 = idx(i + 1, j)
-            v11 = idx(i + 1, j + 1)
-            v01 = idx(i, j + 1)
-            faces.append((v00, v10, v11))
-            faces.append((v00, v11, v01))
-
-    # Base surface (downward normals) - only create faces where all 4 corners are valid.
-    for i in range(rows - 1):
-        for j in range(cols - 1):
-            # Check if all 4 corners of this quad are valid
-            if not (valid_mask[i, j] and valid_mask[i+1, j] and
-                    valid_mask[i+1, j+1] and valid_mask[i, j+1]):
-                continue
-
-            b00 = base_offset + idx(i, j)
-            b10 = base_offset + idx(i + 1, j)
-            b11 = base_offset + idx(i + 1, j + 1)
-            b01 = base_offset + idx(i, j + 1)
-            faces.append((b00, b11, b10))
-            faces.append((b00, b01, b11))
-
-    # Perimeter walls - create walls at boundaries between valid and invalid cells.
-    # Check vertical edges (between columns).
-    for i in range(rows):
-        for j in range(cols - 1):
-            current_valid = valid_mask[i, j]
-            next_valid = valid_mask[i, j + 1]
-
-            # Create wall if one side is valid and the other is not
-            if current_valid and not next_valid:
-                # Wall on right side of current cell (facing outward)
-                if i < rows - 1 and valid_mask[i + 1, j]:
-                    t0 = idx(i, j)
-                    t1 = idx(i + 1, j)
-                    b0 = base_offset + idx(i, j)
-                    b1 = base_offset + idx(i + 1, j)
-                    faces.append((t0, b0, t1))
-                    faces.append((t1, b0, b1))
-            elif not current_valid and next_valid:
-                # Wall on left side of next cell (facing outward)
-                if i < rows - 1 and valid_mask[i + 1, j + 1]:
-                    t0 = idx(i, j + 1)
-                    t1 = idx(i + 1, j + 1)
-                    b0 = base_offset + idx(i, j + 1)
-                    b1 = base_offset + idx(i + 1, j + 1)
-                    faces.append((t0, t1, b0))
-                    faces.append((t1, b1, b0))
-
-    # Check horizontal edges (between rows).
-    for i in range(rows - 1):
-        for j in range(cols):
-            current_valid = valid_mask[i, j]
-            next_valid = valid_mask[i + 1, j]
-
-            # Create wall if one side is valid and the other is not
-            if current_valid and not next_valid:
-                # Wall on bottom side of current cell (facing outward)
-                if j < cols - 1 and valid_mask[i, j + 1]:
-                    t0 = idx(i, j)
-                    t1 = idx(i, j + 1)
-                    b0 = base_offset + idx(i, j)
-                    b1 = base_offset + idx(i, j + 1)
-                    faces.append((t0, t1, b0))
-                    faces.append((t1, b1, b0))
-            elif not current_valid and next_valid:
-                # Wall on top side of next cell (facing outward)
-                if j < cols - 1 and valid_mask[i + 1, j + 1]:
-                    t0 = idx(i + 1, j)
-                    t1 = idx(i + 1, j + 1)
-                    b0 = base_offset + idx(i + 1, j)
-                    b1 = base_offset + idx(i + 1, j + 1)
-                    faces.append((t0, b0, t1))
-                    faces.append((t1, b0, b1))
-
-    # Note: No walls at array boundaries - all walls should be internal
-    # (at valid/invalid cell boundaries) for circular/rectangular cutouts.
-
-    faces_array = np.array(faces, dtype=np.int64)
 
     water_faces_array: Optional[np.ndarray] = None
     if lake_mask is not None and lake_mask.any():
@@ -542,9 +424,5 @@ def dem_to_vertices_and_faces(
 
 def save_stl(vertices: np.ndarray, faces: np.ndarray, output_path: str) -> None:
     """Write vertices/faces to a binary STL file."""
-    vectors = np.zeros((faces.shape[0], 3, 3), dtype=np.float32)
-    for i, face in enumerate(faces):
-        vectors[i] = vertices[face]
-    stl_mesh = mesh.Mesh(np.zeros(vectors.shape[0], dtype=mesh.Mesh.dtype))
-    stl_mesh.vectors[:] = vectors
-    stl_mesh.save(output_path, mode=Mode.BINARY)
+    tm = trimesh.Trimesh(vertices=vertices, faces=faces)
+    tm.export(output_path)

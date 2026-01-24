@@ -107,23 +107,6 @@ def _convert_xyz_to_grid(xyz_path: str) -> str:
     return output_path
 
 
-def fill_nodata(arr: np.ndarray, nodata_value) -> np.ndarray:
-    """Replace nodata/NaN cells with the minimum valid elevation."""
-    data = arr.astype(np.float64, copy=False)
-    mask = ~np.isfinite(data)
-    if nodata_value is not None:
-        mask |= data == nodata_value
-    if mask.any():
-        valid = data[~mask]
-        if valid.size == 0:
-            raise ValueError("DEM contains only nodata values.")
-        # Use minimum valid value so masked water surfaces do not get lifted above surroundings.
-        fill_value = float(valid.min())
-        data = data.copy()
-        data[mask] = fill_value
-    return data
-
-
 def _gather_metadata(paths: Iterable[str]) -> Tuple[float, float, float, object]:
     """Collect pixel sizes, nodata, and CRS consistency checks for merge."""
     paths = list(paths)
@@ -173,13 +156,9 @@ def load_and_merge(
     )
     arr = merged[0]
 
-    # Convert nodata values to NaN so missing areas are truly missing
-    # (not modeled as flat surfaces at nodata_value elevation)
+    # Convert nodata values to NaN so missing areas appear as holes
     if nodata_value is not None:
         arr = np.where(arr == nodata_value, np.nan, arr)
-
-    # Skip fill_nodata to preserve missing data areas as holes
-    # arr = fill_nodata(arr, nodata_value)
 
     # Apply cutout mask if specified
     # For circular cutouts, skip masking - will use boolean intersection in mesh_builder
