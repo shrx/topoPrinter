@@ -9,6 +9,7 @@ import numpy as np
 import rasterio
 from rasterio.merge import merge
 from osgeo import gdal, ogr
+from pyproj import Transformer
 
 
 def preprocess_dem_files(paths: Iterable[str]) -> List[str]:
@@ -106,23 +107,6 @@ def _convert_xyz_to_grid(xyz_path: str) -> str:
     return output_path
 
 
-def fill_nodata(arr: np.ndarray, nodata_value) -> np.ndarray:
-    """Replace nodata/NaN cells with the minimum valid elevation."""
-    data = arr.astype(np.float64, copy=False)
-    mask = ~np.isfinite(data)
-    if nodata_value is not None:
-        mask |= data == nodata_value
-    if mask.any():
-        valid = data[~mask]
-        if valid.size == 0:
-            raise ValueError("DEM contains only nodata values.")
-        # Use minimum valid value so masked water surfaces do not get lifted above surroundings.
-        fill_value = float(valid.min())
-        data = data.copy()
-        data[mask] = fill_value
-    return data
-
-
 def _gather_metadata(paths: Iterable[str]) -> Tuple[float, float, float, object]:
     """Collect pixel sizes, nodata, and CRS consistency checks for merge."""
     paths = list(paths)
@@ -147,7 +131,14 @@ def _gather_metadata(paths: Iterable[str]) -> Tuple[float, float, float, object]
     return ref_px_x, ref_px_y, nodata_value, ref_crs
 
 
-def load_and_merge(paths: Iterable[str], downsample: int) -> Tuple[np.ndarray, float, float]:
+def load_and_merge(
+    paths: Iterable[str],
+    downsample: int,
+    center_lat: float = None,
+    center_lon: float = None,
+    radius_km: float = None,
+    side_length_km: float = None,
+) -> Tuple[np.ndarray, float, float, object, object]:
     """Merge DEM tiles, fill nodata, and optionally downsample the grid."""
     if downsample < 1:
         raise ValueError("downsample must be >= 1")
@@ -157,21 +148,120 @@ def load_and_merge(paths: Iterable[str], downsample: int) -> Tuple[np.ndarray, f
     # Preprocess files (convert XYZ to grid if needed)
     path_list = preprocess_dem_files(path_list)
 
-    px_size_x, px_size_y, nodata_value, _ = _gather_metadata(path_list)
-    merged, _transform = merge(
+    px_size_x, px_size_y, nodata_value, ref_crs = _gather_metadata(path_list)
+    merged, ref_transform = merge(
         path_list,
         nodata=nodata_value,
         method="first",
     )
     arr = merged[0]
-    arr = fill_nodata(arr, nodata_value)
+
+    # Convert nodata values to NaN so missing areas appear as holes
+    if nodata_value is not None:
+        arr = np.where(arr == nodata_value, np.nan, arr)
+
+    # Apply cutout mask if specified
+    # For circular cutouts, skip masking - will use boolean intersection in mesh_builder
+    # For rectangular cutouts, apply mask as before
+    if center_lat is not None and side_length_km is not None:
+        # Rectangular cutout - apply mask
+        arr = apply_cutout_mask(
+            arr,
+            ref_transform,
+            ref_crs,
+            center_lat,
+            center_lon,
+            None,  # no radius
+            side_length_km,
+            px_size_x,
+            px_size_y,
+            np.nan
+        )
+        valid_count = np.sum(np.isfinite(arr))
+        if valid_count == 0:
+            raise ValueError(
+                f"Cutout at ({center_lat}, {center_lon}) excluded all data. "
+                "Check that cutout region intersects with DEM."
+            )
 
     if downsample > 1:
         arr = arr[::downsample, ::downsample]
         px_size_x *= downsample
         px_size_y *= downsample
+        # Update transform to reflect downsampling
+        ref_transform = ref_transform * ref_transform.scale(downsample, downsample)
 
     if arr.size == 0 or arr.shape[0] < 2 or arr.shape[1] < 2:
         raise ValueError("DEM too small after downsampling to form a mesh.")
 
-    return arr, px_size_x, px_size_y
+    return arr, px_size_x, px_size_y, ref_crs, ref_transform
+
+
+def apply_cutout_mask(
+    arr: np.ndarray,
+    transform: object,
+    crs: object,
+    center_lat: float,
+    center_lon: float,
+    radius_km: float = None,
+    side_length_km: float = None,
+    px_size_x: float = None,
+    px_size_y: float = None,
+    nodata_value: float = np.nan,
+) -> np.ndarray:
+    """
+    Apply circular or rectangular cutout mask to DEM array.
+
+    For circular cutouts, includes a buffer to keep pixels partially within the circle.
+    This buffer allows later interpolation to n-gon perimeter vertices.
+
+    Args:
+        arr: DEM array (rows x cols)
+        transform: Affine transform from rasterio
+        crs: CRS of the DEM
+        center_lat: Center latitude (EPSG:4326)
+        center_lon: Center longitude (EPSG:4326)
+        radius_km: Radius for circular cutout (km), or None
+        side_length_km: Side length for square cutout (km), or None
+        px_size_x: Pixel size in X direction (meters), required for circular cutouts
+        px_size_y: Pixel size in Y direction (meters), required for circular cutouts
+        nodata_value: Value to set for masked areas
+
+    Returns:
+        Masked DEM array with areas outside cutout set to nodata
+    """
+    rows, cols = arr.shape
+
+    # Transform center from EPSG:4326 to DEM's CRS
+    transformer = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    center_x, center_y = transformer.transform(center_lon, center_lat)
+
+    # Create coordinate grids for all pixels
+    row_indices, col_indices = np.mgrid[0:rows, 0:cols]
+
+    # Get x, y coordinates for each pixel using affine transform
+    pixel_x = transform.c + transform.a * col_indices + transform.b * row_indices
+    pixel_y = transform.f + transform.d * col_indices + transform.e * row_indices
+
+    # Calculate distances from center
+    dx = pixel_x - center_x
+    dy = pixel_y - center_y
+
+    # Create mask based on cutout type
+    if radius_km is not None:
+        # Circular cutout - use exact radius for min/max calculation
+        # For boolean intersection approach, we'll build a larger rectangular mesh
+        # and let the boolean op cut it precisely
+        radius_m = radius_km * 1000.0
+        distances = np.sqrt(dx**2 + dy**2)
+        mask = distances > radius_m  # True = outside = mask out
+    else:
+        # Rectangular (square) cutout
+        half_side_m = (side_length_km * 1000.0) / 2.0
+        mask = (np.abs(dx) > half_side_m) | (np.abs(dy) > half_side_m)
+
+    # Apply mask
+    arr_masked = arr.copy()
+    arr_masked[mask] = nodata_value
+
+    return arr_masked
