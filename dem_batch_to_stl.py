@@ -74,6 +74,12 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         default=None,
         help="Side length in kilometers for square cutout (requires --center).",
     )
+    parser.add_argument(
+        "--ngon-sides",
+        type=int,
+        default=64,
+        help="Number of sides for circular cutout perimeter (default: 64, higher = smoother).",
+    )
     return parser.parse_args(argv)
 
 
@@ -174,6 +180,7 @@ def main(argv: Iterable[str]) -> int:
             cutout_radius_m=cutout_radius_m,
             ref_transform=ref_transform,
             ref_crs=ref_crs,
+            n_gon_sides=args.ngon_sides,
         )
         water_info = f", water faces: {water_faces.shape[0]}" if water_faces is not None else ""
         print(f"[INFO] Mesh built: {faces.shape[0]} faces, {vertices.shape[0]} vertices{water_info}.")
