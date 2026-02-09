@@ -138,6 +138,10 @@ def load_and_merge(
     center_lon: float = None,
     radius_km: float = None,
     side_length_km: float = None,
+    rect_lat1: float = None,
+    rect_lon1: float = None,
+    rect_lat2: float = None,
+    rect_lon2: float = None,
 ) -> Tuple[np.ndarray, float, float, object, object]:
     """Merge DEM tiles, fill nodata, and optionally downsample the grid."""
     if downsample < 1:
@@ -163,7 +167,31 @@ def load_and_merge(
     # Apply cutout mask if specified
     # For circular cutouts, skip masking - will use boolean intersection in mesh_builder
     # For rectangular cutouts, apply mask as before
-    if center_lat is not None and side_length_km is not None:
+    if rect_lat1 is not None and rect_lon1 is not None and rect_lat2 is not None and rect_lon2 is not None:
+        # Rectangle corners cutout - apply mask
+        arr = apply_cutout_mask(
+            arr,
+            ref_transform,
+            ref_crs,
+            None,  # no center
+            None,
+            None,  # no radius
+            None,  # no side_length
+            px_size_x,
+            px_size_y,
+            np.nan,
+            rect_lat1=rect_lat1,
+            rect_lon1=rect_lon1,
+            rect_lat2=rect_lat2,
+            rect_lon2=rect_lon2,
+        )
+        valid_count = np.sum(np.isfinite(arr))
+        if valid_count == 0:
+            raise ValueError(
+                f"Cutout with corners ({rect_lat1}, {rect_lon1}) to ({rect_lat2}, {rect_lon2}) excluded all data. "
+                "Check that cutout region intersects with DEM."
+            )
+    elif center_lat is not None and side_length_km is not None:
         # Rectangular cutout - apply mask
         arr = apply_cutout_mask(
             arr,
@@ -208,6 +236,10 @@ def apply_cutout_mask(
     px_size_x: float = None,
     px_size_y: float = None,
     nodata_value: float = np.nan,
+    rect_lat1: float = None,
+    rect_lon1: float = None,
+    rect_lat2: float = None,
+    rect_lon2: float = None,
 ) -> np.ndarray:
     """
     Apply circular or rectangular cutout mask to DEM array.
@@ -219,22 +251,23 @@ def apply_cutout_mask(
         arr: DEM array (rows x cols)
         transform: Affine transform from rasterio
         crs: CRS of the DEM
-        center_lat: Center latitude (EPSG:4326)
-        center_lon: Center longitude (EPSG:4326)
+        center_lat: Center latitude (EPSG:4326), or None for rectangle corners mode
+        center_lon: Center longitude (EPSG:4326), or None for rectangle corners mode
         radius_km: Radius for circular cutout (km), or None
         side_length_km: Side length for square cutout (km), or None
         px_size_x: Pixel size in X direction (meters), required for circular cutouts
         px_size_y: Pixel size in Y direction (meters), required for circular cutouts
         nodata_value: Value to set for masked areas
+        rect_lat1: First corner latitude (EPSG:4326), or None
+        rect_lon1: First corner longitude (EPSG:4326), or None
+        rect_lat2: Second corner latitude (EPSG:4326), or None
+        rect_lon2: Second corner longitude (EPSG:4326), or None
 
     Returns:
         Masked DEM array with areas outside cutout set to nodata
     """
     rows, cols = arr.shape
-
-    # Transform center from EPSG:4326 to DEM's CRS
     transformer = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
-    center_x, center_y = transformer.transform(center_lon, center_lat)
 
     # Create coordinate grids for all pixels
     row_indices, col_indices = np.mgrid[0:rows, 0:cols]
@@ -243,22 +276,42 @@ def apply_cutout_mask(
     pixel_x = transform.c + transform.a * col_indices + transform.b * row_indices
     pixel_y = transform.f + transform.d * col_indices + transform.e * row_indices
 
-    # Calculate distances from center
-    dx = pixel_x - center_x
-    dy = pixel_y - center_y
+    # Handle rectangle corners mode
+    if rect_lat1 is not None and rect_lon1 is not None and rect_lat2 is not None and rect_lon2 is not None:
+        # Transform both corners from EPSG:4326 to DEM's CRS
+        corner1_x, corner1_y = transformer.transform(rect_lon1, rect_lat1)
+        corner2_x, corner2_y = transformer.transform(rect_lon2, rect_lat2)
 
-    # Create mask based on cutout type
-    if radius_km is not None:
-        # Circular cutout - use exact radius for min/max calculation
-        # For boolean intersection approach, we'll build a larger rectangular mesh
-        # and let the boolean op cut it precisely
-        radius_m = radius_km * 1000.0
-        distances = np.sqrt(dx**2 + dy**2)
-        mask = distances > radius_m  # True = outside = mask out
+        # Determine min/max bounds (corners can be in any order)
+        min_x = min(corner1_x, corner2_x)
+        max_x = max(corner1_x, corner2_x)
+        min_y = min(corner1_y, corner2_y)
+        max_y = max(corner1_y, corner2_y)
+
+        # Create mask: True for pixels outside the rectangle
+        mask = (pixel_x < min_x) | (pixel_x > max_x) | (pixel_y < min_y) | (pixel_y > max_y)
+
+    # Handle center-based cutouts
     else:
-        # Rectangular (square) cutout
-        half_side_m = (side_length_km * 1000.0) / 2.0
-        mask = (np.abs(dx) > half_side_m) | (np.abs(dy) > half_side_m)
+        # Transform center from EPSG:4326 to DEM's CRS
+        center_x, center_y = transformer.transform(center_lon, center_lat)
+
+        # Calculate distances from center
+        dx = pixel_x - center_x
+        dy = pixel_y - center_y
+
+        # Create mask based on cutout type
+        if radius_km is not None:
+            # Circular cutout - use exact radius for min/max calculation
+            # For boolean intersection approach, we'll build a larger rectangular mesh
+            # and let the boolean op cut it precisely
+            radius_m = radius_km * 1000.0
+            distances = np.sqrt(dx**2 + dy**2)
+            mask = distances > radius_m  # True = outside = mask out
+        else:
+            # Rectangular (square) cutout
+            half_side_m = (side_length_km * 1000.0) / 2.0
+            mask = (np.abs(dx) > half_side_m) | (np.abs(dy) > half_side_m)
 
     # Apply mask
     arr_masked = arr.copy()

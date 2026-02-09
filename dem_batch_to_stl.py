@@ -55,12 +55,26 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         default=0.0,
         help="Lower identified lake cells by this many millimeters (0 disables lake lowering).",
     )
-    parser.add_argument(
+    # Cutout region specification - mutually exclusive modes
+    region_group = parser.add_mutually_exclusive_group()
+
+    # Center-based cutout (existing)
+    region_group.add_argument(
         "--center",
         type=str,
         default=None,
-        help="Center point for cutout as LAT,LON (e.g., '46.9876,8.6543').",
+        help="Center point for cutout as LAT,LON (e.g., '46.9876,8.6543'). Use with --diameter or --side-length.",
     )
+
+    # Rectangle corners (new)
+    region_group.add_argument(
+        "--rect-corners",
+        type=str,
+        default=None,
+        help="Rectangle cutout specified by two opposite corners as LAT1,LON1,LAT2,LON2 (e.g., '46.5,8.5,47.0,9.0').",
+    )
+
+    # Size specification for center-based cutouts
     cutout_group = parser.add_mutually_exclusive_group()
     cutout_group.add_argument(
         "--diameter",
@@ -88,9 +102,31 @@ def main(argv: Iterable[str]) -> int:
 
     # Validate cutout arguments
     center_lat, center_lon = None, None
-    if args.diameter is not None or args.side_length is not None:
-        if args.center is None:
-            print("[ERROR] --center required with --diameter or --side-length.", file=sys.stderr)
+    rect_lat1, rect_lon1, rect_lat2, rect_lon2 = None, None, None, None
+
+    # Handle rectangle corners
+    if args.rect_corners is not None:
+        try:
+            parts = args.rect_corners.split(',')
+            if len(parts) != 4:
+                raise ValueError("must be LAT1,LON1,LAT2,LON2 format")
+            rect_lat1, rect_lon1, rect_lat2, rect_lon2 = (
+                float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
+            )
+            if not all(-90 <= lat <= 90 for lat in [rect_lat1, rect_lat2]):
+                raise ValueError("latitude coordinates out of range")
+            if not all(-180 <= lon <= 180 for lon in [rect_lon1, rect_lon2]):
+                raise ValueError("longitude coordinates out of range")
+            if rect_lat1 == rect_lat2 or rect_lon1 == rect_lon2:
+                raise ValueError("corners must define a non-zero area rectangle")
+        except ValueError as e:
+            print(f"[ERROR] Invalid --rect-corners: {e}", file=sys.stderr)
+            return 1
+
+    # Handle center-based cutouts
+    elif args.center is not None:
+        if args.diameter is None and args.side_length is None:
+            print("[ERROR] --center requires either --diameter or --side-length.", file=sys.stderr)
             return 1
         try:
             parts = args.center.split(',')
@@ -102,6 +138,11 @@ def main(argv: Iterable[str]) -> int:
         except ValueError as e:
             print(f"[ERROR] Invalid --center: {e}", file=sys.stderr)
             return 1
+
+    # Validate that diameter/side-length require center
+    elif args.diameter is not None or args.side_length is not None:
+        print("[ERROR] --diameter or --side-length require --center.", file=sys.stderr)
+        return 1
 
     urls = read_url_list(args.url_list)
     if not urls:
@@ -135,12 +176,18 @@ def main(argv: Iterable[str]) -> int:
             center_lon=center_lon,
             radius_km=args.diameter / 2.0 if args.diameter is not None else None,
             side_length_km=args.side_length,
+            rect_lat1=rect_lat1,
+            rect_lon1=rect_lon1,
+            rect_lat2=rect_lat2,
+            rect_lon2=rect_lon2,
         )
         print(
             f"[INFO] Merge complete. DEM shape: {dem.shape[0]} x {dem.shape[1]} "
             f"(downsample={args.downsample}), pixel size (m): {px_size_x:.3f} x {px_size_y:.3f}"
         )
-        if args.center:
+        if args.rect_corners:
+            print(f"[INFO] Applied rectangular cutout with corners ({rect_lat1}, {rect_lon1}) to ({rect_lat2}, {rect_lon2})")
+        elif args.center:
             cutout_type = "circular" if args.diameter else "rectangular"
             cutout_size = f"{args.diameter}km diameter" if args.diameter else f"{args.side_length}km side"
             print(f"[INFO] Applied {cutout_type} cutout at ({center_lat}, {center_lon}), {cutout_size}")
