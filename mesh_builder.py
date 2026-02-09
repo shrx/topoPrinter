@@ -8,6 +8,8 @@ import numpy as np
 from pyproj import Transformer
 import trimesh
 
+from bearing_utils import rotate_to_bearing_frame, rotate_from_bearing_frame
+
 
 def _build_rectangular_mesh(
     rows: int,
@@ -127,6 +129,140 @@ def _build_rectangular_mesh(
                 faces.append((v11, b10, b11))
 
     return vertices, np.array(faces, dtype=np.int64), vertex_map
+
+
+def _build_rect_cutout_mesh(
+    dem: np.ndarray,
+    px_size_x: float,
+    px_size_y: float,
+    x_size_mm: float,
+    model_y_mm: float,
+    z_surface_mm: np.ndarray,
+    valid_mask: np.ndarray,
+    X: np.ndarray,
+    Y: np.ndarray,
+    c1_x_crs: float,
+    c1_y_crs: float,
+    c2_x_crs: float,
+    c2_y_crs: float,
+    bearing: float,
+    ref_transform: object,
+    base_thickness_mm: float,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """
+    Build mesh with exact rectangular bounds using boolean intersection.
+
+    Args:
+        dem: DEM array
+        px_size_x, px_size_y: Pixel sizes in meters
+        x_size_mm, model_y_mm: Model dimensions in mm
+        z_surface_mm: Surface elevations in mm (rows x cols)
+        valid_mask: Valid data mask (rows x cols)
+        X, Y: Meshgrid of model coordinates (rows x cols)
+        c1_x_crs, c1_y_crs: First corner in CRS coordinates (corner A)
+        c2_x_crs, c2_y_crs: Second corner in CRS coordinates (corner C, opposite to A)
+        bearing: Bearing in degrees (direction of AD edge)
+        ref_transform: Rasterio affine transform
+        base_thickness_mm: Base thickness
+
+    Returns:
+        Tuple of (vertices, faces, max_z)
+    """
+    rows, cols = dem.shape
+
+    # Build rectangular DEM mesh for boolean intersection
+    vertices_dem, faces_dem, _ = _build_rectangular_mesh(rows, cols, X, Y, z_surface_mm, valid_mask)
+    dem_mesh = trimesh.Trimesh(vertices=vertices_dem, faces=faces_dem)
+
+    # Decompose diagonal into width (perpendicular to bearing) and height (along bearing)
+    dx_crs = c2_x_crs - c1_x_crs
+    dy_crs = c2_y_crs - c1_y_crs
+    bearing_rad = np.radians(bearing)
+    AB_length_m, AD_length_m = rotate_to_bearing_frame(dx_crs, dy_crs, bearing_rad)
+    AB_length_m = abs(AB_length_m)
+    AD_length_m = abs(AD_length_m)
+
+    # DEM mesh scale: mm per CRS meter
+    terrain_width_m = abs(ref_transform.a) * cols
+    dem_scale = x_size_mm / terrain_width_m
+
+    # Rectangle dimensions in DEM mesh coordinate space
+    rect_width_mm_dem = AB_length_m * dem_scale
+    rect_height_mm_dem = AD_length_m * dem_scale
+
+    # Final model scale: rectangle width → x_size_mm
+    final_scale = x_size_mm / AB_length_m
+    rect_width_mm_final = x_size_mm
+    rect_height_mm_final = AD_length_m * final_scale
+
+    # Find center in model mm via pixel lookup
+    center_x_crs = (c1_x_crs + c2_x_crs) / 2.0
+    center_y_crs = (c1_y_crs + c2_y_crs) / 2.0
+
+    from rasterio.transform import rowcol
+    center_row, center_col = rowcol(ref_transform, center_x_crs, center_y_crs)
+    center_row = max(0, min(rows - 1, center_row))
+    center_col = max(0, min(cols - 1, center_col))
+    center_x_mm = X[center_row, center_col]
+    center_y_mm = Y[center_row, center_col]
+
+    # Create box for intersection
+    max_terrain_z = float(np.max(z_surface_mm[valid_mask]))
+    box_height = max(max_terrain_z * 2, base_thickness_mm * 3)
+
+    half_w = rect_width_mm_dem / 2.0
+    half_h = rect_height_mm_dem / 2.0
+
+    box_verts = [
+        [-half_w, -half_h, 0], [half_w, -half_h, 0], [half_w, half_h, 0], [-half_w, half_h, 0],
+        [-half_w, -half_h, box_height], [half_w, -half_h, box_height],
+        [half_w, half_h, box_height], [-half_w, half_h, box_height],
+    ]
+
+    # Rotate box from bearing-local frame to CRS-aligned model space and translate to center
+    box_verts_rot = []
+    for vx, vy, vz in box_verts:
+        de, dn = rotate_from_bearing_frame(vx, vy, bearing_rad)
+        box_verts_rot.append([de + center_x_mm, dn + center_y_mm, vz])
+
+    box_faces = [
+        [0, 1, 2], [0, 2, 3],  # bottom
+        [4, 6, 5], [4, 7, 6],  # top
+        [0, 4, 1], [1, 4, 5],  # sides
+        [1, 5, 2], [2, 5, 6],
+        [2, 6, 3], [3, 6, 7],
+        [3, 7, 0], [0, 7, 4],
+    ]
+
+    box_mesh = trimesh.Trimesh(vertices=box_verts_rot, faces=box_faces)
+    box_mesh.fix_normals()
+
+    # Boolean intersection
+    if not dem_mesh.is_volume or not box_mesh.is_volume:
+        raise ValueError("Meshes are not volumes for boolean intersection")
+
+    result_mesh = dem_mesh.intersection(box_mesh)
+
+    # Undo bearing rotation: project model offsets onto bearing-local frame
+    verts = result_mesh.vertices.copy()
+    dx = verts[:, 0] - center_x_mm
+    dy = verts[:, 1] - center_y_mm
+    local_perp, local_along = rotate_to_bearing_frame(dx, dy, bearing_rad)
+
+    # Rescale from DEM mesh scale to final model scale
+    scale_factor = final_scale / dem_scale
+    local_perp *= scale_factor
+    local_along *= scale_factor
+
+    # Translate to origin (center at half-width, half-height)
+    verts[:, 0] = local_perp + rect_width_mm_final / 2.0
+    verts[:, 1] = local_along + rect_height_mm_final / 2.0
+
+    vertices = verts.astype(np.float32)
+    faces = result_mesh.faces.astype(np.int64)
+    max_z = float(np.max(vertices[:, 2]))
+
+    return vertices, faces, max_z
 
 
 def _build_circular_cutout_mesh(
@@ -261,14 +397,20 @@ def dem_to_vertices_and_faces(
     cutout_center_lat: Optional[float] = None,
     cutout_center_lon: Optional[float] = None,
     cutout_radius_m: Optional[float] = None,
+    cutout_side_length_km: Optional[float] = None,
     ref_transform: Optional[object] = None,
     ref_crs: Optional[object] = None,
     n_gon_sides: int = 64,
+    bearing: float = 0.0,
+    rect_corner1_lat: Optional[float] = None,
+    rect_corner1_lon: Optional[float] = None,
+    rect_corner2_lat: Optional[float] = None,
+    rect_corner2_lon: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray, float, Optional[np.ndarray]]:
     """
     Convert DEM grid into watertight mesh vertices/faces.
 
-    For circular cutouts, generates smooth n-gon perimeter walls instead of jagged pixel-based walls.
+    Cutout cropping is handled by boolean intersection for all cutout types.
     """
     rows, cols = dem.shape
     aspect_ratio = (rows * px_size_y) / (cols * px_size_x)
@@ -279,30 +421,7 @@ def dem_to_vertices_and_faces(
     if not valid_mask.any():
         raise ValueError("DEM contains no valid data (all NaN/infinite)")
 
-    # Calculate min/max only from valid data
-    # For circular cutouts with boolean intersection, calculate from exact circle
-    if cutout_type == "circular" and cutout_center_lat is not None and cutout_radius_m is not None:
-        from pyproj import Transformer
-        from rasterio.transform import rowcol
-        transformer = Transformer.from_crs("EPSG:4326", ref_crs, always_xy=True)
-        center_x_crs, center_y_crs = transformer.transform(cutout_center_lon, cutout_center_lat)
-
-        # Create mask for exact circle
-        row_indices, col_indices = np.mgrid[0:rows, 0:cols]
-        pixel_x_crs = ref_transform.c + ref_transform.a * col_indices + ref_transform.b * row_indices
-        pixel_y_crs = ref_transform.f + ref_transform.d * col_indices + ref_transform.e * row_indices
-        dx = pixel_x_crs - center_x_crs
-        dy = pixel_y_crs - center_y_crs
-        distances = np.sqrt(dx**2 + dy**2)
-        exact_circle_mask = (distances <= cutout_radius_m * 1000.0) & valid_mask
-
-        if not exact_circle_mask.any():
-            raise ValueError("No valid data within exact circle radius")
-
-        valid_data = dem[exact_circle_mask]
-    else:
-        valid_data = dem[valid_mask]
-
+    valid_data = dem[valid_mask]
     min_elev = float(np.min(valid_data))
     max_elev = float(np.max(valid_data))
     height_range = max_elev - min_elev
@@ -331,9 +450,9 @@ def dem_to_vertices_and_faces(
             target_lake_mm = max(lake_min_mm - lake_lowering_mm, 0.0)
             z_surface_mm = np.where(lake_mask, target_lake_mm, z_surface_mm)
 
-    # Flip X so the output matches the expected orientation in common viewers (e.g., Blender without extra flips).
-    xs = np.linspace(x_size_mm, 0, cols)
-    ys = np.linspace(0, model_y_mm, rows)
+    # Model axes aligned with CRS: X ∝ Easting, Y ∝ Northing
+    xs = np.linspace(0, x_size_mm, cols)
+    ys = np.linspace(model_y_mm, 0, rows)
     X, Y = np.meshgrid(xs, ys)
 
     # Handle circular cutout with smooth n-gon perimeter
@@ -345,7 +464,33 @@ def dem_to_vertices_and_faces(
             ref_transform, ref_crs, n_gon_sides, base_thickness_mm
         )
 
-    # Build rectangular mesh
+    # Handle all rectangular cutouts via boolean intersection
+    if cutout_type == "rectangular":
+        transformer = Transformer.from_crs("EPSG:4326", ref_crs, always_xy=True)
+        bearing_rad = np.radians(bearing)
+
+        if rect_corner1_lat is not None:
+            # rect-corners mode: convert lat/lon to CRS
+            c1_x, c1_y = transformer.transform(rect_corner1_lon, rect_corner1_lat)
+            c2_x, c2_y = transformer.transform(rect_corner2_lon, rect_corner2_lat)
+        else:
+            # center + side-length mode: compute CRS corners
+            cx, cy = transformer.transform(cutout_center_lon, cutout_center_lat)
+            half = cutout_side_length_km * 1000.0 / 2.0
+            de1, dn1 = rotate_from_bearing_frame(-half, -half, bearing_rad)
+            c1_x, c1_y = cx + de1, cy + dn1
+            de2, dn2 = rotate_from_bearing_frame(half, half, bearing_rad)
+            c2_x, c2_y = cx + de2, cy + dn2
+
+        vertices, faces_array, max_z = _build_rect_cutout_mesh(
+            dem, px_size_x, px_size_y, x_size_mm, model_y_mm,
+            z_surface_mm, valid_mask, X, Y,
+            c1_x, c1_y, c2_x, c2_y,
+            bearing, ref_transform, base_thickness_mm
+        )
+        return vertices, faces_array, max_z, None
+
+    # Build rectangular mesh (no cutout)
     vertices, faces_array, vertex_map = _build_rectangular_mesh(rows, cols, X, Y, z_surface_mm, valid_mask)
     base_offset = len(vertices) // 2
 
