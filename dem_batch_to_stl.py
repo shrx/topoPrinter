@@ -94,6 +94,12 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         default=64,
         help="Number of sides for circular cutout perimeter (default: 64, higher = smoother).",
     )
+    parser.add_argument(
+        "--bearing",
+        type=float,
+        default=0.0,
+        help="Bearing in degrees (0-360) for cutout rotation. 0/360=North, 90=East, 180=South, 270=West. Default: 0 (North).",
+    )
     return parser.parse_args(argv)
 
 
@@ -144,6 +150,11 @@ def main(argv: Iterable[str]) -> int:
         print("[ERROR] --diameter or --side-length require --center.", file=sys.stderr)
         return 1
 
+    # Validate bearing
+    if not (0.0 <= args.bearing <= 360.0):
+        print("[ERROR] --bearing must be between 0 and 360 degrees.", file=sys.stderr)
+        return 1
+
     urls = read_url_list(args.url_list)
     if not urls:
         print("No URLs found in url list.", file=sys.stderr)
@@ -172,25 +183,19 @@ def main(argv: Iterable[str]) -> int:
         dem, px_size_x, px_size_y, ref_crs, ref_transform = load_and_merge(
             downloaded,
             args.downsample,
-            center_lat=center_lat,
-            center_lon=center_lon,
-            radius_km=args.diameter / 2.0 if args.diameter is not None else None,
-            side_length_km=args.side_length,
-            rect_lat1=rect_lat1,
-            rect_lon1=rect_lon1,
-            rect_lat2=rect_lat2,
-            rect_lon2=rect_lon2,
         )
         print(
             f"[INFO] Merge complete. DEM shape: {dem.shape[0]} x {dem.shape[1]} "
             f"(downsample={args.downsample}), pixel size (m): {px_size_x:.3f} x {px_size_y:.3f}"
         )
         if args.rect_corners:
-            print(f"[INFO] Applied rectangular cutout with corners ({rect_lat1}, {rect_lon1}) to ({rect_lat2}, {rect_lon2})")
+            bearing_info = f", bearing={args.bearing}°" if args.bearing != 0.0 else ""
+            print(f"[INFO] Applied rectangular cutout with corners ({rect_lat1}, {rect_lon1}) to ({rect_lat2}, {rect_lon2}){bearing_info}")
         elif args.center:
             cutout_type = "circular" if args.diameter else "rectangular"
             cutout_size = f"{args.diameter}km diameter" if args.diameter else f"{args.side_length}km side"
-            print(f"[INFO] Applied {cutout_type} cutout at ({center_lat}, {center_lon}), {cutout_size}")
+            bearing_info = f", bearing={args.bearing}°" if args.bearing != 0.0 else ""
+            print(f"[INFO] Applied {cutout_type} cutout at ({center_lat}, {center_lon}), {cutout_size}{bearing_info}")
         print("[INFO] Building mesh...", flush=True)
 
         if args.max_height_mm is not None:
@@ -205,7 +210,9 @@ def main(argv: Iterable[str]) -> int:
         # Prepare cutout parameters for mesh builder
         cutout_type_for_mesh = None
         cutout_radius_m = None
-        if args.center:
+        if args.rect_corners:
+            cutout_type_for_mesh = "rectangular"
+        elif args.center:
             cutout_type_for_mesh = "circular" if args.diameter else "rectangular"
             if args.diameter:
                 cutout_radius_m = (args.diameter / 2.0) * 1000.0  # Convert km to m
@@ -225,9 +232,15 @@ def main(argv: Iterable[str]) -> int:
             cutout_center_lat=center_lat,
             cutout_center_lon=center_lon,
             cutout_radius_m=cutout_radius_m,
+            cutout_side_length_km=args.side_length,
             ref_transform=ref_transform,
             ref_crs=ref_crs,
             n_gon_sides=args.ngon_sides,
+            bearing=args.bearing,
+            rect_corner1_lat=rect_lat1,
+            rect_corner1_lon=rect_lon1,
+            rect_corner2_lat=rect_lat2,
+            rect_corner2_lon=rect_lon2,
         )
         water_info = f", water faces: {water_faces.shape[0]}" if water_faces is not None else ""
         print(f"[INFO] Mesh built: {faces.shape[0]} faces, {vertices.shape[0]} vertices{water_info}.")

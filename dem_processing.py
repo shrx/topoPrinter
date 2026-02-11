@@ -3,6 +3,7 @@ DEM loading, nodata handling, and merging.
 """
 
 import os
+import sys
 from typing import Iterable, Tuple, List
 
 import numpy as np
@@ -10,6 +11,8 @@ import rasterio
 from rasterio.merge import merge
 from osgeo import gdal, ogr
 from pyproj import Transformer
+
+from bearing_utils import rotate_to_bearing_frame
 
 
 def preprocess_dem_files(paths: Iterable[str]) -> List[str]:
@@ -134,14 +137,6 @@ def _gather_metadata(paths: Iterable[str]) -> Tuple[float, float, float, object]
 def load_and_merge(
     paths: Iterable[str],
     downsample: int,
-    center_lat: float = None,
-    center_lon: float = None,
-    radius_km: float = None,
-    side_length_km: float = None,
-    rect_lat1: float = None,
-    rect_lon1: float = None,
-    rect_lat2: float = None,
-    rect_lon2: float = None,
 ) -> Tuple[np.ndarray, float, float, object, object]:
     """Merge DEM tiles, fill nodata, and optionally downsample the grid."""
     if downsample < 1:
@@ -164,53 +159,7 @@ def load_and_merge(
     if nodata_value is not None:
         arr = np.where(arr == nodata_value, np.nan, arr)
 
-    # Apply cutout mask if specified
-    # For circular cutouts, skip masking - will use boolean intersection in mesh_builder
-    # For rectangular cutouts, apply mask as before
-    if rect_lat1 is not None and rect_lon1 is not None and rect_lat2 is not None and rect_lon2 is not None:
-        # Rectangle corners cutout - apply mask
-        arr = apply_cutout_mask(
-            arr,
-            ref_transform,
-            ref_crs,
-            None,  # no center
-            None,
-            None,  # no radius
-            None,  # no side_length
-            px_size_x,
-            px_size_y,
-            np.nan,
-            rect_lat1=rect_lat1,
-            rect_lon1=rect_lon1,
-            rect_lat2=rect_lat2,
-            rect_lon2=rect_lon2,
-        )
-        valid_count = np.sum(np.isfinite(arr))
-        if valid_count == 0:
-            raise ValueError(
-                f"Cutout with corners ({rect_lat1}, {rect_lon1}) to ({rect_lat2}, {rect_lon2}) excluded all data. "
-                "Check that cutout region intersects with DEM."
-            )
-    elif center_lat is not None and side_length_km is not None:
-        # Rectangular cutout - apply mask
-        arr = apply_cutout_mask(
-            arr,
-            ref_transform,
-            ref_crs,
-            center_lat,
-            center_lon,
-            None,  # no radius
-            side_length_km,
-            px_size_x,
-            px_size_y,
-            np.nan
-        )
-        valid_count = np.sum(np.isfinite(arr))
-        if valid_count == 0:
-            raise ValueError(
-                f"Cutout at ({center_lat}, {center_lon}) excluded all data. "
-                "Check that cutout region intersects with DEM."
-            )
+    # Cutout cropping is handled by boolean intersection in mesh_builder
 
     if downsample > 1:
         arr = arr[::downsample, ::downsample]
@@ -240,9 +189,10 @@ def apply_cutout_mask(
     rect_lon1: float = None,
     rect_lat2: float = None,
     rect_lon2: float = None,
+    bearing: float = 0.0,
 ) -> np.ndarray:
     """
-    Apply circular or rectangular cutout mask to DEM array.
+    Apply circular or rectangular cutout mask to DEM array with optional rotation.
 
     For circular cutouts, includes a buffer to keep pixels partially within the circle.
     This buffer allows later interpolation to n-gon perimeter vertices.
@@ -262,6 +212,7 @@ def apply_cutout_mask(
         rect_lon1: First corner longitude (EPSG:4326), or None
         rect_lat2: Second corner latitude (EPSG:4326), or None
         rect_lon2: Second corner longitude (EPSG:4326), or None
+        bearing: Bearing in degrees (0-360) for cutout rotation. 0=North, 90=East, etc.
 
     Returns:
         Masked DEM array with areas outside cutout set to nodata
@@ -276,20 +227,44 @@ def apply_cutout_mask(
     pixel_x = transform.c + transform.a * col_indices + transform.b * row_indices
     pixel_y = transform.f + transform.d * col_indices + transform.e * row_indices
 
+    # Convert bearing to radians for rotation (bearing is clockwise from north)
+    bearing_rad = np.radians(bearing)
+
     # Handle rectangle corners mode
     if rect_lat1 is not None and rect_lon1 is not None and rect_lat2 is not None and rect_lon2 is not None:
         # Transform both corners from EPSG:4326 to DEM's CRS
         corner1_x, corner1_y = transformer.transform(rect_lon1, rect_lat1)
         corner2_x, corner2_y = transformer.transform(rect_lon2, rect_lat2)
 
-        # Determine min/max bounds (corners can be in any order)
-        min_x = min(corner1_x, corner2_x)
-        max_x = max(corner1_x, corner2_x)
-        min_y = min(corner1_y, corner2_y)
-        max_y = max(corner1_y, corner2_y)
+        # Calculate center of the rectangle
+        center_x = (corner1_x + corner2_x) / 2.0
+        center_y = (corner1_y + corner2_y) / 2.0
 
-        # Create mask: True for pixels outside the rectangle
-        mask = (pixel_x < min_x) | (pixel_x > max_x) | (pixel_y < min_y) | (pixel_y > max_y)
+        if bearing != 0.0:
+            # Project pixel offsets onto bearing-aligned local frame
+            px_centered = pixel_x - center_x
+            py_centered = pixel_y - center_y
+            pixel_perp, pixel_along = rotate_to_bearing_frame(px_centered, py_centered, bearing_rad)
+
+            # Project corner offsets onto bearing-aligned local frame
+            c1_perp, c1_along = rotate_to_bearing_frame(corner1_x - center_x, corner1_y - center_y, bearing_rad)
+            c2_perp, c2_along = rotate_to_bearing_frame(corner2_x - center_x, corner2_y - center_y, bearing_rad)
+
+            # Determine min/max bounds in local frame
+            min_perp = min(c1_perp, c2_perp)
+            max_perp = max(c1_perp, c2_perp)
+            min_along = min(c1_along, c2_along)
+            max_along = max(c1_along, c2_along)
+
+            # Create mask using local-frame pixel coordinates
+            mask = (pixel_perp < min_perp) | (pixel_perp > max_perp) | (pixel_along < min_along) | (pixel_along > max_along)
+        else:
+            # No rotation - use original logic
+            min_x = min(corner1_x, corner2_x)
+            max_x = max(corner1_x, corner2_x)
+            min_y = min(corner1_y, corner2_y)
+            max_y = max(corner1_y, corner2_y)
+            mask = (pixel_x < min_x) | (pixel_x > max_x) | (pixel_y < min_y) | (pixel_y > max_y)
 
     # Handle center-based cutouts
     else:
@@ -300,9 +275,15 @@ def apply_cutout_mask(
         dx = pixel_x - center_x
         dy = pixel_y - center_y
 
+        # Apply rotation if bearing is non-zero
+        if bearing != 0.0 and side_length_km is not None:
+            # Project offset coordinates onto bearing-aligned local frame
+            dx, dy = rotate_to_bearing_frame(dx, dy, bearing_rad)
+
         # Create mask based on cutout type
         if radius_km is not None:
-            # Circular cutout - use exact radius for min/max calculation
+            # Circular cutout - rotation doesn't affect circular shapes
+            # Use exact radius for min/max calculation
             # For boolean intersection approach, we'll build a larger rectangular mesh
             # and let the boolean op cut it precisely
             radius_m = radius_km * 1000.0
