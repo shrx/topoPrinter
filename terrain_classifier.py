@@ -11,8 +11,6 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import requests
 from pyproj import Transformer
-from rasterio.features import rasterize
-from rasterio.enums import MergeAlg
 
 # Terrain class constants (priority: lower value = higher priority)
 TERRAIN_ROCK = 0
@@ -207,14 +205,20 @@ def _relation_to_geojson(element: dict) -> Optional[dict]:
         rings = [outer_rings[0]] + inner_rings
         return {"type": "Polygon", "coordinates": rings}
     else:
-        # MultiPolygon — assign inner rings to the outer ring that contains them
-        # Simple approach: put all inners with first outer (good enough for most cases)
+        # MultiPolygon — assign each inner ring to the outer ring that contains it
+        from shapely.geometry import Polygon as _Poly, Point as _Point
+        outer_polys = [_Poly(ring) for ring in outer_rings]
+        inner_assignments: Dict[int, list] = {i: [] for i in range(len(outer_rings))}
+        for inner in inner_rings:
+            # Test a point on the inner ring against each outer
+            pt = _Point(inner[0])
+            for i, op in enumerate(outer_polys):
+                if op.contains(pt):
+                    inner_assignments[i].append(inner)
+                    break
         polygons = []
         for i, outer in enumerate(outer_rings):
-            if i == 0:
-                polygons.append([outer] + inner_rings)
-            else:
-                polygons.append([outer])
+            polygons.append([outer] + inner_assignments[i])
         return {"type": "MultiPolygon", "coordinates": polygons}
 
 
@@ -271,20 +275,19 @@ def classify_terrain(
     ref_transform,
     ref_crs,
     overpass_url: str = OVERPASS_URL,
-) -> Tuple[np.ndarray, Dict[int, list]]:
-    """Query OSM and rasterize terrain classification onto the DEM grid.
+) -> Dict[int, list]:
+    """Query OSM and collect terrain polygon geometries.
 
     Args:
         dem_shape: (rows, cols) of the DEM array.
         ref_transform: rasterio Affine transform for the DEM.
         ref_crs: CRS of the DEM (pyproj or rasterio CRS).
         overpass_url: Overpass API endpoint.
+        terrain_types: optional list of terrain type names to include
+            (e.g. ["glacier", "foliage"]). None means all.
 
     Returns:
-        Tuple of:
-        - uint8 array of shape dem_shape with values:
-          0=rock, 1=glacier, 2=water, 3=foliage.
-        - dict mapping terrain class → list of GeoJSON geometry dicts in CRS coords.
+        dict mapping terrain class → list of GeoJSON geometry dicts in CRS coords.
     """
     rows, cols = dem_shape
 
@@ -316,12 +319,12 @@ def classify_terrain(
     query = _build_overpass_query(bbox)
     data = _query_overpass(query, overpass_url)
     if data is None:
-        return np.zeros(dem_shape, dtype=np.uint8), empty_features
+        return empty_features
 
     elements = data.get("elements", [])
     if not elements:
         print("[terrain] No OSM features found in bounding box.")
-        return np.zeros(dem_shape, dtype=np.uint8), empty_features
+        return empty_features
 
     # Parse, classify, and transform geometries
     from_wgs84 = Transformer.from_crs("EPSG:4326", ref_crs, always_xy=True)
@@ -345,23 +348,7 @@ def classify_terrain(
         geom_crs = _transform_geojson_to_crs(geom, from_wgs84)
         features_by_class[terrain_class].append(geom_crs)
 
-    # Rasterize in reverse priority order so higher priority overwrites
-    classification = np.zeros(dem_shape, dtype=np.uint8)
-
-    for terrain_class in [TERRAIN_FOLIAGE, TERRAIN_WATER, TERRAIN_GLACIER]:
-        geoms = features_by_class[terrain_class]
-        if not geoms:
-            continue
-        shapes = [(g, terrain_class) for g in geoms]
-        rasterize(
-            shapes,
-            out=classification,
-            transform=ref_transform,
-            all_touched=True,
-            merge_alg=MergeAlg.replace,
-        )
-
-    return classification, features_by_class
+    return features_by_class
 
 
 def _query_overpass(

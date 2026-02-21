@@ -116,6 +116,13 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         help="Thickness of terrain overlay shells in mm (default: 2.0).",
     )
     parser.add_argument(
+        "--terrain-types",
+        type=str,
+        default=None,
+        help="Comma-separated list of terrain types to include (default: all). "
+             "Valid types: glacier, water, foliage.",
+    )
+    parser.add_argument(
         "--terrain-recess-mode",
         choices=["flat", "uniform"],
         default="flat",
@@ -241,19 +248,35 @@ def main(argv: Iterable[str]) -> int:
                 cutout_radius_m = (args.diameter / 2.0) * 1000.0  # Convert km to m
 
         # Terrain classification
-        classification = None
+        class_geometries = None
         if args.terrain:
             from terrain_classifier import classify_terrain, TERRAIN_NAMES
             if args.lake_range_percent > 0 and args.lake_lowering_mm > 0:
                 print("[WARN] --terrain mode ignores --lake-range-percent and --lake-lowering-mm "
                       "(OSM water classification is used instead).", flush=True)
             print("[INFO] Classifying terrain from OSM data...", flush=True)
-            classification, class_geometries = classify_terrain(dem.shape, ref_transform, ref_crs)
+            terrain_type_list = args.terrain_types.split(",") if args.terrain_types else None
+            class_geometries = classify_terrain(dem.shape, ref_transform, ref_crs)
+            from shapely.geometry import shape as shapely_shape
+            from shapely.ops import unary_union
+            class_areas = {}
             for cls_val, cls_name in sorted(TERRAIN_NAMES.items()):
-                count = int(np.sum(classification == cls_val))
-                if count > 0:
-                    pct = 100.0 * count / classification.size
-                    print(f"[INFO]   {cls_name}: {count} pixels ({pct:.1f}%)")
+                geoms = class_geometries.get(cls_val, [])
+                if geoms:
+                    polys = [shapely_shape(g) for g in geoms]
+                    class_areas[cls_name] = unary_union(polys).area
+                else:
+                    class_areas[cls_name] = 0.0
+            total_area = sum(class_areas.values())
+            if total_area > 0:
+                rock_area = dem.shape[0] * abs(ref_transform.e) * dem.shape[1] * abs(ref_transform.a) - total_area
+                class_areas["rock"] = max(rock_area, 0.0)
+                total_with_rock = sum(class_areas.values())
+                for name in ["rock", "glacier", "water", "foliage"]:
+                    area = class_areas.get(name, 0.0)
+                    if area > 0:
+                        pct = 100.0 * area / total_with_rock
+                        print(f"[INFO]   {name}: {pct:.1f}%")
 
         # Build meshes
         input_stub = os.path.splitext(os.path.basename(args.url_list))[0]
@@ -262,9 +285,9 @@ def main(argv: Iterable[str]) -> int:
         if len(downloaded) > 1:
             base_name = f"{base_name}_mosaic"
 
-        if args.terrain and classification is not None:
+        if args.terrain and class_geometries is not None:
             terrain_meshes = build_all_terrain_meshes(
-                dem, classification, class_geometries,
+                dem, class_geometries,
                 px_size_x, px_size_y,
                 args.x_size_mm, max_height_mm, z_exaggeration,
                 args.base_thickness_mm, args.terrain_thickness_mm,
@@ -283,6 +306,7 @@ def main(argv: Iterable[str]) -> int:
                 rect_corner2_lat=rect_lat2,
                 rect_corner2_lon=rect_lon2,
                 recess_mode=args.terrain_recess_mode,
+                terrain_types=terrain_type_list,
             )
             for terrain_name, mesh_data in terrain_meshes.items():
                 if mesh_data is None:

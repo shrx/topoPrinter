@@ -209,11 +209,12 @@ class TestClassifyTerrain:
         # Approximate transform: 1km pixels, origin near (2580000, 1180000) in LV95
         transform = from_bounds(2580000, 1180000, 2590000, 1190000, 10, 10)
 
-        result, class_geoms = classify_terrain(dem_shape, transform, "EPSG:2056")
+        class_geoms = classify_terrain(dem_shape, transform, "EPSG:2056")
 
-        assert result.shape == dem_shape
-        assert result.dtype == np.uint8
-        assert set(np.unique(result)).issubset({TERRAIN_ROCK, TERRAIN_GLACIER, TERRAIN_WATER, TERRAIN_FOLIAGE})
+        assert isinstance(class_geoms, dict)
+        assert TERRAIN_GLACIER in class_geoms
+        assert TERRAIN_WATER in class_geoms
+        assert TERRAIN_FOLIAGE in class_geoms
 
     @patch("terrain_classifier.time.sleep")  # skip retry delays
     @patch("terrain_classifier.requests.post")
@@ -224,10 +225,9 @@ class TestClassifyTerrain:
         dem_shape = (5, 5)
         transform = from_bounds(2580000, 1180000, 2585000, 1185000, 5, 5)
 
-        result, class_geoms = classify_terrain(dem_shape, transform, "EPSG:2056")
+        class_geoms = classify_terrain(dem_shape, transform, "EPSG:2056")
 
-        assert result.shape == dem_shape
-        assert np.all(result == TERRAIN_ROCK)
+        assert all(len(v) == 0 for v in class_geoms.values())
 
     @patch("terrain_classifier.requests.post")
     def test_classify_terrain_empty_response(self, mock_post):
@@ -240,7 +240,6 @@ class TestClassifyTerrain:
         dem_shape = (5, 5)
         transform = from_bounds(2580000, 1180000, 2585000, 1185000, 5, 5)
 
-        result, class_geoms = classify_terrain(dem_shape, transform, "EPSG:2056")
+        class_geoms = classify_terrain(dem_shape, transform, "EPSG:2056")
 
-        assert result.shape == dem_shape
-        assert np.all(result == TERRAIN_ROCK)
+        assert all(len(v) == 0 for v in class_geoms.values())

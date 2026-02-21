@@ -1111,7 +1111,6 @@ def _iter_polygon_components(geom: shapely.Geometry):
 
 def build_all_terrain_meshes(
     dem: np.ndarray,
-    classification: np.ndarray,
     class_geometries: dict,
     px_size_x: float,
     px_size_y: float,
@@ -1135,6 +1134,7 @@ def build_all_terrain_meshes(
     rect_corner2_lat: Optional[float] = None,
     rect_corner2_lon: Optional[float] = None,
     recess_mode: str = "flat",
+    terrain_types: Optional[List[str]] = None,
 ) -> dict:
     """Build rock base mesh and terrain overlay meshes.
 
@@ -1147,6 +1147,23 @@ def build_all_terrain_meshes(
     """
     from terrain_classifier import TERRAIN_ROCK, TERRAIN_GLACIER, TERRAIN_WATER, TERRAIN_FOLIAGE, TERRAIN_NAMES
 
+    # Priority order: water > glacier > foliage > rock
+    PRIORITY_ORDER = [TERRAIN_WATER, TERRAIN_GLACIER, TERRAIN_FOLIAGE]
+
+    # Determine active (meshed) vs excluded terrain classes
+    if terrain_types is not None:
+        name_to_class = {v: k for k, v in TERRAIN_NAMES.items() if k != TERRAIN_ROCK}
+        active_set = set()
+        for t in terrain_types:
+            t = t.strip()
+            if t not in name_to_class:
+                raise ValueError(f"Unknown terrain type '{t}'. Valid types: {list(name_to_class.keys())}")
+            active_set.add(name_to_class[t])
+    else:
+        active_set = set(PRIORITY_ORDER)
+
+    all_overlay_classes = [tc for tc in PRIORITY_ORDER if tc in active_set]
+
     rows, cols = dem.shape
 
     # Compute model coordinates once (shared by rock base and overlays)
@@ -1157,31 +1174,47 @@ def build_all_terrain_meshes(
         use_true_scale=use_true_scale,
     )
 
-    # Convert all class geometries to shapely in model mm, union per class
+    # Convert ALL class geometries to shapely in model mm (including excluded)
     class_polys_mm = {}
-    for tc in [TERRAIN_GLACIER, TERRAIN_WATER, TERRAIN_FOLIAGE]:
+    for tc in PRIORITY_ORDER:
         geoms = class_geometries.get(tc, [])
         poly = _polygons_to_model_mm(
             geoms, ref_transform, rows, cols, x_size_mm, model_y_mm,
         )
         class_polys_mm[tc] = poly
 
+    # For excluded types, merge each component polygon into the active type
+    # that spatially contains it.  Components not inside any active type
+    # fall through to rock (no action needed).
+    for tc in PRIORITY_ORDER:
+        if tc in active_set or class_polys_mm[tc] is None:
+            continue
+        for component in _iter_polygon_components(class_polys_mm[tc]):
+            pt = component.representative_point()
+            for candidate in PRIORITY_ORDER:
+                if candidate not in active_set or class_polys_mm[candidate] is None:
+                    continue
+                if class_polys_mm[candidate].contains(pt):
+                    class_polys_mm[candidate] = unary_union([class_polys_mm[candidate], component])
+                    break
+            # If no active type contains it, it becomes rock — nothing to do
+        class_polys_mm[tc] = None
+
     # Subtract higher-priority classes from lower-priority ones to make
-    # mutually exclusive (matches the pixel rasterization priority order:
-    # glacier > water > foliage)
-    if class_polys_mm[TERRAIN_WATER] is not None and class_polys_mm[TERRAIN_GLACIER] is not None:
-        diff = class_polys_mm[TERRAIN_WATER].difference(class_polys_mm[TERRAIN_GLACIER])
-        class_polys_mm[TERRAIN_WATER] = diff if not diff.is_empty else None
-    higher = [p for p in [class_polys_mm[TERRAIN_GLACIER], class_polys_mm[TERRAIN_WATER]] if p is not None]
-    if class_polys_mm[TERRAIN_FOLIAGE] is not None and higher:
-        combined_higher = unary_union(higher)
-        diff = class_polys_mm[TERRAIN_FOLIAGE].difference(combined_higher)
-        class_polys_mm[TERRAIN_FOLIAGE] = diff if not diff.is_empty else None
+    # mutually exclusive (priority: water > glacier > foliage)
+    for i, tc in enumerate(PRIORITY_ORDER):
+        if class_polys_mm[tc] is None:
+            continue
+        higher = [class_polys_mm[h] for h in PRIORITY_ORDER[:i] if class_polys_mm[h] is not None]
+        if higher:
+            combined_higher = unary_union(higher)
+            diff = class_polys_mm[tc].difference(combined_higher)
+            class_polys_mm[tc] = diff if not diff.is_empty else None
 
     # Pre-compute flat_z per overlay component (shared by recess and overlay)
     # List of (terrain_class, component_polygon, flat_z)
     overlay_components = []
-    for tc in [TERRAIN_GLACIER, TERRAIN_WATER, TERRAIN_FOLIAGE]:
+    for tc in all_overlay_classes:
         union_poly = class_polys_mm[tc]
         if union_poly is None:
             continue
@@ -1314,7 +1347,7 @@ def build_all_terrain_meshes(
     for tc, component, flat_z in overlay_components:
         class_components[tc].append((component, flat_z))
 
-    for terrain_class in [TERRAIN_GLACIER, TERRAIN_WATER, TERRAIN_FOLIAGE]:
+    for terrain_class in all_overlay_classes:
         name = TERRAIN_NAMES[terrain_class]
         components = class_components.get(terrain_class, [])
         if not components:
