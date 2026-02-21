@@ -8,6 +8,10 @@ import numpy as np
 from pyproj import Transformer
 import trimesh
 
+from shapely.geometry import shape as shapely_shape, Polygon as ShapelyPolygon, MultiPolygon
+from shapely.ops import unary_union
+import shapely
+
 from bearing_utils import rotate_to_bearing_frame, rotate_from_bearing_frame
 
 
@@ -129,6 +133,213 @@ def _build_rectangular_mesh(
                 faces.append((v11, b10, b11))
 
     return vertices, np.array(faces, dtype=np.int64), vertex_map
+
+
+def _crs_to_model_xy(
+    crs_coords: List[Tuple[float, float]],
+    ref_transform,
+    rows: int,
+    cols: int,
+    x_size_mm: float,
+    model_y_mm: float,
+) -> List[Tuple[float, float]]:
+    """Convert CRS coordinates to model mm coordinates.
+
+    Uses the same linear mapping as _compute_model_coordinates:
+    model_x = col_frac / (cols-1) * x_size_mm
+    model_y = model_y_mm * (1 - row_frac / (rows-1))
+    """
+    result = []
+    for x_crs, y_crs in crs_coords:
+        col_frac = (x_crs - ref_transform.c) / ref_transform.a
+        row_frac = (y_crs - ref_transform.f) / ref_transform.e
+        model_x = col_frac / (cols - 1) * x_size_mm
+        model_y = model_y_mm * (1 - row_frac / (rows - 1))
+        result.append((model_x, model_y))
+    return result
+
+
+def _geojson_to_shapely_mm(
+    geojson_geom: dict,
+    ref_transform,
+    rows: int,
+    cols: int,
+    x_size_mm: float,
+    model_y_mm: float,
+) -> shapely.Geometry:
+    """Convert a GeoJSON geometry (CRS coords) to a shapely geometry in model mm."""
+    geom = shapely_shape(geojson_geom)
+    # Transform all coordinates from CRS to model mm
+    def _transform_ring(ring):
+        crs_coords = list(ring.coords)
+        return _crs_to_model_xy(crs_coords, ref_transform, rows, cols, x_size_mm, model_y_mm)
+
+    if geom.geom_type == "Polygon":
+        exterior = _transform_ring(geom.exterior)
+        holes = [_transform_ring(h) for h in geom.interiors]
+        return ShapelyPolygon(exterior, holes)
+    elif geom.geom_type == "MultiPolygon":
+        polys = []
+        for poly in geom.geoms:
+            exterior = _transform_ring(poly.exterior)
+            holes = [_transform_ring(h) for h in poly.interiors]
+            polys.append(ShapelyPolygon(exterior, holes))
+        return MultiPolygon(polys)
+    return shapely_shape(geojson_geom)
+
+
+def _polygon_bbox_to_grid(
+    polygon_mm: ShapelyPolygon,
+    X: np.ndarray,
+    Y: np.ndarray,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Convert polygon bounding box to grid index range (i_min, i_max, j_min, j_max).
+
+    Returns None if the crop region is too small.
+    """
+    rows, cols = X.shape
+    x_size_mm = float(X[0, -1])
+    model_y_mm = float(Y[0, 0])
+    minx, miny, maxx, maxy = polygon_mm.bounds
+
+    j_min = max(int(np.floor(minx * (cols - 1) / x_size_mm)) - 1, 0)
+    j_max = min(int(np.ceil(maxx * (cols - 1) / x_size_mm)) + 1, cols - 1)
+    i_min = max(int(np.floor((1 - maxy / model_y_mm) * (rows - 1))) - 1, 0)
+    i_max = min(int(np.ceil((1 - miny / model_y_mm) * (rows - 1))) + 1, rows - 1)
+
+    if (i_max - i_min + 1) < 2 or (j_max - j_min + 1) < 2:
+        return None
+    return i_min, i_max, j_min, j_max
+
+
+def _compute_component_flat_z(
+    polygon_mm: ShapelyPolygon,
+    z_surface_mm: np.ndarray,
+    X: np.ndarray,
+    Y: np.ndarray,
+    valid_mask: np.ndarray,
+    thickness_mm: float,
+) -> Optional[float]:
+    """Compute the flat Z bottom for an overlay component via point-in-polygon."""
+    bbox = _polygon_bbox_to_grid(polygon_mm, X, Y)
+    if bbox is None:
+        return None
+    i_min, i_max, j_min, j_max = bbox
+
+    X_crop = X[i_min:i_max + 1, j_min:j_max + 1]
+    Y_crop = Y[i_min:i_max + 1, j_min:j_max + 1]
+    z_crop = z_surface_mm[i_min:i_max + 1, j_min:j_max + 1]
+    valid_crop = valid_mask[i_min:i_max + 1, j_min:j_max + 1]
+
+    pts = shapely.points(X_crop.ravel(), Y_crop.ravel())
+    inside = shapely.contains(polygon_mm, pts).reshape(X_crop.shape)
+    inside &= valid_crop
+
+    if not inside.any():
+        return None
+    return max(float(np.min(z_crop[inside])) - thickness_mm, 0.01)
+
+
+def _build_polygon_prism(
+    polygon_mm: ShapelyPolygon,
+    z_bottom: float,
+    z_top: float,
+) -> Optional[trimesh.Trimesh]:
+    """Build a watertight extruded prism from a shapely Polygon.
+
+    Uses trimesh.creation.extrude_polygon for correct triangulation of
+    non-convex polygons and polygons with holes.  Applies buffer(0) to fix
+    self-touching boundaries from shapely boolean ops (may yield MultiPolygon).
+
+    Returns trimesh volume or None if degenerate.
+    """
+    polygon_mm = polygon_mm.buffer(0)
+    if polygon_mm.is_empty:
+        return None
+    height = z_top - z_bottom
+    if height <= 0:
+        return None
+
+    if polygon_mm.geom_type == "Polygon":
+        polys = [polygon_mm]
+    elif polygon_mm.geom_type == "MultiPolygon":
+        polys = list(polygon_mm.geoms)
+    else:
+        return None
+
+    meshes = []
+    for poly in polys:
+        if poly.is_empty or not poly.is_valid:
+            continue
+        mesh = trimesh.creation.extrude_polygon(poly, height)
+        mesh.apply_translation([0, 0, z_bottom])
+        if mesh.is_empty or len(mesh.faces) == 0:
+            continue
+        mesh.fix_normals()
+        meshes.append(mesh)
+
+    if not meshes:
+        return None
+    if len(meshes) == 1:
+        return meshes[0]
+    return trimesh.boolean.union(meshes, check_volume=False)
+
+
+def _build_overlay_component(
+    polygon_mm: ShapelyPolygon,
+    flat_z: float,
+    z_surface_mm: np.ndarray,
+    X: np.ndarray,
+    Y: np.ndarray,
+    valid_mask: np.ndarray,
+    thickness_mm: float,
+) -> Optional[trimesh.Trimesh]:
+    """Build one overlay component mesh via boolean intersection.
+
+    Args:
+        polygon_mm: shapely Polygon in model mm coordinates.
+        flat_z: pre-computed flat Z bottom for this component.
+        z_surface_mm: terrain surface Z array (rows x cols).
+        X, Y: model coordinate grids (rows x cols).
+        valid_mask: valid DEM data mask (rows x cols).
+        thickness_mm: overlay shell thickness.
+
+    Returns:
+        trimesh.Trimesh or None if no DEM data inside polygon.
+    """
+    bbox = _polygon_bbox_to_grid(polygon_mm, X, Y)
+    if bbox is None:
+        return None
+    i_min, i_max, j_min, j_max = bbox
+
+    X_crop = X[i_min:i_max + 1, j_min:j_max + 1]
+    Y_crop = Y[i_min:i_max + 1, j_min:j_max + 1]
+    z_crop = z_surface_mm[i_min:i_max + 1, j_min:j_max + 1]
+    valid_crop = valid_mask[i_min:i_max + 1, j_min:j_max + 1]
+    crop_rows = i_max - i_min + 1
+    crop_cols = j_max - j_min + 1
+
+    verts_dem, faces_dem, _ = _build_rectangular_mesh(
+        crop_rows, crop_cols, X_crop, Y_crop, z_crop, valid_crop,
+    )
+    if len(faces_dem) == 0:
+        return None
+
+    dem_mesh = trimesh.Trimesh(vertices=verts_dem, faces=faces_dem)
+
+    max_terrain_z = float(np.max(z_crop[valid_crop]))
+    prism_top = max(max_terrain_z + thickness_mm * 2, flat_z + thickness_mm * 10)
+
+    prism_mesh = _build_polygon_prism(polygon_mm, flat_z, prism_top)
+    if prism_mesh is None:
+        return None
+
+    result = trimesh.boolean.intersection([dem_mesh, prism_mesh], check_volume=False)
+    if result.is_empty or len(result.faces) == 0:
+        return None
+
+    return result
+
 
 
 def _build_rect_cutout_mesh(
@@ -382,7 +593,7 @@ def _build_circular_cutout_mesh(
     return vertices, faces_array, max_z, None
 
 
-def dem_to_vertices_and_faces(
+def _compute_model_coordinates(
     dem: np.ndarray,
     px_size_x: float,
     px_size_y: float,
@@ -393,30 +604,16 @@ def dem_to_vertices_and_faces(
     lake_range_percent: float = 0.0,
     lake_lowering_mm: float = 0.0,
     use_true_scale: bool = False,
-    cutout_type: Optional[str] = None,
-    cutout_center_lat: Optional[float] = None,
-    cutout_center_lon: Optional[float] = None,
-    cutout_radius_m: Optional[float] = None,
-    cutout_side_length_km: Optional[float] = None,
-    ref_transform: Optional[object] = None,
-    ref_crs: Optional[object] = None,
-    n_gon_sides: int = 64,
-    bearing: float = 0.0,
-    rect_corner1_lat: Optional[float] = None,
-    rect_corner1_lon: Optional[float] = None,
-    rect_corner2_lat: Optional[float] = None,
-    rect_corner2_lon: Optional[float] = None,
-) -> Tuple[np.ndarray, np.ndarray, float, Optional[np.ndarray]]:
-    """
-    Convert DEM grid into watertight mesh vertices/faces.
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], float]:
+    """Compute model-space coordinates from DEM data.
 
-    Cutout cropping is handled by boolean intersection for all cutout types.
+    Returns:
+        (X, Y, z_surface_mm, valid_mask, lake_mask, model_y_mm)
     """
     rows, cols = dem.shape
     aspect_ratio = (rows * px_size_y) / (cols * px_size_x)
     model_y_mm = x_size_mm * aspect_ratio
 
-    # Create mask for valid data (not NaN or infinite)
     valid_mask = np.isfinite(dem)
     if not valid_mask.any():
         raise ValueError("DEM contains no valid data (all NaN/infinite)")
@@ -450,10 +647,49 @@ def dem_to_vertices_and_faces(
             target_lake_mm = max(lake_min_mm - lake_lowering_mm, 0.0)
             z_surface_mm = np.where(lake_mask, target_lake_mm, z_surface_mm)
 
-    # Model axes aligned with CRS: X ∝ Easting, Y ∝ Northing
     xs = np.linspace(0, x_size_mm, cols)
     ys = np.linspace(model_y_mm, 0, rows)
     X, Y = np.meshgrid(xs, ys)
+
+    return X, Y, z_surface_mm, valid_mask, lake_mask, model_y_mm
+
+
+def dem_to_vertices_and_faces(
+    dem: np.ndarray,
+    px_size_x: float,
+    px_size_y: float,
+    x_size_mm: float,
+    max_height_mm: float,
+    z_exaggeration: float,
+    base_thickness_mm: float,
+    lake_range_percent: float = 0.0,
+    lake_lowering_mm: float = 0.0,
+    use_true_scale: bool = False,
+    cutout_type: Optional[str] = None,
+    cutout_center_lat: Optional[float] = None,
+    cutout_center_lon: Optional[float] = None,
+    cutout_radius_m: Optional[float] = None,
+    cutout_side_length_km: Optional[float] = None,
+    ref_transform: Optional[object] = None,
+    ref_crs: Optional[object] = None,
+    n_gon_sides: int = 64,
+    bearing: float = 0.0,
+    rect_corner1_lat: Optional[float] = None,
+    rect_corner1_lon: Optional[float] = None,
+    rect_corner2_lat: Optional[float] = None,
+    rect_corner2_lon: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray, float, Optional[np.ndarray]]:
+    """
+    Convert DEM grid into watertight mesh vertices/faces.
+
+    Cutout cropping is handled by boolean intersection for all cutout types.
+    """
+    X, Y, z_surface_mm, valid_mask, lake_mask, model_y_mm = _compute_model_coordinates(
+        dem, px_size_x, px_size_y, x_size_mm, max_height_mm,
+        z_exaggeration, base_thickness_mm, lake_range_percent,
+        lake_lowering_mm, use_true_scale,
+    )
+    rows, cols = dem.shape
 
     # Handle circular cutout with smooth n-gon perimeter
     if cutout_type == "circular" and cutout_center_lat is not None and cutout_radius_m is not None:
@@ -565,6 +801,514 @@ def dem_to_vertices_and_faces(
 
     max_z = float(np.max(z_surface_mm))
     return vertices.astype(np.float32), faces_array, max_z, water_faces_array
+
+
+def _build_cutout_shape(
+    cutout_type: str,
+    dem_shape: Tuple[int, int],
+    px_size_x: float,
+    px_size_y: float,
+    x_size_mm: float,
+    z_surface_mm: np.ndarray,
+    valid_mask: np.ndarray,
+    X: np.ndarray,
+    Y: np.ndarray,
+    base_thickness_mm: float,
+    ref_transform: object,
+    ref_crs: object,
+    cutout_center_lat: Optional[float] = None,
+    cutout_center_lon: Optional[float] = None,
+    cutout_radius_m: Optional[float] = None,
+    cutout_side_length_km: Optional[float] = None,
+    n_gon_sides: int = 64,
+    bearing: float = 0.0,
+    rect_corner1_lat: Optional[float] = None,
+    rect_corner1_lon: Optional[float] = None,
+    rect_corner2_lat: Optional[float] = None,
+    rect_corner2_lon: Optional[float] = None,
+) -> Optional[trimesh.Trimesh]:
+    """Build the cutout shape (cylinder or rotated box) as a trimesh solid.
+
+    Returns the cutout shape mesh, or None if cutout_type is not recognized.
+    """
+    rows, cols = dem_shape
+    max_terrain_z = float(np.max(z_surface_mm[valid_mask]))
+    box_height = max(max_terrain_z * 2, base_thickness_mm * 3)
+
+    transformer = Transformer.from_crs("EPSG:4326", ref_crs, always_xy=True)
+
+    if cutout_type == "circular":
+        center_x_crs, center_y_crs = transformer.transform(cutout_center_lon, cutout_center_lat)
+        from rasterio.transform import rowcol
+        cr, cc = rowcol(ref_transform, center_x_crs, center_y_crs)
+        cr = max(0, min(rows - 1, cr))
+        cc = max(0, min(cols - 1, cc))
+        center_x_mm = X[cr, cc]
+        center_y_mm = Y[cr, cc]
+
+        terrain_width_m = cols * px_size_x
+        scale = x_size_mm / terrain_width_m
+        radius_mm = cutout_radius_m * scale
+
+        angles = np.linspace(0, 2 * np.pi, n_gon_sides, endpoint=False)
+        ngon_x = center_x_mm + radius_mm * np.cos(angles)
+        ngon_y = center_y_mm + radius_mm * np.sin(angles)
+
+        verts = []
+        for i in range(n_gon_sides):
+            verts.append([ngon_x[i], ngon_y[i], 0.0])
+        for i in range(n_gon_sides):
+            verts.append([ngon_x[i], ngon_y[i], box_height])
+
+        faces = []
+        for i in range(n_gon_sides):
+            ni = (i + 1) % n_gon_sides
+            faces.append([i, n_gon_sides + i, ni])
+            faces.append([ni, n_gon_sides + i, n_gon_sides + ni])
+        for i in range(1, n_gon_sides - 1):
+            faces.append([0, i + 1, i])
+        for i in range(1, n_gon_sides - 1):
+            faces.append([n_gon_sides, n_gon_sides + i, n_gon_sides + i + 1])
+
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces)
+        mesh.fix_normals()
+        return mesh
+
+    elif cutout_type == "rectangular":
+        bearing_rad = np.radians(bearing)
+
+        if rect_corner1_lat is not None:
+            c1_x, c1_y = transformer.transform(rect_corner1_lon, rect_corner1_lat)
+            c2_x, c2_y = transformer.transform(rect_corner2_lon, rect_corner2_lat)
+        else:
+            cx, cy = transformer.transform(cutout_center_lon, cutout_center_lat)
+            half = cutout_side_length_km * 1000.0 / 2.0
+            de1, dn1 = rotate_from_bearing_frame(-half, -half, bearing_rad)
+            c1_x, c1_y = cx + de1, cy + dn1
+            de2, dn2 = rotate_from_bearing_frame(half, half, bearing_rad)
+            c2_x, c2_y = cx + de2, cy + dn2
+
+        dx_crs = c2_x - c1_x
+        dy_crs = c2_y - c1_y
+        AB_length_m, AD_length_m = rotate_to_bearing_frame(dx_crs, dy_crs, bearing_rad)
+        AB_length_m = abs(AB_length_m)
+        AD_length_m = abs(AD_length_m)
+
+        terrain_width_m = abs(ref_transform.a) * cols
+        dem_scale = x_size_mm / terrain_width_m
+        half_w = AB_length_m * dem_scale / 2.0
+        half_h = AD_length_m * dem_scale / 2.0
+
+        center_x_crs = (c1_x + c2_x) / 2.0
+        center_y_crs = (c1_y + c2_y) / 2.0
+        from rasterio.transform import rowcol
+        cr, cc = rowcol(ref_transform, center_x_crs, center_y_crs)
+        cr = max(0, min(rows - 1, cr))
+        cc = max(0, min(cols - 1, cc))
+        center_x_mm = X[cr, cc]
+        center_y_mm = Y[cr, cc]
+
+        box_verts_local = [
+            [-half_w, -half_h, 0], [half_w, -half_h, 0],
+            [half_w, half_h, 0], [-half_w, half_h, 0],
+            [-half_w, -half_h, box_height], [half_w, -half_h, box_height],
+            [half_w, half_h, box_height], [-half_w, half_h, box_height],
+        ]
+        box_verts_rot = []
+        for vx, vy, vz in box_verts_local:
+            de, dn = rotate_from_bearing_frame(vx, vy, bearing_rad)
+            box_verts_rot.append([de + center_x_mm, dn + center_y_mm, vz])
+
+        box_faces = [
+            [0, 1, 2], [0, 2, 3],
+            [4, 6, 5], [4, 7, 6],
+            [0, 4, 1], [1, 4, 5],
+            [1, 5, 2], [2, 5, 6],
+            [2, 6, 3], [3, 6, 7],
+            [3, 7, 0], [0, 7, 4],
+        ]
+        mesh = trimesh.Trimesh(vertices=box_verts_rot, faces=box_faces)
+        mesh.fix_normals()
+        return mesh
+
+    return None
+
+
+def _rasterize_cutout_mask(
+    dem_shape: Tuple[int, int],
+    ref_transform,
+    ref_crs,
+    cutout_type: str,
+    cutout_center_lat: Optional[float] = None,
+    cutout_center_lon: Optional[float] = None,
+    cutout_radius_m: Optional[float] = None,
+    cutout_side_length_km: Optional[float] = None,
+    bearing: float = 0.0,
+    rect_corner1_lat: Optional[float] = None,
+    rect_corner1_lon: Optional[float] = None,
+    rect_corner2_lat: Optional[float] = None,
+    rect_corner2_lon: Optional[float] = None,
+) -> np.ndarray:
+    """Compute a boolean pixel mask for the cutout region on the DEM grid.
+
+    Returns:
+        Boolean array of shape dem_shape, True inside cutout.
+    """
+    rows, cols = dem_shape
+    transformer = Transformer.from_crs("EPSG:4326", ref_crs, always_xy=True)
+
+    # Build CRS coordinates for each pixel center
+    col_idx, row_idx = np.meshgrid(np.arange(cols), np.arange(rows))
+    # Pixel center: (col + 0.5, row + 0.5) in pixel space -> CRS via transform
+    px_x_crs = ref_transform.a * (col_idx + 0.5) + ref_transform.c
+    px_y_crs = ref_transform.e * (row_idx + 0.5) + ref_transform.f
+
+    if cutout_type == "circular":
+        center_x_crs, center_y_crs = transformer.transform(cutout_center_lon, cutout_center_lat)
+        dist = np.sqrt((px_x_crs - center_x_crs)**2 + (px_y_crs - center_y_crs)**2)
+        return dist <= cutout_radius_m
+
+    elif cutout_type == "rectangular":
+        bearing_rad = np.radians(bearing)
+
+        if rect_corner1_lat is not None:
+            c1_x, c1_y = transformer.transform(rect_corner1_lon, rect_corner1_lat)
+            c2_x, c2_y = transformer.transform(rect_corner2_lon, rect_corner2_lat)
+        else:
+            cx, cy = transformer.transform(cutout_center_lon, cutout_center_lat)
+            half = cutout_side_length_km * 1000.0 / 2.0
+            de1, dn1 = rotate_from_bearing_frame(-half, -half, bearing_rad)
+            c1_x, c1_y = cx + de1, cy + dn1
+            de2, dn2 = rotate_from_bearing_frame(half, half, bearing_rad)
+            c2_x, c2_y = cx + de2, cy + dn2
+
+        center_x_crs = (c1_x + c2_x) / 2.0
+        center_y_crs = (c1_y + c2_y) / 2.0
+        dx_crs = c2_x - c1_x
+        dy_crs = c2_y - c1_y
+        half_w, half_h = rotate_to_bearing_frame(dx_crs, dy_crs, bearing_rad)
+        half_w = abs(half_w) / 2.0
+        half_h = abs(half_h) / 2.0
+
+        # Project pixel offsets from center onto bearing-aligned frame
+        de = px_x_crs - center_x_crs
+        dn = px_y_crs - center_y_crs
+        perp, along = rotate_to_bearing_frame(de, dn, bearing_rad)
+
+        return (np.abs(perp) <= half_w) & (np.abs(along) <= half_h)
+
+    # No cutout
+    return np.ones(dem_shape, dtype=bool)
+
+
+def _apply_rect_cutout_transform(
+    verts: np.ndarray,
+    dem_shape: Tuple[int, int],
+    px_size_x: float,
+    x_size_mm: float,
+    ref_transform: object,
+    X: np.ndarray,
+    Y: np.ndarray,
+    bearing: float,
+    c1_x_crs: float,
+    c1_y_crs: float,
+    c2_x_crs: float,
+    c2_y_crs: float,
+) -> np.ndarray:
+    """Apply the rectangular cutout rescale and bearing un-rotation to vertices.
+
+    Transforms vertices from DEM mesh space to final model space
+    (same transform as _build_rect_cutout_mesh post-processing).
+    """
+    rows, cols = dem_shape
+    bearing_rad = np.radians(bearing)
+
+    dx_crs = c2_x_crs - c1_x_crs
+    dy_crs = c2_y_crs - c1_y_crs
+    AB_length_m, AD_length_m = rotate_to_bearing_frame(dx_crs, dy_crs, bearing_rad)
+    AB_length_m = abs(AB_length_m)
+    AD_length_m = abs(AD_length_m)
+
+    terrain_width_m = abs(ref_transform.a) * cols
+    dem_scale = x_size_mm / terrain_width_m
+    final_scale = x_size_mm / AB_length_m
+
+    rect_width_mm_final = x_size_mm
+    rect_height_mm_final = AD_length_m * final_scale
+
+    center_x_crs = (c1_x_crs + c2_x_crs) / 2.0
+    center_y_crs = (c1_y_crs + c2_y_crs) / 2.0
+    from rasterio.transform import rowcol
+    cr, cc = rowcol(ref_transform, center_x_crs, center_y_crs)
+    cr = max(0, min(rows - 1, cr))
+    cc = max(0, min(cols - 1, cc))
+    center_x_mm = X[cr, cc]
+    center_y_mm = Y[cr, cc]
+
+    result = verts.copy()
+    dx = result[:, 0] - center_x_mm
+    dy = result[:, 1] - center_y_mm
+    local_perp, local_along = rotate_to_bearing_frame(dx, dy, bearing_rad)
+
+    scale_factor = final_scale / dem_scale
+    local_perp *= scale_factor
+    local_along *= scale_factor
+
+    result[:, 0] = local_perp + rect_width_mm_final / 2.0
+    result[:, 1] = local_along + rect_height_mm_final / 2.0
+    return result
+
+
+def _polygons_to_model_mm(
+    geojson_geoms: List[dict],
+    ref_transform,
+    rows: int,
+    cols: int,
+    x_size_mm: float,
+    model_y_mm: float,
+) -> Optional[shapely.Geometry]:
+    """Convert a list of GeoJSON geometries (CRS) to a single unioned shapely geometry in model mm."""
+    if not geojson_geoms:
+        return None
+    polys_mm = []
+    for g in geojson_geoms:
+        p = _geojson_to_shapely_mm(g, ref_transform, rows, cols, x_size_mm, model_y_mm)
+        if p.is_valid and not p.is_empty:
+            polys_mm.append(p)
+    if not polys_mm:
+        return None
+    union = unary_union(polys_mm)
+    if union.is_empty:
+        return None
+    return union
+
+
+def _iter_polygon_components(geom: shapely.Geometry):
+    """Yield individual Polygon components from a Polygon or MultiPolygon."""
+    if geom.geom_type == "Polygon":
+        yield geom
+    elif geom.geom_type == "MultiPolygon":
+        yield from geom.geoms
+
+
+def build_all_terrain_meshes(
+    dem: np.ndarray,
+    classification: np.ndarray,
+    class_geometries: dict,
+    px_size_x: float,
+    px_size_y: float,
+    x_size_mm: float,
+    max_height_mm: float,
+    z_exaggeration: float,
+    base_thickness_mm: float,
+    overlay_thickness_mm: float,
+    use_true_scale: bool = False,
+    cutout_type: Optional[str] = None,
+    cutout_center_lat: Optional[float] = None,
+    cutout_center_lon: Optional[float] = None,
+    cutout_radius_m: Optional[float] = None,
+    cutout_side_length_km: Optional[float] = None,
+    ref_transform: Optional[object] = None,
+    ref_crs: Optional[object] = None,
+    n_gon_sides: int = 64,
+    bearing: float = 0.0,
+    rect_corner1_lat: Optional[float] = None,
+    rect_corner1_lon: Optional[float] = None,
+    rect_corner2_lat: Optional[float] = None,
+    rect_corner2_lon: Optional[float] = None,
+) -> dict:
+    """Build rock base mesh and terrain overlay meshes.
+
+    Args:
+        class_geometries: dict mapping terrain class int → list of GeoJSON
+            geometry dicts in CRS coordinates (from classify_terrain).
+
+    Returns:
+        dict mapping terrain name to (vertices, faces, max_z) or None.
+    """
+    from terrain_classifier import TERRAIN_ROCK, TERRAIN_GLACIER, TERRAIN_WATER, TERRAIN_FOLIAGE, TERRAIN_NAMES
+
+    rows, cols = dem.shape
+
+    # Compute model coordinates once (shared by rock base and overlays)
+    X, Y, z_surface_mm, valid_mask, _, model_y_mm = _compute_model_coordinates(
+        dem, px_size_x, px_size_y, x_size_mm, max_height_mm,
+        z_exaggeration, base_thickness_mm,
+        lake_range_percent=0.0, lake_lowering_mm=0.0,
+        use_true_scale=use_true_scale,
+    )
+
+    # Convert all class geometries to shapely in model mm, union per class
+    class_polys_mm = {}
+    for tc in [TERRAIN_GLACIER, TERRAIN_WATER, TERRAIN_FOLIAGE]:
+        geoms = class_geometries.get(tc, [])
+        poly = _polygons_to_model_mm(
+            geoms, ref_transform, rows, cols, x_size_mm, model_y_mm,
+        )
+        class_polys_mm[tc] = poly
+
+    # Subtract higher-priority classes from lower-priority ones to make
+    # mutually exclusive (matches the pixel rasterization priority order:
+    # glacier > water > foliage)
+    if class_polys_mm[TERRAIN_WATER] is not None and class_polys_mm[TERRAIN_GLACIER] is not None:
+        diff = class_polys_mm[TERRAIN_WATER].difference(class_polys_mm[TERRAIN_GLACIER])
+        class_polys_mm[TERRAIN_WATER] = diff if not diff.is_empty else None
+    higher = [p for p in [class_polys_mm[TERRAIN_GLACIER], class_polys_mm[TERRAIN_WATER]] if p is not None]
+    if class_polys_mm[TERRAIN_FOLIAGE] is not None and higher:
+        combined_higher = unary_union(higher)
+        diff = class_polys_mm[TERRAIN_FOLIAGE].difference(combined_higher)
+        class_polys_mm[TERRAIN_FOLIAGE] = diff if not diff.is_empty else None
+
+    # Pre-compute flat_z per overlay component (shared by recess and overlay)
+    # List of (terrain_class, component_polygon, flat_z)
+    overlay_components = []
+    for tc in [TERRAIN_GLACIER, TERRAIN_WATER, TERRAIN_FOLIAGE]:
+        union_poly = class_polys_mm[tc]
+        if union_poly is None:
+            continue
+        for component in _iter_polygon_components(union_poly):
+            fz = _compute_component_flat_z(
+                component, z_surface_mm, X, Y, valid_mask, overlay_thickness_mm,
+            )
+            if fz is not None:
+                overlay_components.append((tc, component, fz))
+
+    # Compute CRS corners for rectangular cutout (needed for rock mesh and transforms)
+    c1_x_crs = c1_y_crs = c2_x_crs = c2_y_crs = None
+    if cutout_type == "rectangular" and ref_transform and ref_crs:
+        transformer = Transformer.from_crs("EPSG:4326", ref_crs, always_xy=True)
+        bearing_rad = np.radians(bearing)
+        if rect_corner1_lat is not None:
+            c1_x_crs, c1_y_crs = transformer.transform(rect_corner1_lon, rect_corner1_lat)
+            c2_x_crs, c2_y_crs = transformer.transform(rect_corner2_lon, rect_corner2_lat)
+        else:
+            cx, cy = transformer.transform(cutout_center_lon, cutout_center_lat)
+            half = cutout_side_length_km * 1000.0 / 2.0
+            de1, dn1 = rotate_from_bearing_frame(-half, -half, bearing_rad)
+            c1_x_crs, c1_y_crs = cx + de1, cy + dn1
+            de2, dn2 = rotate_from_bearing_frame(half, half, bearing_rad)
+            c2_x_crs, c2_y_crs = cx + de2, cy + dn2
+
+    # Build cutout shape once (shared by rock mesh and all overlays)
+    cutout_shape = _build_cutout_shape(
+        cutout_type, dem.shape, px_size_x, px_size_y, x_size_mm,
+        z_surface_mm, valid_mask, X, Y, base_thickness_mm,
+        ref_transform, ref_crs,
+        cutout_center_lat=cutout_center_lat,
+        cutout_center_lon=cutout_center_lon,
+        cutout_radius_m=cutout_radius_m,
+        cutout_side_length_km=cutout_side_length_km,
+        n_gon_sides=n_gon_sides,
+        bearing=bearing,
+        rect_corner1_lat=rect_corner1_lat,
+        rect_corner1_lon=rect_corner1_lon,
+        rect_corner2_lat=rect_corner2_lat,
+        rect_corner2_lon=rect_corner2_lon,
+    )
+
+    # Build rock base mesh: recess first, then cutout.
+    # Overlay polygons are NOT clipped to the cutout boundary, so recess
+    # prisms extend beyond the DEM grid — no coplanar faces with the DEM
+    # perimeter wall.  The cutout shape then cleanly trims the result.
+    rock_verts, rock_faces, _ = _build_rectangular_mesh(
+        rows, cols, X, Y, z_surface_mm, valid_mask,
+    )
+    rock_mesh = trimesh.Trimesh(vertices=rock_verts, faces=rock_faces)
+
+    # Step 1: Subtract recess prisms from the full DEM mesh
+    max_terrain_z = float(np.max(z_surface_mm[valid_mask]))
+    recess_prisms = []
+    for tc, component, flat_z in overlay_components:
+        prism_top = max(max_terrain_z * 2, flat_z + overlay_thickness_mm * 10)
+        prism = _build_polygon_prism(component, flat_z, prism_top)
+        if prism is not None:
+            recess_prisms.append(prism)
+
+    if recess_prisms and rock_mesh.is_volume:
+        if len(recess_prisms) == 1:
+            combined_prism = recess_prisms[0]
+        else:
+            combined_prism = trimesh.boolean.union(recess_prisms, check_volume=False)
+        subtracted = trimesh.boolean.difference([rock_mesh, combined_prism], check_volume=False)
+        if not subtracted.is_empty and len(subtracted.faces) > 0:
+            rock_mesh = subtracted
+
+    # Step 2: Apply cutout shape
+    if cutout_shape is not None:
+        result_mesh = trimesh.boolean.intersection([rock_mesh, cutout_shape], check_volume=False)
+        if not result_mesh.is_empty and len(result_mesh.faces) > 0:
+            rock_mesh = result_mesh
+
+    # Step 3: For rectangular cutout, rescale and un-rotate to final model space
+    rock_verts = rock_mesh.vertices
+    if cutout_type == "rectangular" and c1_x_crs is not None:
+        rock_verts = _apply_rect_cutout_transform(
+            rock_verts, dem.shape, px_size_x, x_size_mm,
+            ref_transform, X, Y, bearing,
+            c1_x_crs, c1_y_crs, c2_x_crs, c2_y_crs,
+        )
+    rock_verts = rock_verts.astype(np.float32)
+    rock_faces = rock_mesh.faces.astype(np.int64)
+    rock_max_z = float(np.max(rock_verts[:, 2]))
+
+    result = {"rock": (rock_verts, rock_faces, rock_max_z)}
+
+    # Build overlays via boolean intersection with vector polygon prisms
+    # Group components by terrain class
+    from collections import defaultdict
+    class_components = defaultdict(list)
+    for tc, component, flat_z in overlay_components:
+        class_components[tc].append((component, flat_z))
+
+    for terrain_class in [TERRAIN_GLACIER, TERRAIN_WATER, TERRAIN_FOLIAGE]:
+        name = TERRAIN_NAMES[terrain_class]
+        components = class_components.get(terrain_class, [])
+        if not components:
+            result[name] = None
+            continue
+
+        component_meshes = []
+        for component, flat_z in components:
+            mesh = _build_overlay_component(
+                component, flat_z, z_surface_mm, X, Y, valid_mask, overlay_thickness_mm,
+            )
+            if mesh is not None:
+                component_meshes.append(mesh)
+
+        if not component_meshes:
+            result[name] = None
+            continue
+
+        # Boolean-union components into a proper volume, then apply cutout
+        if len(component_meshes) == 1:
+            combined = component_meshes[0]
+        else:
+            combined = trimesh.boolean.union(component_meshes, check_volume=False)
+
+        if cutout_shape is not None:
+            trimmed = trimesh.boolean.intersection([combined, cutout_shape], check_volume=False)
+            if not trimmed.is_empty and len(trimmed.faces) > 0:
+                combined = trimmed
+
+        overlay_verts = combined.vertices
+        overlay_faces = combined.faces
+
+        # For rectangular cutout, apply rescale + rotation undo
+        if cutout_type == "rectangular" and c1_x_crs is not None:
+            overlay_verts = _apply_rect_cutout_transform(
+                overlay_verts, dem.shape, px_size_x, x_size_mm,
+                ref_transform, X, Y, bearing,
+                c1_x_crs, c1_y_crs, c2_x_crs, c2_y_crs,
+            )
+
+        max_z = float(np.max(overlay_verts[:, 2]))
+        result[name] = (
+            overlay_verts.astype(np.float32),
+            overlay_faces.astype(np.int64),
+            max_z,
+        )
+
+    return result
 
 
 def save_stl(vertices: np.ndarray, faces: np.ndarray, output_path: str) -> None:
