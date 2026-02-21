@@ -22,6 +22,7 @@ def _build_rectangular_mesh(
     Y: np.ndarray,
     z_surface_mm: np.ndarray,
     valid_mask: np.ndarray,
+    z_base: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build rectangular watertight mesh from DEM grid.
 
@@ -65,7 +66,8 @@ def _build_rectangular_mesh(
     for i in range(rows):
         for j in range(cols):
             if vertex_map[i, j] >= 0:
-                vertex_list.append([X[i, j], Y[i, j], 0.0])
+                z_b = z_base[i, j] if z_base is not None else 0.0
+                vertex_list.append([X[i, j], Y[i, j], z_b])
 
     vertices = np.array(vertex_list, dtype=np.float32)
 
@@ -287,22 +289,25 @@ def _build_polygon_prism(
 
 def _build_overlay_component(
     polygon_mm: ShapelyPolygon,
-    flat_z: float,
+    flat_z: Optional[float],
     z_surface_mm: np.ndarray,
     X: np.ndarray,
     Y: np.ndarray,
     valid_mask: np.ndarray,
     thickness_mm: float,
+    recess_mode: str = "flat",
 ) -> Optional[trimesh.Trimesh]:
     """Build one overlay component mesh via boolean intersection.
 
     Args:
         polygon_mm: shapely Polygon in model mm coordinates.
-        flat_z: pre-computed flat Z bottom for this component.
+        flat_z: pre-computed flat Z bottom (used only in "flat" mode).
         z_surface_mm: terrain surface Z array (rows x cols).
         X, Y: model coordinate grids (rows x cols).
         valid_mask: valid DEM data mask (rows x cols).
         thickness_mm: overlay shell thickness.
+        recess_mode: "flat" for flat-bottomed recess, "uniform" for
+            terrain-following uniform-thickness shell.
 
     Returns:
         trimesh.Trimesh or None if no DEM data inside polygon.
@@ -319,18 +324,31 @@ def _build_overlay_component(
     crop_rows = i_max - i_min + 1
     crop_cols = j_max - j_min + 1
 
-    verts_dem, faces_dem, _ = _build_rectangular_mesh(
-        crop_rows, crop_cols, X_crop, Y_crop, z_crop, valid_crop,
-    )
+    if recess_mode == "uniform":
+        z_base_crop = z_crop - thickness_mm
+        verts_dem, faces_dem, _ = _build_rectangular_mesh(
+            crop_rows, crop_cols, X_crop, Y_crop, z_crop, valid_crop,
+            z_base=z_base_crop,
+        )
+    else:
+        verts_dem, faces_dem, _ = _build_rectangular_mesh(
+            crop_rows, crop_cols, X_crop, Y_crop, z_crop, valid_crop,
+        )
     if len(faces_dem) == 0:
         return None
 
     dem_mesh = trimesh.Trimesh(vertices=verts_dem, faces=faces_dem)
 
     max_terrain_z = float(np.max(z_crop[valid_crop]))
-    prism_top = max(max_terrain_z + thickness_mm * 2, flat_z + thickness_mm * 10)
+    if recess_mode == "uniform":
+        min_base_z = float(np.min(z_crop[valid_crop])) - thickness_mm
+        prism_bottom = min_base_z - thickness_mm
+        prism_top = max_terrain_z + thickness_mm * 2
+    else:
+        prism_bottom = flat_z
+        prism_top = max(max_terrain_z + thickness_mm * 2, flat_z + thickness_mm * 10)
 
-    prism_mesh = _build_polygon_prism(polygon_mm, flat_z, prism_top)
+    prism_mesh = _build_polygon_prism(polygon_mm, prism_bottom, prism_top)
     if prism_mesh is None:
         return None
 
@@ -1116,6 +1134,7 @@ def build_all_terrain_meshes(
     rect_corner1_lon: Optional[float] = None,
     rect_corner2_lat: Optional[float] = None,
     rect_corner2_lon: Optional[float] = None,
+    recess_mode: str = "flat",
 ) -> dict:
     """Build rock base mesh and terrain overlay meshes.
 
@@ -1167,11 +1186,14 @@ def build_all_terrain_meshes(
         if union_poly is None:
             continue
         for component in _iter_polygon_components(union_poly):
-            fz = _compute_component_flat_z(
-                component, z_surface_mm, X, Y, valid_mask, overlay_thickness_mm,
-            )
-            if fz is not None:
-                overlay_components.append((tc, component, fz))
+            if recess_mode == "uniform":
+                overlay_components.append((tc, component, None))
+            else:
+                fz = _compute_component_flat_z(
+                    component, z_surface_mm, X, Y, valid_mask, overlay_thickness_mm,
+                )
+                if fz is not None:
+                    overlay_components.append((tc, component, fz))
 
     # Compute CRS corners for rectangular cutout (needed for rock mesh and transforms)
     c1_x_crs = c1_y_crs = c2_x_crs = c2_y_crs = None
@@ -1215,21 +1237,53 @@ def build_all_terrain_meshes(
     )
     rock_mesh = trimesh.Trimesh(vertices=rock_verts, faces=rock_faces)
 
-    # Step 1: Subtract recess prisms from the full DEM mesh
+    # Step 1: Subtract recess volumes from the full DEM mesh
     max_terrain_z = float(np.max(z_surface_mm[valid_mask]))
-    recess_prisms = []
-    for tc, component, flat_z in overlay_components:
-        prism_top = max(max_terrain_z * 2, flat_z + overlay_thickness_mm * 10)
-        prism = _build_polygon_prism(component, flat_z, prism_top)
-        if prism is not None:
-            recess_prisms.append(prism)
+    recess_volumes = []
+    if recess_mode == "uniform":
+        for tc, component, _ in overlay_components:
+            bbox = _polygon_bbox_to_grid(component, X, Y)
+            if bbox is None:
+                continue
+            i_min, i_max, j_min, j_max = bbox
+            X_crop = X[i_min:i_max + 1, j_min:j_max + 1]
+            Y_crop = Y[i_min:i_max + 1, j_min:j_max + 1]
+            z_crop = z_surface_mm[i_min:i_max + 1, j_min:j_max + 1]
+            valid_crop = valid_mask[i_min:i_max + 1, j_min:j_max + 1]
+            crop_rows = i_max - i_min + 1
+            crop_cols = j_max - j_min + 1
+            z_base_crop = z_crop - overlay_thickness_mm
+            # Use a high flat top (well above terrain) to avoid coplanarity
+            # with the rock mesh's terrain surface during boolean difference.
+            z_top_high = np.full_like(z_crop, max_terrain_z + overlay_thickness_mm * 2)
+            verts, faces, _ = _build_rectangular_mesh(
+                crop_rows, crop_cols, X_crop, Y_crop, z_top_high, valid_crop,
+                z_base=z_base_crop,
+            )
+            if len(faces) == 0:
+                continue
+            recess_vol = trimesh.Trimesh(vertices=verts, faces=faces)
+            # Intersect with tall polygon prism for XY clipping
+            min_base_z = float(np.min(z_crop[valid_crop])) - overlay_thickness_mm
+            prism = _build_polygon_prism(component, min_base_z - overlay_thickness_mm,
+                                         max_terrain_z + overlay_thickness_mm * 2)
+            if prism is not None:
+                clipped = trimesh.boolean.intersection([recess_vol, prism], check_volume=False)
+                if not clipped.is_empty and len(clipped.faces) > 0:
+                    recess_volumes.append(clipped)
+    else:
+        for tc, component, flat_z in overlay_components:
+            prism_top = max(max_terrain_z * 2, flat_z + overlay_thickness_mm * 10)
+            prism = _build_polygon_prism(component, flat_z, prism_top)
+            if prism is not None:
+                recess_volumes.append(prism)
 
-    if recess_prisms and rock_mesh.is_volume:
-        if len(recess_prisms) == 1:
-            combined_prism = recess_prisms[0]
+    if recess_volumes and rock_mesh.is_volume:
+        if len(recess_volumes) == 1:
+            combined = recess_volumes[0]
         else:
-            combined_prism = trimesh.boolean.union(recess_prisms, check_volume=False)
-        subtracted = trimesh.boolean.difference([rock_mesh, combined_prism], check_volume=False)
+            combined = trimesh.boolean.union(recess_volumes, check_volume=False)
+        subtracted = trimesh.boolean.difference([rock_mesh, combined], check_volume=False)
         if not subtracted.is_empty and len(subtracted.faces) > 0:
             rock_mesh = subtracted
 
@@ -1271,6 +1325,7 @@ def build_all_terrain_meshes(
         for component, flat_z in components:
             mesh = _build_overlay_component(
                 component, flat_z, z_surface_mm, X, Y, valid_mask, overlay_thickness_mm,
+                recess_mode=recess_mode,
             )
             if mesh is not None:
                 component_meshes.append(mesh)

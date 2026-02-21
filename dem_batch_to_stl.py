@@ -115,6 +115,13 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         default=2.0,
         help="Thickness of terrain overlay shells in mm (default: 2.0).",
     )
+    parser.add_argument(
+        "--terrain-recess-mode",
+        choices=["flat", "uniform"],
+        default="flat",
+        help="Recess algorithm: 'flat' (flat bottom at min elevation) or "
+             "'uniform' (terrain-following uniform thickness). Default: flat.",
+    )
 
     return parser.parse_args(argv)
 
@@ -275,6 +282,7 @@ def main(argv: Iterable[str]) -> int:
                 rect_corner1_lon=rect_lon1,
                 rect_corner2_lat=rect_lat2,
                 rect_corner2_lon=rect_lon2,
+                recess_mode=args.terrain_recess_mode,
             )
             for terrain_name, mesh_data in terrain_meshes.items():
                 if mesh_data is None:
