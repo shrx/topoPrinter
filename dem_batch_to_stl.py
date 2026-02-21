@@ -11,7 +11,8 @@ from typing import Iterable, List
 
 from dem_processing import load_and_merge
 from downloader import CACHE_DIR, download_dem, ensure_dir, read_url_list
-from mesh_builder import dem_to_vertices_and_faces, save_stl
+import numpy as np
+from mesh_builder import build_all_terrain_meshes, dem_to_vertices_and_faces, save_stl
 
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
@@ -100,6 +101,35 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         default=0.0,
         help="Bearing in degrees (0-360) for cutout rotation. 0/360=North, 90=East, 180=South, 270=West. Default: 0 (North).",
     )
+
+    # Terrain classification
+    parser.add_argument(
+        "--terrain",
+        action="store_true",
+        default=False,
+        help="Enable terrain classification from OSM data (outputs separate STL per terrain type).",
+    )
+    parser.add_argument(
+        "--terrain-thickness-mm",
+        type=float,
+        default=2.0,
+        help="Thickness of terrain overlay shells in mm (default: 2.0).",
+    )
+    parser.add_argument(
+        "--terrain-types",
+        type=str,
+        default=None,
+        help="Comma-separated list of terrain types to include (default: all). "
+             "Valid types: glacier, water, foliage.",
+    )
+    parser.add_argument(
+        "--terrain-recess-mode",
+        choices=["flat", "uniform"],
+        default="flat",
+        help="Recess algorithm: 'flat' (flat bottom at min elevation) or "
+             "'uniform' (terrain-following uniform thickness). Default: flat.",
+    )
+
     return parser.parse_args(argv)
 
 
@@ -217,67 +247,135 @@ def main(argv: Iterable[str]) -> int:
             if args.diameter:
                 cutout_radius_m = (args.diameter / 2.0) * 1000.0  # Convert km to m
 
-        vertices, faces, max_z, water_faces = dem_to_vertices_and_faces(
-            dem,
-            px_size_x,
-            px_size_y,
-            args.x_size_mm,
-            max_height_mm,
-            z_exaggeration,
-            args.base_thickness_mm,
-            args.lake_range_percent,
-            args.lake_lowering_mm,
-            use_true_scale=use_true_scale,
-            cutout_type=cutout_type_for_mesh,
-            cutout_center_lat=center_lat,
-            cutout_center_lon=center_lon,
-            cutout_radius_m=cutout_radius_m,
-            cutout_side_length_km=args.side_length,
-            ref_transform=ref_transform,
-            ref_crs=ref_crs,
-            n_gon_sides=args.ngon_sides,
-            bearing=args.bearing,
-            rect_corner1_lat=rect_lat1,
-            rect_corner1_lon=rect_lon1,
-            rect_corner2_lat=rect_lat2,
-            rect_corner2_lon=rect_lon2,
-        )
-        water_info = f", water faces: {water_faces.shape[0]}" if water_faces is not None else ""
-        print(f"[INFO] Mesh built: {faces.shape[0]} faces, {vertices.shape[0]} vertices{water_info}.")
+        # Terrain classification
+        class_geometries = None
+        if args.terrain:
+            from terrain_classifier import classify_terrain, TERRAIN_NAMES
+            if args.lake_range_percent > 0 and args.lake_lowering_mm > 0:
+                print("[WARN] --terrain mode ignores --lake-range-percent and --lake-lowering-mm "
+                      "(OSM water classification is used instead).", flush=True)
+            print("[INFO] Classifying terrain from OSM data...", flush=True)
+            terrain_type_list = args.terrain_types.split(",") if args.terrain_types else None
+            class_geometries = classify_terrain(dem.shape, ref_transform, ref_crs)
+            from shapely.geometry import shape as shapely_shape
+            from shapely.ops import unary_union
+            class_areas = {}
+            for cls_val, cls_name in sorted(TERRAIN_NAMES.items()):
+                geoms = class_geometries.get(cls_val, [])
+                if geoms:
+                    polys = [shapely_shape(g) for g in geoms]
+                    class_areas[cls_name] = unary_union(polys).area
+                else:
+                    class_areas[cls_name] = 0.0
+            total_area = sum(class_areas.values())
+            if total_area > 0:
+                rock_area = dem.shape[0] * abs(ref_transform.e) * dem.shape[1] * abs(ref_transform.a) - total_area
+                class_areas["rock"] = max(rock_area, 0.0)
+                total_with_rock = sum(class_areas.values())
+                for name in ["rock", "glacier", "water", "foliage"]:
+                    area = class_areas.get(name, 0.0)
+                    if area > 0:
+                        pct = 100.0 * area / total_with_rock
+                        print(f"[INFO]   {name}: {pct:.1f}%")
+
+        # Build meshes
+        input_stub = os.path.splitext(os.path.basename(args.url_list))[0]
+        first_tile_stub = os.path.splitext(os.path.basename(downloaded[0]))[0]
+        base_name = f"{input_stub}_{first_tile_stub}"
+        if len(downloaded) > 1:
+            base_name = f"{base_name}_mosaic"
+
+        if args.terrain and class_geometries is not None:
+            terrain_meshes = build_all_terrain_meshes(
+                dem, class_geometries,
+                px_size_x, px_size_y,
+                args.x_size_mm, max_height_mm, z_exaggeration,
+                args.base_thickness_mm, args.terrain_thickness_mm,
+                use_true_scale=use_true_scale,
+                cutout_type=cutout_type_for_mesh,
+                cutout_center_lat=center_lat,
+                cutout_center_lon=center_lon,
+                cutout_radius_m=cutout_radius_m,
+                cutout_side_length_km=args.side_length,
+                ref_transform=ref_transform,
+                ref_crs=ref_crs,
+                n_gon_sides=args.ngon_sides,
+                bearing=args.bearing,
+                rect_corner1_lat=rect_lat1,
+                rect_corner1_lon=rect_lon1,
+                rect_corner2_lat=rect_lat2,
+                rect_corner2_lon=rect_lon2,
+                recess_mode=args.terrain_recess_mode,
+                terrain_types=terrain_type_list,
+            )
+            for terrain_name, mesh_data in terrain_meshes.items():
+                if mesh_data is None:
+                    continue
+                verts, fcs, mz = mesh_data
+                stl_path = os.path.join(args.output_dir, f"{base_name}_{terrain_name}.stl")
+                print(f"[INFO] Saving {terrain_name} STL ({fcs.shape[0]} faces) to {stl_path}...", flush=True)
+                save_stl(verts, fcs, stl_path)
+
+            rows, cols = dem.shape
+            rock_data = terrain_meshes["rock"]
+            model_y = rock_data[0][:, 1].max()
+            max_z = rock_data[2]
+            print(
+                f"[OK] Merged {len(downloaded)} DEM(s): {rows} x {cols} samples -> "
+                f"model {args.x_size_mm:.2f} mm x {model_y:.2f} mm x {max_z:.2f} mm\n"
+                f"     Terrain STLs saved to {args.output_dir}\n"
+                f"Cached DEM files at: {os.path.abspath(CACHE_DIR)}"
+            )
+        else:
+            vertices, faces, max_z, water_faces = dem_to_vertices_and_faces(
+                dem,
+                px_size_x,
+                px_size_y,
+                args.x_size_mm,
+                max_height_mm,
+                z_exaggeration,
+                args.base_thickness_mm,
+                args.lake_range_percent,
+                args.lake_lowering_mm,
+                use_true_scale=use_true_scale,
+                cutout_type=cutout_type_for_mesh,
+                cutout_center_lat=center_lat,
+                cutout_center_lon=center_lon,
+                cutout_radius_m=cutout_radius_m,
+                cutout_side_length_km=args.side_length,
+                ref_transform=ref_transform,
+                ref_crs=ref_crs,
+                n_gon_sides=args.ngon_sides,
+                bearing=args.bearing,
+                rect_corner1_lat=rect_lat1,
+                rect_corner1_lon=rect_lon1,
+                rect_corner2_lat=rect_lat2,
+                rect_corner2_lon=rect_lon2,
+            )
+            water_info = f", water faces: {water_faces.shape[0]}" if water_faces is not None else ""
+            print(f"[INFO] Mesh built: {faces.shape[0]} faces, {vertices.shape[0]} vertices{water_info}.")
+
+            stl_path = os.path.join(args.output_dir, f"{base_name}.stl")
+            print(f"[INFO] Saving STL to {stl_path}...", flush=True)
+            save_stl(vertices, faces, stl_path)
+
+            if water_faces is not None and len(water_faces) > 0 and args.lake_range_percent > 0 and args.lake_lowering_mm > 0:
+                water_path = os.path.join(args.output_dir, f"{base_name}_water.stl")
+                print(f"[INFO] Saving water STL to {water_path}...", flush=True)
+                save_stl(vertices, water_faces, water_path)
+
+            rows, cols = dem.shape
+            model_y = vertices[:, 1].max()
+            print(
+                f"[OK] Merged {len(downloaded)} DEM(s): {rows} x {cols} samples -> "
+                f"model {args.x_size_mm:.2f} mm x {model_y:.2f} mm x {max_z:.2f} mm\n"
+                f"     -> {stl_path}\n"
+                f"Cached DEM files at: {os.path.abspath(CACHE_DIR)}"
+            )
+
     except Exception as exc:  # noqa: BLE001
         print(f"[ERROR] Processing failed: {exc}", file=sys.stderr)
         return 1
-
-    input_stub = os.path.splitext(os.path.basename(args.url_list))[0]
-    first_tile_stub = os.path.splitext(os.path.basename(downloaded[0]))[0]
-    base_name = f"{input_stub}_{first_tile_stub}"
-    if len(downloaded) > 1:
-        base_name = f"{base_name}_mosaic"
-    stl_path = os.path.join(args.output_dir, f"{base_name}.stl")
-    print(f"[INFO] Saving STL to {stl_path}...", flush=True)
-    try:
-        save_stl(vertices, faces, stl_path)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[ERROR] Failed to save STL: {exc}", file=sys.stderr)
-        return 1
-
-    if water_faces is not None and len(water_faces) > 0 and args.lake_range_percent > 0 and args.lake_lowering_mm > 0:
-        water_path = os.path.join(args.output_dir, f"{base_name}_water.stl")
-        print(f"[INFO] Saving water STL to {water_path}...", flush=True)
-        try:
-            save_stl(vertices, water_faces, water_path)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[ERROR] Failed to save water STL: {exc}", file=sys.stderr)
-            return 1
-
-    rows, cols = dem.shape
-    model_y = vertices[:, 1].max()
-    print(
-        f"[OK] Merged {len(downloaded)} DEM(s): {rows} x {cols} samples -> "
-        f"model {args.x_size_mm:.2f} mm x {model_y:.2f} mm x {max_z:.2f} mm\n"
-        f"     -> {stl_path}\n"
-        f"Cached DEM files at: {os.path.abspath(CACHE_DIR)}"
-    )
 
     return 0
 
