@@ -26,6 +26,10 @@ def _build_rectangular_mesh(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build rectangular watertight mesh from DEM grid.
 
+    Fully vectorized (NumPy) construction of the top surface, flat/draped base,
+    and perimeter walls. Produces the same indexed mesh as the previous
+    per-cell Python loops, but at C speed and with much lower peak memory.
+
     Returns:
         Tuple of (vertices, faces, vertex_map)
     """
@@ -37,104 +41,111 @@ def _build_rectangular_mesh(
         valid_mask[:-1, 1:]
     )
 
-    # Generate vertices for all valid DEM cells
+    # A vertex is "used" if any of the (up to 4) cells incident to it is valid.
+    # Scatter each valid cell onto its four corner vertices via shifted ORs.
+    vertex_used = np.zeros((rows, cols), dtype=bool)
+    vertex_used[:-1, :-1] |= cell_is_valid   # corner (i,   j)
+    vertex_used[1:, :-1] |= cell_is_valid    # corner (i+1, j)
+    vertex_used[1:, 1:] |= cell_is_valid     # corner (i+1, j+1)
+    vertex_used[:-1, 1:] |= cell_is_valid    # corner (i,   j+1)
+    vertex_used &= valid_mask
+
+    # Assign sequential vertex indices in row-major order (matches np.where).
+    n_used = int(vertex_used.sum())
     vertex_map = np.full((rows, cols), -1, dtype=np.int32)
-    vertex_list = []
-    vertex_idx = 0
+    vertex_map[vertex_used] = np.arange(n_used, dtype=np.int32)
 
-    # Add DEM vertices that are part of valid cells
-    for i in range(rows):
-        for j in range(cols):
-            # Check if this vertex is used by any valid cell
-            used = False
-            if i > 0 and j > 0 and cell_is_valid[i - 1, j - 1]:
-                used = True
-            elif i > 0 and j < cols - 1 and cell_is_valid[i - 1, j]:
-                used = True
-            elif i < rows - 1 and j > 0 and cell_is_valid[i, j - 1]:
-                used = True
-            elif i < rows - 1 and j < cols - 1 and cell_is_valid[i, j]:
-                used = True
+    if n_used == 0:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.int64),
+            vertex_map,
+        )
 
-            if used and valid_mask[i, j]:
-                vertex_list.append([X[i, j], Y[i, j], z_surface_mm[i, j]])
-                vertex_map[i, j] = vertex_idx
-                vertex_idx += 1
+    # Vertices: top surface block followed by base block (row-major order).
+    ii, jj = np.where(vertex_used)
+    xv, yv = X[ii, jj], Y[ii, jj]
+    z_b = z_base[ii, jj] if z_base is not None else np.zeros(n_used, dtype=X.dtype)
+    vertices = np.empty((2 * n_used, 3), dtype=np.float32)
+    vertices[:n_used, 0] = xv
+    vertices[:n_used, 1] = yv
+    vertices[:n_used, 2] = z_surface_mm[ii, jj]
+    vertices[n_used:, 0] = xv
+    vertices[n_used:, 1] = yv
+    vertices[n_used:, 2] = z_b
+    base_offset = n_used
 
-    # Add base vertices for DEM cells
-    base_offset = len(vertex_list)
-    for i in range(rows):
-        for j in range(cols):
-            if vertex_map[i, j] >= 0:
-                z_b = z_base[i, j] if z_base is not None else 0.0
-                vertex_list.append([X[i, j], Y[i, j], z_b])
+    # Corner vertex indices for every valid cell (all guaranteed >= 0).
+    ci, cj = np.where(cell_is_valid)
+    v00 = vertex_map[ci, cj]
+    v10 = vertex_map[ci + 1, cj]
+    v11 = vertex_map[ci + 1, cj + 1]
+    v01 = vertex_map[ci, cj + 1]
+    b00, b10, b11, b01 = (
+        v00 + base_offset, v10 + base_offset,
+        v11 + base_offset, v01 + base_offset,
+    )
 
-    vertices = np.array(vertex_list, dtype=np.float32)
+    def _interleave(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """Interleave two (N,3) arrays into (2N,3): a[0], b[0], a[1], b[1], ..."""
+        out = np.empty((a.shape[0] * 2, 3), dtype=np.int64)
+        out[0::2] = a
+        out[1::2] = b
+        return out
 
-    faces: List[Tuple[int, int, int]] = []
+    # Top surface: two triangles per valid cell.
+    top_faces = _interleave(
+        np.column_stack((v00, v10, v11)),
+        np.column_stack((v00, v11, v01)),
+    )
+    # Base surface (reversed winding).
+    base_faces = _interleave(
+        np.column_stack((b00, b11, b10)),
+        np.column_stack((b00, b01, b11)),
+    )
 
-    # Top surface faces
-    for i in range(rows - 1):
-        for j in range(cols - 1):
-            if not cell_is_valid[i, j]:
-                continue
+    # Perimeter walls: an edge gets walls unless the adjacent cell is also
+    # valid. Neighbor lookups use a 2-cell zero-padded mask so out-of-bounds
+    # neighbors read as invalid (reproducing the original boundary behavior).
+    P = np.zeros((rows + 4, cols + 4), dtype=bool)
+    P[2:2 + rows, 2:2 + cols] = valid_mask
 
-            v00, v10, v11, v01 = vertex_map[i, j], vertex_map[i + 1, j], vertex_map[i + 1, j + 1], vertex_map[i, j + 1]
-            if v00 >= 0 and v10 >= 0 and v11 >= 0 and v01 >= 0:
-                faces.append((v00, v10, v11))
-                faces.append((v00, v11, v01))
+    def _V(di: int, dj: int) -> np.ndarray:
+        return P[ci + 2 + di, cj + 2 + dj]
 
-    # Base surface faces
-    for i in range(rows - 1):
-        for j in range(cols - 1):
-            if not cell_is_valid[i, j]:
-                continue
+    add_left = ~(_V(0, -1) & _V(1, -1))
+    add_right = ~(_V(0, 2) & _V(1, 2))
+    add_top = ~(_V(-1, 0) & _V(-1, 1))
+    add_bottom = ~(_V(2, 0) & _V(2, 1))
 
-            v00, v10, v11, v01 = vertex_map[i, j], vertex_map[i + 1, j], vertex_map[i + 1, j + 1], vertex_map[i, j + 1]
-            if v00 >= 0 and v10 >= 0 and v11 >= 0 and v01 >= 0:
-                b00 = base_offset + v00
-                b10 = base_offset + v10
-                b11 = base_offset + v11
-                b01 = base_offset + v01
-                faces.append((b00, b11, b10))
-                faces.append((b00, b01, b11))
+    wall_blocks = []
+    if add_left.any():
+        m = add_left
+        wall_blocks.append(_interleave(
+            np.column_stack((v00[m], b00[m], v10[m])),
+            np.column_stack((v10[m], b00[m], b10[m])),
+        ))
+    if add_right.any():
+        m = add_right
+        wall_blocks.append(_interleave(
+            np.column_stack((v01[m], v11[m], b01[m])),
+            np.column_stack((v11[m], b11[m], b01[m])),
+        ))
+    if add_top.any():
+        m = add_top
+        wall_blocks.append(_interleave(
+            np.column_stack((v00[m], v01[m], b00[m])),
+            np.column_stack((v01[m], b01[m], b00[m])),
+        ))
+    if add_bottom.any():
+        m = add_bottom
+        wall_blocks.append(_interleave(
+            np.column_stack((v10[m], b10[m], v11[m])),
+            np.column_stack((v11[m], b10[m], b11[m])),
+        ))
 
-    # Perimeter walls
-    for i in range(rows - 1):
-        for j in range(cols - 1):
-            if not (valid_mask[i, j] and valid_mask[i+1, j] and
-                    valid_mask[i+1, j+1] and valid_mask[i, j+1]):
-                continue
-
-            v00, v10, v11, v01 = vertex_map[i, j], vertex_map[i + 1, j], vertex_map[i + 1, j + 1], vertex_map[i, j + 1]
-            if v00 < 0 or v10 < 0 or v11 < 0 or v01 < 0:
-                continue
-
-            # Left edge
-            if not (j > 0 and valid_mask[i, j-1] and valid_mask[i+1, j-1]):
-                b00, b10 = base_offset + v00, base_offset + v10
-                faces.append((v00, b00, v10))
-                faces.append((v10, b00, b10))
-
-            # Right edge
-            if not (j < cols - 2 and valid_mask[i, j+2] and valid_mask[i+1, j+2]):
-                b01, b11 = base_offset + v01, base_offset + v11
-                faces.append((v01, v11, b01))
-                faces.append((v11, b11, b01))
-
-            # Top edge
-            if not (i > 0 and valid_mask[i-1, j] and valid_mask[i-1, j+1]):
-                b00, b01 = base_offset + v00, base_offset + v01
-                faces.append((v00, v01, b00))
-                faces.append((v01, b01, b00))
-
-            # Bottom edge
-            if not (i < rows - 2 and valid_mask[i+2, j] and valid_mask[i+2, j+1]):
-                b10, b11 = base_offset + v10, base_offset + v11
-                faces.append((v10, b10, v11))
-                faces.append((v11, b10, b11))
-
-    return vertices, np.array(faces, dtype=np.int64), vertex_map
+    faces = np.concatenate([top_faces, base_faces, *wall_blocks], axis=0)
+    return vertices, faces, vertex_map
 
 
 def _crs_to_model_xy(
