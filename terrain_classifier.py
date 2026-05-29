@@ -34,6 +34,10 @@ _FOLIAGE_LANDUSE = {"forest", "meadow", "grass", "farmland", "orchard", "vineyar
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
+# overpass-api.de rejects the default python-requests User-Agent with HTTP 406,
+# so identify the client explicitly (also expected Overpass usage etiquette).
+OVERPASS_HEADERS = {"User-Agent": "topoPrinter/1.0 (DEM-to-STL terrain classifier)"}
+
 
 def _classify_element(tags: dict) -> int:
     """Classify an OSM element by its tags. Returns terrain class constant."""
@@ -365,7 +369,7 @@ def _query_overpass(
     for attempt in range(max_retries):
         try:
             print(f"[terrain] Querying Overpass API (attempt {attempt + 1})...", flush=True)
-            resp = requests.post(url, data={"data": query}, timeout=120)
+            resp = requests.post(url, data={"data": query}, headers=OVERPASS_HEADERS, timeout=120)
             if resp.status_code == 200:
                 return resp.json()
             elif resp.status_code in (429, 504):
