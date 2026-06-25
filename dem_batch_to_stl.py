@@ -129,6 +129,25 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         help="Recess algorithm: 'flat' (flat bottom at min elevation) or "
              "'uniform' (terrain-following uniform thickness). Default: flat.",
     )
+    parser.add_argument(
+        "--insert-xy-clearance-mm",
+        type=float,
+        default=0.0,
+        help="Per-side horizontal gap between inserts and their rock pockets, "
+             "for printing inserts separately on a single-nozzle printer. The "
+             "insert walls are inset by this amount; the pocket stays full size. "
+             "0 = touching fit for one-piece multimaterial printing (default). "
+             "~0.1 mm gives a friction fit on a 0.4 mm nozzle.",
+    )
+    parser.add_argument(
+        "--insert-z-clearance-mm",
+        type=float,
+        default=0.0,
+        help="Vertical relief at the hidden pocket floor, so a separately-printed "
+             "insert can seat fully flush on its walls instead of bottoming out. "
+             "Only the pocket is deepened; the insert keeps its full height so its "
+             "top stays flush. 0 = no relief (default). ~0.2 mm suits a 0.4 mm nozzle.",
+    )
 
     return parser.parse_args(argv)
 
@@ -307,6 +326,8 @@ def main(argv: Iterable[str]) -> int:
                 rect_corner2_lon=rect_lon2,
                 recess_mode=args.terrain_recess_mode,
                 terrain_types=terrain_type_list,
+                insert_xy_clearance_mm=args.insert_xy_clearance_mm,
+                insert_z_clearance_mm=args.insert_z_clearance_mm,
             )
             for terrain_name, mesh_data in terrain_meshes.items():
                 if mesh_data is None:

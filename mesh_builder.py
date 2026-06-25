@@ -298,6 +298,26 @@ def _build_polygon_prism(
     return trimesh.boolean.union(meshes, check_volume=False)
 
 
+def _inset_polygon(
+    polygon_mm: ShapelyPolygon,
+    distance_mm: float,
+) -> Optional[ShapelyPolygon]:
+    """Shrink a polygon inward by ``distance_mm`` on every side.
+
+    Used to give a separately-printed insert horizontal clearance from its rock
+    pocket.  ``buffer(-d)`` may return a (Multi)Polygon or empty geometry when a
+    feature is narrower than 2*distance; both are handled downstream.  Returns
+    the original polygon when distance is non-positive, or None if the inset
+    erases the feature entirely.
+    """
+    if distance_mm <= 0:
+        return polygon_mm
+    inset = polygon_mm.buffer(-distance_mm)
+    if inset.is_empty:
+        return None
+    return inset
+
+
 def _build_overlay_component(
     polygon_mm: ShapelyPolygon,
     flat_z: Optional[float],
@@ -1146,12 +1166,22 @@ def build_all_terrain_meshes(
     rect_corner2_lon: Optional[float] = None,
     recess_mode: str = "flat",
     terrain_types: Optional[List[str]] = None,
+    insert_xy_clearance_mm: float = 0.0,
+    insert_z_clearance_mm: float = 0.0,
 ) -> dict:
     """Build rock base mesh and terrain overlay meshes.
 
     Args:
         class_geometries: dict mapping terrain class int → list of GeoJSON
             geometry dicts in CRS coordinates (from classify_terrain).
+        insert_xy_clearance_mm: per-side horizontal gap for separately-printed
+            inserts.  The insert walls are inset by this amount while the rock
+            pocket keeps the full polygon, yielding a uniform XY gap.  0 gives a
+            touching fit for one-piece multimaterial printing.
+        insert_z_clearance_mm: vertical relief at the hidden pocket floor.  The
+            pocket is deepened by this amount while the insert keeps its full
+            height, so the insert seats flush on its walls instead of bottoming
+            out.  0 gives a touching fit.
 
     Returns:
         dict mapping terrain name to (vertices, faces, max_z) or None.
@@ -1296,7 +1326,9 @@ def build_all_terrain_meshes(
             valid_crop = valid_mask[i_min:i_max + 1, j_min:j_max + 1]
             crop_rows = i_max - i_min + 1
             crop_cols = j_max - j_min + 1
-            z_base_crop = z_crop - overlay_thickness_mm
+            # Deepen the pocket by the Z clearance so a separately-printed
+            # insert seats flush on its walls instead of bottoming out.
+            z_base_crop = z_crop - overlay_thickness_mm - insert_z_clearance_mm
             # Use a high flat top (well above terrain) to avoid coplanarity
             # with the rock mesh's terrain surface during boolean difference.
             z_top_high = np.full_like(z_crop, max_terrain_z + overlay_thickness_mm * 2)
@@ -1308,7 +1340,7 @@ def build_all_terrain_meshes(
                 continue
             recess_vol = trimesh.Trimesh(vertices=verts, faces=faces)
             # Intersect with tall polygon prism for XY clipping
-            min_base_z = float(np.min(z_crop[valid_crop])) - overlay_thickness_mm
+            min_base_z = float(np.min(z_crop[valid_crop])) - overlay_thickness_mm - insert_z_clearance_mm
             prism = _build_polygon_prism(component, min_base_z - overlay_thickness_mm,
                                          max_terrain_z + overlay_thickness_mm * 2)
             if prism is not None:
@@ -1318,7 +1350,9 @@ def build_all_terrain_meshes(
     else:
         for tc, component, flat_z in overlay_components:
             prism_top = max(max_terrain_z * 2, flat_z + overlay_thickness_mm * 10)
-            prism = _build_polygon_prism(component, flat_z, prism_top)
+            # Deepen the pocket by the Z clearance so a separately-printed
+            # insert seats flush on its walls instead of bottoming out.
+            prism = _build_polygon_prism(component, flat_z - insert_z_clearance_mm, prism_top)
             if prism is not None:
                 recess_volumes.append(prism)
 
@@ -1367,8 +1401,16 @@ def build_all_terrain_meshes(
 
         component_meshes = []
         for component, flat_z in components:
+            # Shrink the insert walls for separate printing; the rock pocket
+            # (carved above) keeps the full polygon, so the gap is the inset.
+            # The pocket walls extend beyond the cutout, so intersecting the
+            # inset insert with the cutout below leaves the outer model edge
+            # full — clearance applies only to interior insert/rock seams.
+            insert_poly = _inset_polygon(component, insert_xy_clearance_mm)
+            if insert_poly is None:
+                continue
             mesh = _build_overlay_component(
-                component, flat_z, z_surface_mm, X, Y, valid_mask, overlay_thickness_mm,
+                insert_poly, flat_z, z_surface_mm, X, Y, valid_mask, overlay_thickness_mm,
                 recess_mode=recess_mode,
             )
             if mesh is not None:
