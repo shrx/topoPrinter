@@ -5,12 +5,19 @@ Queries OSM polygon features (glacier, water, foliage) and rasterizes
 them onto the DEM grid. Unclassified pixels default to rock.
 """
 
+import hashlib
+import json
+import os
 import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import requests
 from pyproj import Transformer
+
+# Cache directory for raw Overpass responses (keyed by query hash), so terrain
+# data can be reused offline across runs.
+OVERPASS_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "osm_cache")
 
 # Terrain class constants (priority: lower value = higher priority)
 TERRAIN_ROCK = 0
@@ -365,13 +372,25 @@ def _query_overpass(
 
     Returns parsed JSON dict, or None on failure.
     """
+    cache_key = hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
+    cache_path = os.path.join(OVERPASS_CACHE_DIR, f"overpass_{cache_key}.json")
+    if os.path.exists(cache_path):
+        print(f"[terrain] Using cached Overpass response: {cache_path}", flush=True)
+        with open(cache_path) as fh:
+            return json.load(fh)
+
     delay = initial_delay
     for attempt in range(max_retries):
         try:
             print(f"[terrain] Querying Overpass API (attempt {attempt + 1})...", flush=True)
             resp = requests.post(url, data={"data": query}, headers=OVERPASS_HEADERS, timeout=120)
             if resp.status_code == 200:
-                return resp.json()
+                data = resp.json()
+                os.makedirs(OVERPASS_CACHE_DIR, exist_ok=True)
+                with open(cache_path, "w") as fh:
+                    json.dump(data, fh)
+                print(f"[terrain] Cached Overpass response: {cache_path}", flush=True)
+                return data
             elif resp.status_code in (429, 504):
                 print(f"[terrain] HTTP {resp.status_code}, retrying in {delay:.0f}s...", flush=True)
                 time.sleep(delay)
