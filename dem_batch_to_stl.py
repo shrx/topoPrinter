@@ -276,14 +276,22 @@ def main(argv: Iterable[str]) -> int:
             print("[INFO] Classifying terrain from OSM data...", flush=True)
             terrain_type_list = args.terrain_types.split(",") if args.terrain_types else None
             class_geometries = classify_terrain(dem.shape, ref_transform, ref_crs)
-            from shapely.geometry import shape as shapely_shape
-            from shapely.ops import unary_union
+            import shapely
+            from shapely.geometry import box as shapely_box, shape as shapely_shape
+            # Clip to the DEM extent before unioning: OSM polygons can extend far
+            # beyond the model, which would both slow the union down and inflate
+            # the reported percentages.
+            bx0, by0 = ref_transform * (0, 0)
+            bx1, by1 = ref_transform * (dem.shape[1], dem.shape[0])
+            dem_bbox = shapely_box(min(bx0, bx1), min(by0, by1), max(bx0, bx1), max(by0, by1))
             class_areas = {}
             for cls_val, cls_name in sorted(TERRAIN_NAMES.items()):
                 geoms = class_geometries.get(cls_val, [])
                 if geoms:
-                    polys = [shapely_shape(g) for g in geoms]
-                    class_areas[cls_name] = unary_union(polys).area
+                    polys = shapely.make_valid(
+                        np.array([shapely_shape(g) for g in geoms], dtype=object))
+                    clipped = shapely.intersection(polys, dem_bbox)
+                    class_areas[cls_name] = float(shapely.union_all(clipped).area)
                 else:
                     class_areas[cls_name] = 0.0
             total_area = sum(class_areas.values())
@@ -348,6 +356,10 @@ def main(argv: Iterable[str]) -> int:
                 f"Cached DEM files at: {os.path.abspath(CACHE_DIR)}"
             )
         else:
+            if (args.lake_range_percent > 0 and args.lake_lowering_mm > 0
+                    and cutout_type_for_mesh is not None):
+                print("[WARN] Lake lowering is applied to the surface, but a separate "
+                      "water STL is not produced when a cutout is used.", flush=True)
             vertices, faces, max_z, water_faces = dem_to_vertices_and_faces(
                 dem,
                 px_size_x,

@@ -148,28 +148,49 @@ def _build_rectangular_mesh(
     return vertices, faces, vertex_map
 
 
-def _crs_to_model_xy(
-    crs_coords: List[Tuple[float, float]],
+def _crs_point_to_model_xy(
+    x_crs: float,
+    y_crs: float,
     ref_transform,
     rows: int,
     cols: int,
     x_size_mm: float,
     model_y_mm: float,
-) -> List[Tuple[float, float]]:
-    """Convert CRS coordinates to model mm coordinates.
+) -> Tuple[float, float]:
+    """Map one CRS point to model mm exactly (pixel-center convention).
 
-    Uses the same linear mapping as _compute_model_coordinates:
-    model_x = col_frac / (cols-1) * x_size_mm
-    model_y = model_y_mm * (1 - row_frac / (rows-1))
+    Grid vertex (i, j) carries the DEM sample of pixel (i, j), whose CRS
+    location is the pixel CENTER (col + 0.5, row + 0.5 in pixel space), so the
+    CRS->model mapping must subtract that half-pixel before scaling:
+    model_x = ((x - c)/a - 0.5) / (cols-1) * x_size_mm
+    model_y = model_y_mm * (1 - ((y - f)/e - 0.5) / (rows-1))
     """
-    result = []
-    for x_crs, y_crs in crs_coords:
-        col_frac = (x_crs - ref_transform.c) / ref_transform.a
-        row_frac = (y_crs - ref_transform.f) / ref_transform.e
-        model_x = col_frac / (cols - 1) * x_size_mm
-        model_y = model_y_mm * (1 - row_frac / (rows - 1))
-        result.append((model_x, model_y))
-    return result
+    col_frac = (x_crs - ref_transform.c) / ref_transform.a - 0.5
+    row_frac = (y_crs - ref_transform.f) / ref_transform.e - 0.5
+    model_x = col_frac / (cols - 1) * x_size_mm
+    model_y = model_y_mm * (1 - row_frac / (rows - 1))
+    return model_x, model_y
+
+
+def _crs_to_model_xy(
+    crs_coords,
+    ref_transform,
+    rows: int,
+    cols: int,
+    x_size_mm: float,
+    model_y_mm: float,
+) -> np.ndarray:
+    """Convert an (N, 2) array of CRS coordinates to model mm (vectorized).
+
+    Same mapping as _crs_point_to_model_xy, applied to whole rings at once —
+    OSM polygon rings can carry tens of thousands of points.
+    """
+    arr = np.asarray(crs_coords, dtype=np.float64)
+    col_frac = (arr[:, 0] - ref_transform.c) / ref_transform.a - 0.5
+    row_frac = (arr[:, 1] - ref_transform.f) / ref_transform.e - 0.5
+    model_x = col_frac / (cols - 1) * x_size_mm
+    model_y = model_y_mm * (1 - row_frac / (rows - 1))
+    return np.column_stack((model_x, model_y))
 
 
 def _geojson_to_shapely_mm(
@@ -184,7 +205,7 @@ def _geojson_to_shapely_mm(
     geom = shapely_shape(geojson_geom)
     # Transform all coordinates from CRS to model mm
     def _transform_ring(ring):
-        crs_coords = list(ring.coords)
+        crs_coords = np.asarray(ring.coords)
         return _crs_to_model_xy(crs_coords, ref_transform, rows, cols, x_size_mm, model_y_mm)
 
     if geom.geom_type == "Polygon":
@@ -589,8 +610,9 @@ def _build_rect_cutout_mesh(
     AB_length_m = abs(AB_length_m)
     AD_length_m = abs(AD_length_m)
 
-    # DEM mesh scale: mm per CRS meter
-    terrain_width_m = abs(ref_transform.a) * cols
+    # DEM mesh scale: mm per CRS meter (grid spans cols-1 pixel spacings,
+    # first to last pixel center)
+    terrain_width_m = abs(ref_transform.a) * (cols - 1)
     dem_scale = x_size_mm / terrain_width_m
 
     # Rectangle dimensions in DEM mesh coordinate space
@@ -602,16 +624,11 @@ def _build_rect_cutout_mesh(
     rect_width_mm_final = x_size_mm
     rect_height_mm_final = AD_length_m * final_scale
 
-    # Find center in model mm via pixel lookup
+    # Find center in model mm (exact, no pixel snapping)
     center_x_crs = (c1_x_crs + c2_x_crs) / 2.0
     center_y_crs = (c1_y_crs + c2_y_crs) / 2.0
-
-    from rasterio.transform import rowcol
-    center_row, center_col = rowcol(ref_transform, center_x_crs, center_y_crs)
-    center_row = max(0, min(rows - 1, center_row))
-    center_col = max(0, min(cols - 1, center_col))
-    center_x_mm = X[center_row, center_col]
-    center_y_mm = Y[center_row, center_col]
+    center_x_mm, center_y_mm = _crs_point_to_model_xy(
+        center_x_crs, center_y_crs, ref_transform, rows, cols, x_size_mm, model_y_mm)
 
     # Create box for intersection
     max_terrain_z = float(np.max(z_surface_mm[valid_mask]))
@@ -715,19 +732,14 @@ def _build_circular_cutout_mesh(
     """
     rows, cols = dem.shape
 
-    # Convert center to model mm coordinates
+    # Convert center to model mm coordinates (exact, no pixel snapping)
     transformer = Transformer.from_crs("EPSG:4326", ref_crs, always_xy=True)
     center_x_crs, center_y_crs = transformer.transform(center_lon, center_lat)
+    center_x_mm, center_y_mm = _crs_point_to_model_xy(
+        center_x_crs, center_y_crs, ref_transform, rows, cols, x_size_mm, model_y_mm)
 
-    from rasterio.transform import rowcol
-    center_row, center_col = rowcol(ref_transform, center_x_crs, center_y_crs)
-    center_row = max(0, min(rows - 1, center_row))
-    center_col = max(0, min(cols - 1, center_col))
-    center_x_mm = X[center_row, center_col]
-    center_y_mm = Y[center_row, center_col]
-
-    # Convert radius to model mm
-    terrain_width_m = cols * px_size_x
+    # Convert radius to model mm (grid spans cols-1 pixel spacings)
+    terrain_width_m = (cols - 1) * px_size_x
     scale = x_size_mm / terrain_width_m  # mm per meter
     radius_mm = radius_m * scale
 
@@ -807,7 +819,8 @@ def _compute_model_coordinates(
         (X, Y, z_surface_mm, valid_mask, lake_mask, model_y_mm)
     """
     rows, cols = dem.shape
-    aspect_ratio = (rows * px_size_y) / (cols * px_size_x)
+    # The mesh spans first-to-last pixel centers: cols-1 / rows-1 spacings.
+    aspect_ratio = ((rows - 1) * px_size_y) / ((cols - 1) * px_size_x)
     model_y_mm = x_size_mm * aspect_ratio
 
     valid_mask = np.isfinite(dem)
@@ -820,7 +833,7 @@ def _compute_model_coordinates(
     height_range = max_elev - min_elev
 
     if use_true_scale:
-        terrain_width_m = cols * px_size_x
+        terrain_width_m = (cols - 1) * px_size_x
         horizontal_scale = (terrain_width_m * 1000.0) / x_size_mm
         z_relief_mm = (dem - min_elev) * 1000.0 / horizontal_scale
         z_relief_mm = z_relief_mm * z_exaggeration
@@ -926,76 +939,57 @@ def dem_to_vertices_and_faces(
     vertices, faces_array, vertex_map = _build_rectangular_mesh(rows, cols, X, Y, z_surface_mm, valid_mask)
     base_offset = len(vertices) // 2
 
-    def idx(i: int, j: int) -> int:
-        """Get vertex index for valid cell at (i,j). Returns -1 if invalid."""
-        return vertex_map[i, j]
-
     water_faces_array: Optional[np.ndarray] = None
     if lake_mask is not None and lake_mask.any():
         cell_mask = lake_mask[:-1, :-1] & lake_mask[1:, :-1] & lake_mask[:-1, 1:] & lake_mask[1:, 1:]
+        ci, cj = np.where(cell_mask)
+        if ci.size:
+            v00 = vertex_map[ci, cj].astype(np.int64)
+            v10 = vertex_map[ci + 1, cj].astype(np.int64)
+            v11 = vertex_map[ci + 1, cj + 1].astype(np.int64)
+            v01 = vertex_map[ci, cj + 1].astype(np.int64)
+            b00, b10, b11, b01 = (
+                v00 + base_offset, v10 + base_offset,
+                v11 + base_offset, v01 + base_offset,
+            )
 
-        def add_water_wall(side: str, i: int, j: int, acc: List[Tuple[int, int, int]]) -> None:
-            if side == "north":
-                t0 = idx(i, j)
-                t1 = idx(i, j + 1)
-                b0 = base_offset + idx(i, j)
-                b1 = base_offset + idx(i, j + 1)
-                acc.append((t0, t1, b0))
-                acc.append((t1, b1, b0))
-            elif side == "south":
-                t0 = idx(i + 1, j)
-                t1 = idx(i + 1, j + 1)
-                b0 = base_offset + idx(i + 1, j)
-                b1 = base_offset + idx(i + 1, j + 1)
-                acc.append((t0, t1, b1))
-                acc.append((t0, b1, b0))
-            elif side == "west":
-                t0 = idx(i, j)
-                t1 = idx(i + 1, j)
-                b0 = base_offset + idx(i, j)
-                b1 = base_offset + idx(i + 1, j)
-                acc.append((t0, t1, b0))
-                acc.append((t1, b1, b0))
-            elif side == "east":
-                t0 = idx(i, j + 1)
-                t1 = idx(i + 1, j + 1)
-                b0 = base_offset + idx(i, j + 1)
-                b1 = base_offset + idx(i + 1, j + 1)
-                acc.append((t0, b0, t1))
-                acc.append((t1, b0, b1))
+            blocks = [
+                # Top and base surface of every lake cell
+                np.column_stack((v00, v10, v11)),
+                np.column_stack((v00, v11, v01)),
+                np.column_stack((b00, b11, b10)),
+                np.column_stack((b00, b01, b11)),
+            ]
 
-        water_faces: List[Tuple[int, int, int]] = []
-        for i in range(rows - 1):
-            for j in range(cols - 1):
-                if not cell_mask[i, j]:
-                    continue
-                v00 = idx(i, j)
-                v10 = idx(i + 1, j)
-                v11 = idx(i + 1, j + 1)
-                v01 = idx(i, j + 1)
-                water_faces.append((v00, v10, v11))
-                water_faces.append((v00, v11, v01))
+            # Walls where the neighboring cell is not a lake cell; the 1-cell
+            # zero-padded mask reads out-of-bounds neighbors as non-lake.
+            P = np.zeros((rows + 1, cols + 1), dtype=bool)
+            P[1:rows, 1:cols] = cell_mask
+            wall_north = ~P[ci, cj + 1]
+            wall_south = ~P[ci + 2, cj + 1]
+            wall_west = ~P[ci + 1, cj]
+            wall_east = ~P[ci + 1, cj + 2]
 
-                b00 = base_offset + idx(i, j)
-                b10 = base_offset + idx(i + 1, j)
-                b11 = base_offset + idx(i + 1, j + 1)
-                b01 = base_offset + idx(i, j + 1)
-                water_faces.append((b00, b11, b10))
-                water_faces.append((b00, b01, b11))
+            if wall_north.any():
+                m = wall_north
+                blocks.append(np.column_stack((v00[m], v01[m], b00[m])))
+                blocks.append(np.column_stack((v01[m], b01[m], b00[m])))
+            if wall_south.any():
+                m = wall_south
+                blocks.append(np.column_stack((v10[m], v11[m], b11[m])))
+                blocks.append(np.column_stack((v10[m], b11[m], b10[m])))
+            if wall_west.any():
+                m = wall_west
+                blocks.append(np.column_stack((v00[m], v10[m], b00[m])))
+                blocks.append(np.column_stack((v10[m], b10[m], b00[m])))
+            if wall_east.any():
+                m = wall_east
+                blocks.append(np.column_stack((v01[m], b01[m], v11[m])))
+                blocks.append(np.column_stack((v11[m], b01[m], b11[m])))
 
-                if i == 0 or not cell_mask[i - 1, j]:
-                    add_water_wall("north", i, j, water_faces)
-                if i == rows - 2 or not cell_mask[i + 1, j]:
-                    add_water_wall("south", i, j, water_faces)
-                if j == 0 or not cell_mask[i, j - 1]:
-                    add_water_wall("west", i, j, water_faces)
-                if j == cols - 2 or not cell_mask[i, j + 1]:
-                    add_water_wall("east", i, j, water_faces)
+            water_faces_array = np.concatenate(blocks, axis=0)
 
-        if water_faces:
-            water_faces_array = np.array(water_faces, dtype=np.int64)
-
-    max_z = float(np.max(z_surface_mm))
+    max_z = float(np.max(z_surface_mm[valid_mask]))
     return vertices.astype(np.float32), faces_array, max_z, water_faces_array
 
 
@@ -1036,16 +1030,14 @@ def _build_cutout_shape(
 
     transformer = Transformer.from_crs("EPSG:4326", ref_crs, always_xy=True)
 
+    model_y_mm = float(Y[0, 0])
+
     if cutout_type == "circular":
         center_x_crs, center_y_crs = transformer.transform(cutout_center_lon, cutout_center_lat)
-        from rasterio.transform import rowcol
-        cr, cc = rowcol(ref_transform, center_x_crs, center_y_crs)
-        cr = max(0, min(rows - 1, cr))
-        cc = max(0, min(cols - 1, cc))
-        center_x_mm = X[cr, cc]
-        center_y_mm = Y[cr, cc]
+        center_x_mm, center_y_mm = _crs_point_to_model_xy(
+            center_x_crs, center_y_crs, ref_transform, rows, cols, x_size_mm, model_y_mm)
 
-        terrain_width_m = cols * px_size_x
+        terrain_width_m = (cols - 1) * px_size_x
         scale = x_size_mm / terrain_width_m
         radius_mm = cutout_radius_m * scale
 
@@ -1094,19 +1086,15 @@ def _build_cutout_shape(
         AB_length_m = abs(AB_length_m)
         AD_length_m = abs(AD_length_m)
 
-        terrain_width_m = abs(ref_transform.a) * cols
+        terrain_width_m = abs(ref_transform.a) * (cols - 1)
         dem_scale = x_size_mm / terrain_width_m
         half_w = AB_length_m * dem_scale / 2.0
         half_h = AD_length_m * dem_scale / 2.0
 
         center_x_crs = (c1_x + c2_x) / 2.0
         center_y_crs = (c1_y + c2_y) / 2.0
-        from rasterio.transform import rowcol
-        cr, cc = rowcol(ref_transform, center_x_crs, center_y_crs)
-        cr = max(0, min(rows - 1, cr))
-        cc = max(0, min(cols - 1, cc))
-        center_x_mm = X[cr, cc]
-        center_y_mm = Y[cr, cc]
+        center_x_mm, center_y_mm = _crs_point_to_model_xy(
+            center_x_crs, center_y_crs, ref_transform, rows, cols, x_size_mm, model_y_mm)
 
         box_verts_local = [
             [-half_w, -half_h, 0], [half_w, -half_h, 0],
@@ -1133,73 +1121,6 @@ def _build_cutout_shape(
         return mesh, footprint
 
     return None, None
-
-
-def _rasterize_cutout_mask(
-    dem_shape: Tuple[int, int],
-    ref_transform,
-    ref_crs,
-    cutout_type: str,
-    cutout_center_lat: Optional[float] = None,
-    cutout_center_lon: Optional[float] = None,
-    cutout_radius_m: Optional[float] = None,
-    cutout_side_length_km: Optional[float] = None,
-    bearing: float = 0.0,
-    rect_corner1_lat: Optional[float] = None,
-    rect_corner1_lon: Optional[float] = None,
-    rect_corner2_lat: Optional[float] = None,
-    rect_corner2_lon: Optional[float] = None,
-) -> np.ndarray:
-    """Compute a boolean pixel mask for the cutout region on the DEM grid.
-
-    Returns:
-        Boolean array of shape dem_shape, True inside cutout.
-    """
-    rows, cols = dem_shape
-    transformer = Transformer.from_crs("EPSG:4326", ref_crs, always_xy=True)
-
-    # Build CRS coordinates for each pixel center
-    col_idx, row_idx = np.meshgrid(np.arange(cols), np.arange(rows))
-    # Pixel center: (col + 0.5, row + 0.5) in pixel space -> CRS via transform
-    px_x_crs = ref_transform.a * (col_idx + 0.5) + ref_transform.c
-    px_y_crs = ref_transform.e * (row_idx + 0.5) + ref_transform.f
-
-    if cutout_type == "circular":
-        center_x_crs, center_y_crs = transformer.transform(cutout_center_lon, cutout_center_lat)
-        dist = np.sqrt((px_x_crs - center_x_crs)**2 + (px_y_crs - center_y_crs)**2)
-        return dist <= cutout_radius_m
-
-    elif cutout_type == "rectangular":
-        bearing_rad = np.radians(bearing)
-
-        if rect_corner1_lat is not None:
-            c1_x, c1_y = transformer.transform(rect_corner1_lon, rect_corner1_lat)
-            c2_x, c2_y = transformer.transform(rect_corner2_lon, rect_corner2_lat)
-        else:
-            cx, cy = transformer.transform(cutout_center_lon, cutout_center_lat)
-            half = cutout_side_length_km * 1000.0 / 2.0
-            de1, dn1 = rotate_from_bearing_frame(-half, -half, bearing_rad)
-            c1_x, c1_y = cx + de1, cy + dn1
-            de2, dn2 = rotate_from_bearing_frame(half, half, bearing_rad)
-            c2_x, c2_y = cx + de2, cy + dn2
-
-        center_x_crs = (c1_x + c2_x) / 2.0
-        center_y_crs = (c1_y + c2_y) / 2.0
-        dx_crs = c2_x - c1_x
-        dy_crs = c2_y - c1_y
-        half_w, half_h = rotate_to_bearing_frame(dx_crs, dy_crs, bearing_rad)
-        half_w = abs(half_w) / 2.0
-        half_h = abs(half_h) / 2.0
-
-        # Project pixel offsets from center onto bearing-aligned frame
-        de = px_x_crs - center_x_crs
-        dn = px_y_crs - center_y_crs
-        perp, along = rotate_to_bearing_frame(de, dn, bearing_rad)
-
-        return (np.abs(perp) <= half_w) & (np.abs(along) <= half_h)
-
-    # No cutout
-    return np.ones(dem_shape, dtype=bool)
 
 
 def _apply_rect_cutout_transform(
@@ -1230,7 +1151,7 @@ def _apply_rect_cutout_transform(
     AB_length_m = abs(AB_length_m)
     AD_length_m = abs(AD_length_m)
 
-    terrain_width_m = abs(ref_transform.a) * cols
+    terrain_width_m = abs(ref_transform.a) * (cols - 1)
     dem_scale = x_size_mm / terrain_width_m
     final_scale = x_size_mm / AB_length_m
 
@@ -1239,12 +1160,9 @@ def _apply_rect_cutout_transform(
 
     center_x_crs = (c1_x_crs + c2_x_crs) / 2.0
     center_y_crs = (c1_y_crs + c2_y_crs) / 2.0
-    from rasterio.transform import rowcol
-    cr, cc = rowcol(ref_transform, center_x_crs, center_y_crs)
-    cr = max(0, min(rows - 1, cr))
-    cc = max(0, min(cols - 1, cc))
-    center_x_mm = X[cr, cc]
-    center_y_mm = Y[cr, cc]
+    model_y_mm = float(Y[0, 0])
+    center_x_mm, center_y_mm = _crs_point_to_model_xy(
+        center_x_crs, center_y_crs, ref_transform, rows, cols, x_size_mm, model_y_mm)
 
     result = verts.copy()
     dx = result[:, 0] - center_x_mm
@@ -1274,7 +1192,19 @@ def _polygons_to_model_mm(
     polys_mm = []
     for g in geojson_geoms:
         p = _geojson_to_shapely_mm(g, ref_transform, rows, cols, x_size_mm, model_y_mm)
-        if p.is_valid and not p.is_empty:
+        if not p.is_valid:
+            # Self-intersecting rings are common in OSM data; repair instead of
+            # dropping the whole feature.  make_valid may return a collection —
+            # keep only the polygonal parts.
+            p = shapely.make_valid(p)
+            if p.geom_type == "GeometryCollection":
+                parts = [g2 for g2 in p.geoms if g2.geom_type in ("Polygon", "MultiPolygon")]
+                if not parts:
+                    continue
+                p = unary_union(parts)
+            if p.geom_type not in ("Polygon", "MultiPolygon"):
+                continue
+        if not p.is_empty:
             polys_mm.append(p)
     if not polys_mm:
         return None
@@ -1382,15 +1312,26 @@ def build_all_terrain_meshes(
     for tc in PRIORITY_ORDER:
         if tc in active_set or class_polys_mm[tc] is None:
             continue
+        candidates = [c for c in PRIORITY_ORDER
+                      if c in active_set and class_polys_mm[c] is not None]
+        # Prepared geometries make the many point-in-polygon tests cheap, and
+        # absorbed components are unioned once per candidate at the end rather
+        # than re-unioning the whole candidate after every component.
+        # (Equivalent to the incremental version: components of one class union
+        # are disjoint, so absorbing one can never make another contained.)
+        for c in candidates:
+            shapely.prepare(class_polys_mm[c])
+        absorbed = {c: [] for c in candidates}
         for component in _iter_polygon_components(class_polys_mm[tc]):
             pt = component.representative_point()
-            for candidate in PRIORITY_ORDER:
-                if candidate not in active_set or class_polys_mm[candidate] is None:
-                    continue
+            for candidate in candidates:
                 if class_polys_mm[candidate].contains(pt):
-                    class_polys_mm[candidate] = unary_union([class_polys_mm[candidate], component])
+                    absorbed[candidate].append(component)
                     break
             # If no active type contains it, it becomes rock — nothing to do
+        for candidate, comps in absorbed.items():
+            if comps:
+                class_polys_mm[candidate] = unary_union([class_polys_mm[candidate], *comps])
         class_polys_mm[tc] = None
 
     # Subtract higher-priority classes from lower-priority ones to make
@@ -1680,4 +1621,7 @@ def save_stl(vertices: np.ndarray, faces: np.ndarray, output_path: str) -> None:
     with open(output_path, "wb") as fh:
         fh.write(b"\x00" * 80)                                 # 80-byte header
         fh.write(np.array(len(faces), dtype="<u4").tobytes())  # uint32 triangle count
-        fh.write(records.tobytes())
+        fh.flush()
+        # tofile() writes the record buffer directly, avoiding the full in-memory
+        # copy that records.tobytes() would create (~2 GB on a 40M-face mesh).
+        records.tofile(fh)

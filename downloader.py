@@ -149,14 +149,20 @@ def download_dem(url: str, fallback_index: int) -> str:
     if os.path.exists(cache_path):
         return cache_path
 
+    # Download to a temp file and rename on success, so an interrupted
+    # download never leaves a truncated file that later runs treat as cached.
+    part_path = cache_path + ".part"
     try:
         with requests.get(url, stream=True, timeout=120) as resp:
             resp.raise_for_status()
-            with open(cache_path, "wb") as f:
+            with open(part_path, "wb") as f:
                 for chunk in resp.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
+        os.replace(part_path, cache_path)
     except Exception as exc:  # noqa: BLE001
+        if os.path.exists(part_path):
+            os.remove(part_path)
         raise RuntimeError(f"Failed to download {url}: {exc}") from exc
 
     return cache_path

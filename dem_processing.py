@@ -25,7 +25,7 @@ def preprocess_dem_files(paths: Iterable[str]) -> List[str]:
             with rasterio.open(path):
                 processed_paths.append(path)
                 continue
-        except:
+        except Exception:
             pass
 
         # Check if it's XYZ point cloud (3 numeric values per line)
@@ -39,7 +39,7 @@ def preprocess_dem_files(paths: Iterable[str]) -> List[str]:
                     continue
         except (FileNotFoundError, OSError):
             raise
-        except:
+        except Exception:
             pass
 
         raise ValueError(f"Unable to read file as raster or XYZ point cloud: {path}")
@@ -148,10 +148,21 @@ def load_and_merge(
     path_list = preprocess_dem_files(path_list)
 
     px_size_x, px_size_y, nodata_value, ref_crs = _gather_metadata(path_list)
+
+    # Merge directly at the target resolution: rasterio then reads every source
+    # tile decimated (nearest resampling), cutting peak memory by downsample^2
+    # compared to building the full-resolution mosaic and slicing it, and the
+    # returned transform describes the coarse grid correctly by construction.
+    merge_kwargs = {}
+    if downsample > 1:
+        merge_kwargs["res"] = (px_size_x * downsample, px_size_y * downsample)
+        px_size_x *= downsample
+        px_size_y *= downsample
     merged, ref_transform = merge(
         path_list,
         nodata=nodata_value,
         method="first",
+        **merge_kwargs,
     )
     arr = merged[0]
 
@@ -160,13 +171,6 @@ def load_and_merge(
         arr = np.where(arr == nodata_value, np.nan, arr)
 
     # Cutout cropping is handled by boolean intersection in mesh_builder
-
-    if downsample > 1:
-        arr = arr[::downsample, ::downsample]
-        px_size_x *= downsample
-        px_size_y *= downsample
-        # Update transform to reflect downsampling
-        ref_transform = ref_transform * ref_transform.scale(downsample, downsample)
 
     if arr.size == 0 or arr.shape[0] < 2 or arr.shape[1] < 2:
         raise ValueError("DEM too small after downsampling to form a mesh.")
