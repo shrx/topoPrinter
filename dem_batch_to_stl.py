@@ -148,6 +148,23 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
              "Only the pocket is deepened; the insert keeps its full height so its "
              "top stays flush. 0 = no relief (default). ~0.2 mm suits a 0.4 mm nozzle.",
     )
+    parser.add_argument(
+        "--insert-corner-relief-mm",
+        type=float,
+        default=0.0,
+        help="Extra clearance at sharp corners, on top of --insert-xy-clearance-mm, "
+             "to defeat FDM inside-corner over-extrusion that otherwise locks the "
+             "fit. Enlarges the rock pocket at convex corners and cuts the insert "
+             "back at reflex corners. 0 = no corner relief (default). ~0.25 mm suits "
+             "a 0.4 mm nozzle.",
+    )
+    parser.add_argument(
+        "--insert-corner-min-angle-deg",
+        type=float,
+        default=45.0,
+        help="Minimum boundary turn angle for a corner to get relief (default 45). "
+             "Near-straight vertices are skipped so the flat clearance is preserved.",
+    )
 
     return parser.parse_args(argv)
 
@@ -336,6 +353,8 @@ def main(argv: Iterable[str]) -> int:
                 terrain_types=terrain_type_list,
                 insert_xy_clearance_mm=args.insert_xy_clearance_mm,
                 insert_z_clearance_mm=args.insert_z_clearance_mm,
+                insert_corner_relief_mm=args.insert_corner_relief_mm,
+                insert_corner_min_angle_deg=args.insert_corner_min_angle_deg,
             )
             for terrain_name, mesh_data in terrain_meshes.items():
                 if mesh_data is None:

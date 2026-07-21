@@ -8,7 +8,8 @@ import numpy as np
 from pyproj import Transformer
 import trimesh
 
-from shapely.geometry import shape as shapely_shape, Polygon as ShapelyPolygon, MultiPolygon
+from shapely.geometry import shape as shapely_shape, Polygon as ShapelyPolygon, MultiPolygon, Point
+from shapely.geometry.polygon import orient
 from shapely.ops import unary_union
 import shapely
 
@@ -405,6 +406,68 @@ def _inset_polygon(
     if inset.is_empty:
         return None
     return inset
+
+
+def _corner_reliefs(
+    component: ShapelyPolygon,
+    clearance_mm: float,
+    relief_mm: float,
+    min_turn_deg: float,
+) -> Tuple[Optional[Union[ShapelyPolygon, MultiPolygon]],
+           Optional[Union[ShapelyPolygon, MultiPolygon]]]:
+    """Corner-relief geometry for a separately-printed insert.
+
+    FDM over-extrudes reentrant (inside) corners, so a sharp corner seats tighter
+    than the flat clearance and can lock.  This adds ``relief_mm`` of extra
+    clearance at sharp corners, on whichever body owns the inside corner:
+
+      * convex footprint corner -> the rock pocket has the inside corner, so
+        enlarge the pocket: a disc of radius (clearance+relief) centred on the
+        insert's inset corner point (concentric with the insert corner, making the
+        corner gap clearance+relief).
+      * reflex footprint corner -> the insert has the inside corner, so shrink the
+        insert: the same disc, centred on the nominal vertex.
+
+    Only corners turning by at least ``min_turn_deg`` are relieved; a disc at a
+    near-straight vertex would push the flat wall out by ``relief_mm`` and wreck
+    the flat clearance.  The signed turn angle classifies convex vs reflex and
+    catches needle-sharp corners (turn near 180 deg) that a sine test would miss.
+
+    Returns (pocket_extra, insert_cut): the union of convex discs to add to the
+    pocket (or None) and the union of reflex discs to subtract from the insert
+    (or None).
+    """
+    if relief_mm <= 0:
+        return None, None
+    r = clearance_mm + relief_mm
+    oriented = orient(component, 1.0)   # exterior CCW, holes CW: solid is on the left
+    convex, reflex = [], []
+    for ring in [oriented.exterior, *oriented.interiors]:
+        pts = list(ring.coords)[:-1]
+        n = len(pts)
+        if n < 3:
+            continue
+        for i in range(n):
+            A = np.asarray(pts[i - 1]); V = np.asarray(pts[i]); B = np.asarray(pts[(i + 1) % n])
+            u = V - A; w = B - V
+            lu = float(np.hypot(*u)); lw = float(np.hypot(*w))
+            if lu == 0.0 or lw == 0.0:
+                continue
+            u /= lu; w /= lw
+            cross = float(u[0] * w[1] - u[1] * w[0])
+            turn = np.degrees(np.arctan2(cross, float(u @ w)))   # signed, -180..180
+            if abs(turn) < min_turn_deg:
+                continue
+            if turn > 0.0:                                       # convex -> relieve pocket
+                nu = np.array([-u[1], u[0]]); nw = np.array([-w[1], w[0]])  # inward normals
+                denom = max(1.0 + float(nu @ nw), 0.1)           # cap miter length at needles
+                P = V + clearance_mm * (nu + nw) / denom
+                convex.append(Point(P).buffer(r))
+            else:                                                # reflex -> relieve insert
+                reflex.append(Point(V).buffer(r))
+    pocket_extra = unary_union(convex) if convex else None
+    insert_cut = unary_union(reflex) if reflex else None
+    return pocket_extra, insert_cut
 
 
 def _clip_to_footprint(
@@ -1250,6 +1313,8 @@ def build_all_terrain_meshes(
     terrain_types: Optional[List[str]] = None,
     insert_xy_clearance_mm: float = 0.0,
     insert_z_clearance_mm: float = 0.0,
+    insert_corner_relief_mm: float = 0.0,
+    insert_corner_min_angle_deg: float = 45.0,
 ) -> dict:
     """Build rock base mesh and terrain overlay meshes.
 
@@ -1264,6 +1329,13 @@ def build_all_terrain_meshes(
             pocket is deepened by this amount while the insert keeps its full
             height, so the insert seats flush on its walls instead of bottoming
             out.  0 gives a touching fit.
+        insert_corner_relief_mm: extra clearance at sharp corners (delta), on top
+            of the flat XY clearance, to defeat FDM inside-corner over-extrusion
+            that otherwise locks the fit.  Applied to the rock pocket at convex
+            corners and to the insert at reflex corners.  0 disables corner relief.
+        insert_corner_min_angle_deg: minimum boundary turn angle for a corner to
+            receive relief.  Near-straight vertices are skipped so the flat
+            clearance is preserved.
 
     Returns:
         dict mapping terrain name to (vertices, faces, max_z) or None.
@@ -1397,8 +1469,18 @@ def build_all_terrain_meshes(
         if union_poly is None:
             continue
         for component in _iter_polygon_components(union_poly):
+            # Corner relief: convex discs enlarge the rock pocket, reflex discs are
+            # subtracted from the insert (below).  flat_z/solid stay on the nominal
+            # component (relief only changes XY at corners, not the recess depth,
+            # and keeps the no-clearance solid reuse valid).
+            pocket_extra, insert_cut = _corner_reliefs(
+                component, insert_xy_clearance_mm, insert_corner_relief_mm,
+                insert_corner_min_angle_deg)
+            pocket_component = (unary_union([component, pocket_extra])
+                                if pocket_extra is not None else component)
             if recess_mode == "uniform":
-                overlay_components.append((tc, component, None, None))
+                overlay_components.append(
+                    (tc, component, None, None, pocket_component, insert_cut))
                 continue
             pocket_poly = _clip_to_footprint(component, cutout_footprint)
             if pocket_poly is None:
@@ -1414,7 +1496,8 @@ def build_all_terrain_meshes(
             if top_min is None:
                 continue
             flat_z = max(top_min - overlay_thickness_mm, 0.01)
-            overlay_components.append((tc, component, flat_z, solid))
+            overlay_components.append(
+                (tc, component, flat_z, solid, pocket_component, insert_cut))
 
     # Build rock base mesh: recess first, then cutout.
     # Overlay polygons are NOT clipped to the cutout boundary, so recess
@@ -1429,8 +1512,8 @@ def build_all_terrain_meshes(
     max_terrain_z = float(np.max(z_surface_mm[valid_mask]))
     recess_volumes = []
     if recess_mode == "uniform":
-        for tc, component, _, _ in overlay_components:
-            bbox = _polygon_bbox_to_grid(component, X, Y)
+        for tc, _, _, _, pocket_component, _ in overlay_components:
+            bbox = _polygon_bbox_to_grid(pocket_component, X, Y)
             if bbox is None:
                 continue
             i_min, i_max, j_min, j_max = bbox
@@ -1455,18 +1538,18 @@ def build_all_terrain_meshes(
             recess_vol = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
             # Intersect with tall polygon prism for XY clipping
             min_base_z = float(np.min(z_crop[valid_crop])) - overlay_thickness_mm
-            prism = _build_polygon_prism(component, min_base_z - overlay_thickness_mm,
+            prism = _build_polygon_prism(pocket_component, min_base_z - overlay_thickness_mm,
                                          max_terrain_z + overlay_thickness_mm * 2)
             if prism is not None:
                 clipped = trimesh.boolean.intersection([recess_vol, prism], check_volume=False)
                 if not clipped.is_empty and len(clipped.faces) > 0:
                     recess_volumes.append(clipped)
     else:
-        for tc, component, flat_z, _ in overlay_components:
+        for tc, _, flat_z, _, pocket_component, _ in overlay_components:
             prism_top = max(max_terrain_z * 2, flat_z + overlay_thickness_mm * 10)
             # Pocket floor at flat_z (a full thickness below the terrain min); the
             # Z clearance is taken on the insert, which sits clearance above this.
-            prism = _build_polygon_prism(component, flat_z, prism_top)
+            prism = _build_polygon_prism(pocket_component, flat_z, prism_top)
             if prism is not None:
                 recess_volumes.append(prism)
 
@@ -1503,8 +1586,8 @@ def build_all_terrain_meshes(
     # Group components by terrain class
     from collections import defaultdict
     class_components = defaultdict(list)
-    for tc, component, flat_z, solid in overlay_components:
-        class_components[tc].append((component, flat_z, solid))
+    for tc, component, flat_z, solid, _, insert_cut in overlay_components:
+        class_components[tc].append((component, flat_z, solid, insert_cut))
 
     for terrain_class in all_overlay_classes:
         name = TERRAIN_NAMES[terrain_class]
@@ -1514,19 +1597,25 @@ def build_all_terrain_meshes(
             continue
 
         component_meshes = []
-        for component, flat_z, solid in components:
-            # Shrink the insert walls for separate printing, then clip to the
-            # cutout footprint — both in 2D, before any solid is built.  The
-            # rock pocket (carved above) keeps the full polygon, so the gap is
-            # the inset; clipping (rather than insetting) at the cutout edge
-            # keeps the insert flush there, so clearance applies only to interior
-            # insert/rock seams, never the outer model edge.  Doing every
-            # same-XY operation on the polygon means the insert's vertical walls
-            # are never subdivided by a solid-vs-solid boolean.
-            if insert_xy_clearance_mm > 0:
+        for component, flat_z, solid, insert_cut in components:
+            # Shrink the insert walls for separate printing, cut the sharp reflex
+            # corners back (corner relief), then clip to the cutout footprint — all
+            # in 2D, before any solid is built.  The rock pocket (carved above)
+            # keeps the full polygon plus convex-corner relief, so the flat gap is
+            # the inset and sharp corners get inset+relief; clipping (rather than
+            # insetting) at the cutout edge keeps the insert flush there, so
+            # clearance applies only to interior insert/rock seams, never the outer
+            # model edge.  Doing every same-XY operation on the polygon means the
+            # insert's vertical walls are never subdivided by a solid-vs-solid
+            # boolean.
+            if insert_xy_clearance_mm > 0 or insert_cut is not None:
                 insert_poly = _inset_polygon(component, insert_xy_clearance_mm)
                 if insert_poly is None:
                     continue
+                if insert_cut is not None:
+                    insert_poly = insert_poly.difference(insert_cut).buffer(0)
+                    if insert_poly.is_empty:
+                        continue
                 insert_poly = _clip_to_footprint(insert_poly, cutout_footprint)
                 if insert_poly is None:
                     continue
@@ -1534,7 +1623,7 @@ def build_all_terrain_meshes(
                 if insert_poly is None:
                     continue
             else:
-                insert_poly = None  # no inset: reuse the pocket solid below
+                insert_poly = None  # no inset/relief: reuse the pocket solid below
 
             if recess_mode == "uniform":
                 if insert_poly is None:
