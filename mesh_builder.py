@@ -520,6 +520,26 @@ def _quantize_to_f32(
     return quantized
 
 
+def _drop_degenerate_faces(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Weld coincident vertices and drop the zero-area faces they leave behind.
+
+    Operates on the final (float32-cast) coordinates so that two vertices which
+    round to the same float32 value are welded, collapsing any sub-ULP thin wall
+    into a zero-length edge; ``nondegenerate_faces()`` (zero-normal test) then
+    removes only those collapsed faces.  Real inserts — even thin ones — keep a
+    non-zero normal and are preserved, so the valid solid is untouched.  Returns
+    the cleaned (vertices, faces).
+    """
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    mesh.merge_vertices()
+    mesh.update_faces(mesh.nondegenerate_faces())
+    mesh.remove_unreferenced_vertices()
+    return mesh.vertices, mesh.faces
+
+
 def _slice_solid_to_parts(
     solid: trimesh.Trimesh,
     floor_offset_mm: float,
@@ -1675,6 +1695,16 @@ def build_all_terrain_meshes(
                 ref_transform, X, Y, bearing,
                 c1_x_crs, c1_y_crs, c2_x_crs, c2_y_crs,
             )
+
+        # Drop degenerate faces on the exact float32 coordinates the STL stores.
+        # The insert inset/relief on a barely-1-pixel component can leave a thin
+        # wall whose two sides fall within one float32 ULP; the cast then collapses
+        # it to a zero-area triangle (zero-length edge) that breaks watertightness.
+        # Snapping to float32 first exposes those coincidences to merge_vertices, and
+        # nondegenerate_faces() removes only the resulting zero-normal faces, so the
+        # valid solid is untouched (a real thin insert is still a proper volume).
+        overlay_verts, overlay_faces = _drop_degenerate_faces(
+            overlay_verts.astype(np.float32), overlay_faces)
 
         max_z = float(np.max(overlay_verts[:, 2]))
         result[name] = (
