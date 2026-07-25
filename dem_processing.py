@@ -10,7 +10,7 @@ import numpy as np
 import rasterio
 from rasterio.merge import merge
 from osgeo import gdal, ogr
-from pyproj import Transformer
+from pyproj import Transformer, Geod
 
 from bearing_utils import rotate_to_bearing_frame
 
@@ -175,7 +175,96 @@ def load_and_merge(
     if arr.size == 0 or arr.shape[0] < 2 or arr.shape[1] < 2:
         raise ValueError("DEM too small after downsampling to form a mesh.")
 
+    # Downstream (true-scale Z, aspect ratio, cutout radius) treats px_size as
+    # METRES. Metric DEMs (Swiss, Slovenian, UTM) already satisfy that, but a
+    # geographic DEM (e.g. TanDEM-X in EPSG:4979, degrees) reports px_size in
+    # degrees -- so convert it to metres at the DEM's centre latitude using a
+    # geodesic measure (no hard-coded m/deg constant). The transform stays in the
+    # native CRS for georeferencing; only the physical pixel size is converted.
+    if getattr(ref_crs, "is_geographic", False):
+        rows, cols = arr.shape
+        clon = ref_transform.c + ref_transform.a * (cols / 2.0)
+        clat = ref_transform.f + ref_transform.e * (rows / 2.0)
+        geod = Geod(ellps="WGS84")
+        # metres spanned by one degree of lon / lat at the centre
+        m_per_deg_lon = geod.inv(clon - 0.5, clat, clon + 0.5, clat)[2]
+        m_per_deg_lat = geod.inv(clon, clat - 0.5, clon, clat + 0.5)[2]
+        px_size_x *= m_per_deg_lon
+        px_size_y *= m_per_deg_lat
+
     return arr, px_size_x, px_size_y, ref_crs, ref_transform
+
+
+def crop_to_cutout(
+    arr: np.ndarray,
+    transform: object,
+    crs: object,
+    center_lat: float = None,
+    center_lon: float = None,
+    radius_m: float = None,
+    side_length_km: float = None,
+    rect_lat1: float = None,
+    rect_lon1: float = None,
+    rect_lat2: float = None,
+    rect_lon2: float = None,
+) -> Tuple[np.ndarray, object]:
+    """Crop the DEM to the cutout region's bounding box.
+
+    The output model scale is set from the cropped array, so ``--x-size-mm`` maps
+    to the cutout, not the whole provided tile -- and only the cutout neighbourhood
+    is meshed instead of a full 1-degree tile. The final (circular/rotated) shape is
+    still trimmed later by the mesh boolean cutout; this only bounds the raster.
+
+    Returns (cropped_arr, cropped_transform). A no-op (returns the inputs) when no
+    cutout region is given or the window would be degenerate.
+    """
+    tf = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    pts = []
+    if rect_lat1 is not None and rect_lat2 is not None:
+        pts = [(rect_lon1, rect_lat1), (rect_lon2, rect_lat2),
+               (rect_lon1, rect_lat2), (rect_lon2, rect_lat1)]
+    elif center_lat is not None:
+        if radius_m is not None:
+            reach = radius_m
+        elif side_length_km is not None:
+            reach = (side_length_km * 1000.0 / 2.0) * (2.0 ** 0.5)  # half-diagonal
+        else:
+            return arr, transform
+        geod = Geod(ellps="WGS84")
+        # Sample the boundary all the way round so a rotated/square region is fully
+        # bounded regardless of bearing.
+        for az in range(0, 360, 15):
+            lon2, lat2, _ = geod.fwd(center_lon, center_lat, az, reach)
+            pts.append((lon2, lat2))
+    else:
+        return arr, transform
+
+    xs, ys = [], []
+    for lon, lat in pts:
+        x, y = tf.transform(lon, lat)
+        xs.append(x)
+        ys.append(y)
+    minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
+
+    inv = ~transform
+    cols, rows = [], []
+    for x, y in [(minx, miny), (minx, maxy), (maxx, miny), (maxx, maxy)]:
+        c, r = inv * (x, y)
+        cols.append(c)
+        rows.append(r)
+    # `inv` gives corner pixel coordinates, but the mesh vertices are pixel CENTRES
+    # (index i sits at corner i+0.5). The kept pixels c0..c1-1 have their outer
+    # centres at c0+0.5 and c1-0.5, so to make those centres bracket the cutout
+    # bbox [min, max] we shift the rounding by that half-pixel: c0 = floor(min-0.5),
+    # c1 = ceil(max+0.5). Otherwise the outermost vertex lands inside the bbox and
+    # the boolean cutout clips the shape (the ~0.1% shortfall seen at the poles).
+    c0 = max(int(np.floor(min(cols) - 0.5)), 0)
+    c1 = min(int(np.ceil(max(cols) + 0.5)), arr.shape[1])
+    r0 = max(int(np.floor(min(rows) - 0.5)), 0)
+    r1 = min(int(np.ceil(max(rows) + 0.5)), arr.shape[0])
+    if c1 - c0 < 2 or r1 - r0 < 2:
+        return arr, transform
+    return arr[r0:r1, c0:c1], transform * rasterio.Affine.translation(c0, r0)
 
 
 def apply_cutout_mask(

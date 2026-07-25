@@ -1331,16 +1331,23 @@ def build_all_terrain_meshes(
     rect_corner2_lon: Optional[float] = None,
     recess_mode: str = "flat",
     terrain_types: Optional[List[str]] = None,
+    base_class: Optional[int] = None,
     insert_xy_clearance_mm: float = 0.0,
     insert_z_clearance_mm: float = 0.0,
     insert_corner_relief_mm: float = 0.0,
     insert_corner_min_angle_deg: float = 45.0,
 ) -> dict:
-    """Build rock base mesh and terrain overlay meshes.
+    """Build the base plate mesh and terrain overlay (insert) meshes.
 
     Args:
         class_geometries: dict mapping terrain class int → list of GeoJSON
             geometry dicts in CRS coordinates (from classify_terrain).
+        base_class: terrain class used as the leftover base plate (never
+            rasterized — it is whatever the overlays don't cover). Defaults to
+            rock. The satellite-inverted Ararat print passes foliage, which turns
+            rock into an ordinary insert class (its polygons must then be present
+            in class_geometries). Overlay classes and their precedence come from
+            terrain_classifier.TERRAIN_PRECEDENCE with the base removed.
         insert_xy_clearance_mm: per-side horizontal gap for separately-printed
             inserts.  The insert walls are inset by this amount while the rock
             pocket keeps the full polygon, yielding a uniform XY gap.  0 gives a
@@ -1360,14 +1367,22 @@ def build_all_terrain_meshes(
     Returns:
         dict mapping terrain name to (vertices, faces, max_z) or None.
     """
-    from terrain_classifier import TERRAIN_ROCK, TERRAIN_GLACIER, TERRAIN_WATER, TERRAIN_FOLIAGE, TERRAIN_NAMES
+    from terrain_classifier import (TERRAIN_ROCK, TERRAIN_NAMES,
+                                     TERRAIN_PRECEDENCE, overlay_precedence)
+    from terrain_compose import resolve_layers, MIN_THICKNESS_MM, MIN_BLOB_MM
 
-    # Priority order: water > glacier > foliage > rock
-    PRIORITY_ORDER = [TERRAIN_WATER, TERRAIN_GLACIER, TERRAIN_FOLIAGE]
+    # The base plate is the "leftover" class (never rasterized: it is whatever the
+    # overlays don't cover). Rock is the base for normal prints; the satellite
+    # inversion passes base_class=FOLIAGE. Overlay/insert classes and their
+    # precedence come from the shared TERRAIN_PRECEDENCE (terrain_classifier).
+    if base_class is None:
+        base_class = TERRAIN_ROCK
+    PRIORITY_ORDER = overlay_precedence(base_class)
+    base_name = TERRAIN_NAMES[base_class]
 
     # Determine active (meshed) vs excluded terrain classes
     if terrain_types is not None:
-        name_to_class = {v: k for k, v in TERRAIN_NAMES.items() if k != TERRAIN_ROCK}
+        name_to_class = {TERRAIN_NAMES[c]: c for c in PRIORITY_ORDER}
         active_set = set()
         for t in terrain_types:
             t = t.strip()
@@ -1389,9 +1404,10 @@ def build_all_terrain_meshes(
         use_true_scale=use_true_scale,
     )
 
-    # Convert ALL class geometries to shapely in model mm (including excluded)
+    # Convert ALL class geometries to shapely in model mm (including the base
+    # class's mask -- the resolver needs it to carve the complement).
     class_polys_mm = {}
-    for tc in PRIORITY_ORDER:
+    for tc in TERRAIN_PRECEDENCE:
         geoms = class_geometries.get(tc, [])
         poly = _polygons_to_model_mm(
             geoms, ref_transform, rows, cols, x_size_mm, model_y_mm,
@@ -1426,16 +1442,35 @@ def build_all_terrain_meshes(
                 class_polys_mm[candidate] = unary_union([class_polys_mm[candidate], *comps])
         class_polys_mm[tc] = None
 
-    # Subtract higher-priority classes from lower-priority ones to make
-    # mutually exclusive (priority: water > glacier > foliage)
-    for i, tc in enumerate(PRIORITY_ORDER):
-        if class_polys_mm[tc] is None:
+    # Resolve masks -> mutually-exclusive inserts + base plate. Model mm is print
+    # mm, so scale_m_per_mm=1.0. The oversized domain leaves inserts unclipped (the
+    # cutout trims later); the complement it carves is clipped there too.
+    margin = float(X.max()) - float(X.min())
+    domain = shapely.geometry.box(float(X.min()) - margin, float(Y.min()) - margin,
+                                  float(X.max()) + margin, float(Y.max()) + margin)
+    masks = {tc: class_polys_mm[tc] for tc in TERRAIN_PRECEDENCE
+             if class_polys_mm.get(tc) is not None}
+    _, resolved_inserts = resolve_layers(
+        domain, masks, base_class,
+        min_thickness_mm=MIN_THICKNESS_MM, min_blob_mm=MIN_BLOB_MM, scale_m_per_mm=1.0)
+    for tc in TERRAIN_PRECEDENCE:
+        class_polys_mm[tc] = resolved_inserts.get(tc)
+
+    # Collapse boundary detail finer than the surface grid before extruding. An
+    # insert outline can carry huge sub-pixel wiggle -- the satellite rock
+    # complement (cutout minus fine vegetation) is ~76k vertices, 90% of which are
+    # below one DEM sample -- and every one becomes extruded walls that are then
+    # boolean-unioned, which is what exhausts memory. Half the model-space DEM
+    # pitch is below what the sampled surface can represent, so simplifying to it
+    # changes no printable shape (area drift < 0.1%) while cutting vertices ~20x.
+    grid_pitch_mm = (float(X.max()) - float(X.min())) / max(cols - 1, 1)
+    simplify_tol_mm = 0.5 * grid_pitch_mm
+    for tc in PRIORITY_ORDER:
+        poly = class_polys_mm[tc]
+        if poly is None:
             continue
-        higher = [class_polys_mm[h] for h in PRIORITY_ORDER[:i] if class_polys_mm[h] is not None]
-        if higher:
-            combined_higher = unary_union(higher)
-            diff = class_polys_mm[tc].difference(combined_higher)
-            class_polys_mm[tc] = diff if not diff.is_empty else None
+        poly = shapely.simplify(poly, simplify_tol_mm, preserve_topology=True).buffer(0)
+        class_polys_mm[tc] = poly if not poly.is_empty else None
 
     # Compute CRS corners for rectangular cutout (needed for rock mesh and transforms)
     c1_x_crs = c1_y_crs = c2_x_crs = c2_y_crs = None
@@ -1600,7 +1635,7 @@ def build_all_terrain_meshes(
     rock_faces = rock_mesh.faces.astype(np.int64)
     rock_max_z = float(np.max(rock_verts[:, 2]))
 
-    result = {"rock": (rock_verts, rock_faces, rock_max_z)}
+    result = {base_name: (rock_verts, rock_faces, rock_max_z)}
 
     # Build overlays via boolean intersection with vector polygon prisms
     # Group components by terrain class
@@ -1705,6 +1740,15 @@ def build_all_terrain_meshes(
         # valid solid is untouched (a real thin insert is still a proper volume).
         overlay_verts, overlay_faces = _drop_degenerate_faces(
             overlay_verts.astype(np.float32), overlay_faces)
+
+        # The boolean union (or the degenerate-face drop) can collapse to nothing
+        # when every part is degenerate or the union fails -- guard the empty
+        # reduction and report the class rather than crashing the whole build.
+        if overlay_verts.shape[0] == 0 or overlay_faces.shape[0] == 0:
+            print(f"[WARN] terrain class '{name}': {len(component_meshes)} part(s) "
+                  f"collapsed to an empty mesh after union; skipping.", flush=True)
+            result[name] = None
+            continue
 
         max_z = float(np.max(overlay_verts[:, 2]))
         result[name] = (

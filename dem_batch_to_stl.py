@@ -123,6 +123,62 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
              "Valid types: glacier, water, foliage.",
     )
     parser.add_argument(
+        "--snow-geojson",
+        type=str,
+        default=None,
+        help="Path to a satellite-derived snow polygon (e.g. from Sentinel-2 NDSI). "
+             "Its polygons are cleaned for printability and added to the glacier "
+             "terrain class (unioned with any OSM glacier). Requires --terrain.",
+    )
+    parser.add_argument(
+        "--snow-iterations",
+        type=int,
+        default=220,
+        help="Area-preserving curve-shortening (APCSF) iterations for snow cleanup: "
+             "higher = more finger retraction / blobbier, thicker inserts (area is "
+             "preserved throughout). Default 220 (sub-1 mm slivers < 1%, 2 pieces, at "
+             "RESAMPLE_M=15; tied to RESAMPLE_M, re-sweep if you change it).",
+    )
+    parser.add_argument(
+        "--snow-min-feature-m2",
+        type=float,
+        default=None,
+        help="Despeckle/hole-fill threshold (m^2): drop snow polygons and holes "
+             "smaller than this. Default: derived from the true print scale as a "
+             "2x2 mm square (diameter/x-size), not a fixed value.",
+    )
+    parser.add_argument(
+        "--snow-dt",
+        type=float,
+        default=4.0,
+        help="APCSF curve-shortening step size (m) per iteration. Default: 4.",
+    )
+    parser.add_argument(
+        "--foliage-geojson",
+        type=str,
+        default=None,
+        help="Path to a satellite-derived foliage/vegetation polygon (e.g. from "
+             "Sentinel-2 NDVI). Required by --invert-base, where foliage becomes "
+             "the base plate. Its polygons are cleaned for printability (APCSF).",
+    )
+    parser.add_argument(
+        "--foliage-iterations",
+        type=int,
+        default=100,
+        help="APCSF iterations for foliage cleanup (see --snow-iterations). "
+             "Default 100 (sub-1 mm base-plate slivers < 1% at RESAMPLE_M=15).",
+    )
+    parser.add_argument(
+        "--invert-base",
+        action="store_true",
+        help="Invert the terrain print: use FOLIAGE as the base plate and seat "
+             "rock + snow as inserts (rock = cutout - snow - foliage). For scenes "
+             "where foliage dominates and rock would otherwise be a fragile web of "
+             "river slivers (e.g. Ararat). Requires --snow-geojson, "
+             "--foliage-geojson and a circular cutout (--diameter). Builds terrain "
+             "from the satellite layers only (no OSM classification).",
+    )
+    parser.add_argument(
         "--terrain-recess-mode",
         choices=["flat", "uniform"],
         default="flat",
@@ -254,6 +310,21 @@ def main(argv: Iterable[str]) -> int:
             f"[INFO] Merge complete. DEM shape: {dem.shape[0]} x {dem.shape[1]} "
             f"(downsample={args.downsample}), pixel size (m): {px_size_x:.3f} x {px_size_y:.3f}"
         )
+        # Crop the raster to the cutout region so --x-size-mm is the cutout's output
+        # size (not the whole tile) and only the cutout neighbourhood is meshed. The
+        # final shape is still trimmed by the mesh boolean cutout.
+        if args.center or args.rect_corners:
+            from dem_processing import crop_to_cutout
+            _crop_radius_m = (args.diameter / 2.0 * 1000.0) if args.diameter else None
+            dem, ref_transform = crop_to_cutout(
+                dem, ref_transform, ref_crs,
+                center_lat=center_lat, center_lon=center_lon,
+                radius_m=_crop_radius_m, side_length_km=args.side_length,
+                rect_lat1=rect_lat1, rect_lon1=rect_lon1,
+                rect_lat2=rect_lat2, rect_lon2=rect_lon2,
+            )
+            print(f"[INFO] Cropped to cutout region: DEM shape {dem.shape[0]} x "
+                  f"{dem.shape[1]}", flush=True)
         if args.rect_corners:
             bearing_info = f", bearing={args.bearing}°" if args.bearing != 0.0 else ""
             print(f"[INFO] Applied rectangular cutout with corners ({rect_lat1}, {rect_lon1}) to ({rect_lat2}, {rect_lon2}){bearing_info}")
@@ -283,44 +354,69 @@ def main(argv: Iterable[str]) -> int:
             if args.diameter:
                 cutout_radius_m = (args.diameter / 2.0) * 1000.0  # Convert km to m
 
-        # Terrain classification
+        # Pin the model scale to the cutout so the printed cutout is exactly
+        # --x-size-mm, independent of how crop_to_cutout rounded to whole pixels.
+        # (Circular: the printed diameter == x_size_mm. The mesh derives its scale
+        # from the raster width, so scale x_size up by raster_width/diameter.)
+        x_size_model = args.x_size_mm
+        terrain_w_m = (dem.shape[1] - 1) * px_size_x
+        if args.diameter:
+            x_size_model = args.x_size_mm * terrain_w_m / (args.diameter * 1000.0)
+
+        # True print scale (real terrain metres per printed mm), after cropping and
+        # the cutout pin. Feature-size rules are defined in mm, so the satellite-layer
+        # cleaning must use THIS scale rather than snow_overlay's nominal constant.
+        scale_m_per_mm = terrain_w_m / x_size_model
+
+        # Terrain classification / composition
         class_geometries = None
-        if args.terrain:
-            from terrain_classifier import classify_terrain, TERRAIN_NAMES
-            if args.lake_range_percent > 0 and args.lake_lowering_mm > 0:
-                print("[WARN] --terrain mode ignores --lake-range-percent and --lake-lowering-mm "
-                      "(OSM water classification is used instead).", flush=True)
-            print("[INFO] Classifying terrain from OSM data...", flush=True)
+        base_class = None
+        terrain_type_list = None
+        if args.terrain or args.invert_base:
+            from terrain_classifier import (TERRAIN_GLACIER, TERRAIN_FOLIAGE,
+                                            TERRAIN_ROCK)
+            from snow_overlay import (load_and_clean_snow, snow_to_ref_geoms,
+                                      despeckle_area_m2)
             terrain_type_list = args.terrain_types.split(",") if args.terrain_types else None
-            class_geometries = classify_terrain(dem.shape, ref_transform, ref_crs)
-            import shapely
-            from shapely.geometry import box as shapely_box, shape as shapely_shape
-            # Clip to the DEM extent before unioning: OSM polygons can extend far
-            # beyond the model, which would both slow the union down and inflate
-            # the reported percentages.
-            bx0, by0 = ref_transform * (0, 0)
-            bx1, by1 = ref_transform * (dem.shape[1], dem.shape[0])
-            dem_bbox = shapely_box(min(bx0, bx1), min(by0, by1), max(bx0, bx1), max(by0, by1))
-            class_areas = {}
-            for cls_val, cls_name in sorted(TERRAIN_NAMES.items()):
-                geoms = class_geometries.get(cls_val, [])
-                if geoms:
-                    polys = shapely.make_valid(
-                        np.array([shapely_shape(g) for g in geoms], dtype=object))
-                    clipped = shapely.intersection(polys, dem_bbox)
-                    class_areas[cls_name] = float(shapely.union_all(clipped).area)
-                else:
-                    class_areas[cls_name] = 0.0
-            total_area = sum(class_areas.values())
-            if total_area > 0:
-                rock_area = dem.shape[0] * abs(ref_transform.e) * dem.shape[1] * abs(ref_transform.a) - total_area
-                class_areas["rock"] = max(rock_area, 0.0)
-                total_with_rock = sum(class_areas.values())
-                for name in ["rock", "glacier", "water", "foliage"]:
-                    area = class_areas.get(name, 0.0)
-                    if area > 0:
-                        pct = 100.0 * area / total_with_rock
-                        print(f"[INFO]   {name}: {pct:.1f}%")
+            class_geometries = {}
+
+            # Masks come from whichever data sources are given, independent of the
+            # bottom-layer mapping.
+            if args.terrain:
+                from terrain_classifier import classify_terrain
+                if args.lake_range_percent > 0 and args.lake_lowering_mm > 0:
+                    print("[WARN] --terrain ignores --lake-range-percent / "
+                          "--lake-lowering-mm (OSM water is used instead).", flush=True)
+                print("[INFO] Classifying terrain from OSM data...", flush=True)
+                class_geometries = classify_terrain(dem.shape, ref_transform, ref_crs)
+
+            if args.snow_geojson:
+                snow_min_feature_m2 = (args.snow_min_feature_m2
+                                       if args.snow_min_feature_m2 is not None
+                                       else despeckle_area_m2(scale_m_per_mm))
+                snow_geom, snow_epsg = load_and_clean_snow(
+                    args.snow_geojson, iterations=args.snow_iterations,
+                    dt=args.snow_dt, min_feature_m2=snow_min_feature_m2)
+                class_geometries.setdefault(TERRAIN_GLACIER, []).extend(
+                    snow_to_ref_geoms(snow_geom, snow_epsg, ref_crs))
+                print(f"[INFO] snow -> glacier: {snow_geom.area / 1e6:.1f} km^2",
+                      flush=True)
+
+            if args.foliage_geojson:
+                from terrain_compose import load_and_clean_veg
+                fol_geom, fol_epsg = load_and_clean_veg(
+                    args.foliage_geojson, iterations=args.foliage_iterations,
+                    min_feature_m2=despeckle_area_m2(scale_m_per_mm))
+                class_geometries.setdefault(TERRAIN_FOLIAGE, []).extend(
+                    snow_to_ref_geoms(fol_geom, fol_epsg, ref_crs))
+                print(f"[INFO] foliage -> foliage: {fol_geom.area / 1e6:.1f} km^2",
+                      flush=True)
+
+            # The only thing --invert-base changes: which terrain type is the bottom.
+            base_class = TERRAIN_FOLIAGE if args.invert_base else TERRAIN_ROCK
+            if args.invert_base and not class_geometries.get(TERRAIN_FOLIAGE):
+                raise SystemExit("--invert-base makes foliage the base plate; supply "
+                                 "a foliage mask with --foliage-geojson.")
 
         # Build meshes
         input_stub = os.path.splitext(os.path.basename(args.url_list))[0]
@@ -329,13 +425,14 @@ def main(argv: Iterable[str]) -> int:
         if len(downloaded) > 1:
             base_name = f"{base_name}_mosaic"
 
-        if args.terrain and class_geometries is not None:
+        if (args.terrain or args.invert_base) and class_geometries is not None:
             terrain_meshes = build_all_terrain_meshes(
                 dem, class_geometries,
                 px_size_x, px_size_y,
-                args.x_size_mm, max_height_mm, z_exaggeration,
+                x_size_model, max_height_mm, z_exaggeration,
                 args.base_thickness_mm, args.terrain_thickness_mm,
                 use_true_scale=use_true_scale,
+                base_class=base_class,
                 cutout_type=cutout_type_for_mesh,
                 cutout_center_lat=center_lat,
                 cutout_center_lon=center_lon,
@@ -365,12 +462,18 @@ def main(argv: Iterable[str]) -> int:
                 save_stl(verts, fcs, stl_path)
 
             rows, cols = dem.shape
-            rock_data = terrain_meshes["rock"]
-            model_y = rock_data[0][:, 1].max()
-            max_z = rock_data[2]
+            from terrain_classifier import TERRAIN_NAMES as _TN
+            base_name_out = _TN[base_class] if base_class is not None else "rock"
+            base_data = terrain_meshes[base_name_out]
+            # Report the actual printed bounding box (the base plate = the cutout,
+            # after the boolean trim), not the raster grid extent.
+            bv = base_data[0]
+            model_x = float(bv[:, 0].max() - bv[:, 0].min())
+            model_y = float(bv[:, 1].max() - bv[:, 1].min())
+            max_z = base_data[2]
             print(
                 f"[OK] Merged {len(downloaded)} DEM(s): {rows} x {cols} samples -> "
-                f"model {args.x_size_mm:.2f} mm x {model_y:.2f} mm x {max_z:.2f} mm\n"
+                f"model {model_x:.2f} mm x {model_y:.2f} mm x {max_z:.2f} mm\n"
                 f"     Terrain STLs saved to {args.output_dir}\n"
                 f"Cached DEM files at: {os.path.abspath(CACHE_DIR)}"
             )
@@ -383,7 +486,7 @@ def main(argv: Iterable[str]) -> int:
                 dem,
                 px_size_x,
                 px_size_y,
-                args.x_size_mm,
+                x_size_model,
                 max_height_mm,
                 z_exaggeration,
                 args.base_thickness_mm,
@@ -417,10 +520,12 @@ def main(argv: Iterable[str]) -> int:
                 save_stl(vertices, water_faces, water_path)
 
             rows, cols = dem.shape
-            model_y = vertices[:, 1].max()
+            # Report the actual printed bounding box (after any boolean cutout trim).
+            model_x = float(vertices[:, 0].max() - vertices[:, 0].min())
+            model_y = float(vertices[:, 1].max() - vertices[:, 1].min())
             print(
                 f"[OK] Merged {len(downloaded)} DEM(s): {rows} x {cols} samples -> "
-                f"model {args.x_size_mm:.2f} mm x {model_y:.2f} mm x {max_z:.2f} mm\n"
+                f"model {model_x:.2f} mm x {model_y:.2f} mm x {max_z:.2f} mm\n"
                 f"     -> {stl_path}\n"
                 f"Cached DEM files at: {os.path.abspath(CACHE_DIR)}"
             )

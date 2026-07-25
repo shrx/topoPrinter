@@ -19,7 +19,8 @@ from pyproj import Transformer
 # data can be reused offline across runs.
 OVERPASS_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "osm_cache")
 
-# Terrain class constants (priority: lower value = higher priority)
+# Terrain class constants. The integer VALUE is just an id, not a priority — see
+# TERRAIN_PRECEDENCE below for the actual layer ordering.
 TERRAIN_ROCK = 0
 TERRAIN_GLACIER = 1
 TERRAIN_WATER = 2
@@ -31,6 +32,28 @@ TERRAIN_NAMES = {
     TERRAIN_WATER: "water",
     TERRAIN_FOLIAGE: "foliage",
 }
+NAME_TO_TERRAIN = {name: cls for cls, name in TERRAIN_NAMES.items()}
+
+# Single source of truth for layer ordering, used by every stage (OSM mesh build
+# and satellite composition). Where two classes overlap, the earlier entry wins
+# over the later one. The LAST entry is the default "leftover" base: any area not
+# claimed by an earlier class becomes it. Normal prints use rock as that base
+# (rock is never rasterized — it is whatever the overlays don't cover); the
+# satellite-inverted Ararat print instead designates foliage as the base and
+# rasterizes rock as an insert class (see terrain_compose.resolve_layers).
+# Satellite "snow" (NDSI) is carried as the GLACIER class — the same physical
+# frozen-ground layer OSM tags as glacier.
+TERRAIN_PRECEDENCE = [TERRAIN_WATER, TERRAIN_GLACIER, TERRAIN_FOLIAGE, TERRAIN_ROCK]
+
+
+def overlay_precedence(base_class=TERRAIN_ROCK):
+    """Precedence-ordered overlay (insert) classes for a given base class.
+
+    The base class is removed from TERRAIN_PRECEDENCE; the rest keep their order,
+    highest priority first. With base_class=ROCK this is [WATER, GLACIER, FOLIAGE]
+    (the historical order); with base_class=FOLIAGE it is [WATER, GLACIER, ROCK].
+    """
+    return [c for c in TERRAIN_PRECEDENCE if c != base_class]
 
 # OSM tag → terrain class mapping
 _GLACIER_NATURAL = {"glacier"}
