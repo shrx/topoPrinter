@@ -1305,6 +1305,172 @@ def _iter_polygon_components(geom: shapely.Geometry):
         yield from geom.geoms
 
 
+def _region_triangles(piece: ShapelyPolygon):
+    """Constrained-Delaunay triangulate a polygon piece -> list of xy coord triples.
+
+    Uses only the piece's own vertices (no Steiner points), so a boundary shared
+    with a neighbour keeps identical vertices on both sides.
+    """
+    tc = shapely.constrained_delaunay_triangles(piece)
+    if tc.is_empty:
+        return []
+    return [list(t.exterior.coords)[:3] for t in tc.geoms]
+
+
+def _dem_sampler(z_grid_asc: np.ndarray, xs: np.ndarray, ys: np.ndarray):
+    """Bilinear DEM sampler on an ascending-x, ascending-y grid.
+
+    Returns a callable mapping an (N,2) array of model-mm xy to interpolated Z.
+    ``z_grid_asc[i, j]`` is the surface at (xs[j], ys[i]).
+    """
+    x0 = float(xs[0]); y0 = float(ys[0])
+    dx = (float(xs[-1]) - x0) / (len(xs) - 1)
+    dy = (float(ys[-1]) - y0) / (len(ys) - 1)
+    nx, ny = len(xs), len(ys)
+
+    def sample(xy: np.ndarray) -> np.ndarray:
+        fx = (xy[:, 0] - x0) / dx
+        fy = (xy[:, 1] - y0) / dy
+        j = np.clip(np.floor(fx).astype(np.int64), 0, nx - 2)
+        i = np.clip(np.floor(fy).astype(np.int64), 0, ny - 2)
+        tx = np.clip(fx - j, 0.0, 1.0)
+        ty = np.clip(fy - i, 0.0, 1.0)
+        z00 = z_grid_asc[i, j]; z01 = z_grid_asc[i, j + 1]
+        z10 = z_grid_asc[i + 1, j]; z11 = z_grid_asc[i + 1, j + 1]
+        return (z00 * (1 - tx) * (1 - ty) + z01 * tx * (1 - ty)
+                + z10 * (1 - tx) * ty + z11 * tx * ty)
+
+    return sample
+
+
+def _dem_min_over(poly, sampler, xs: np.ndarray, ys: np.ndarray) -> Optional[float]:
+    """Minimum DEM value over a footprint (interior grid points + boundary vertices).
+
+    Matches the flat recess floor the old code read from the clipped surface: grid
+    crossings interpolate between bracketing grid points, so they never fall below
+    the interior grid-point minimum -- interior grid points + polygon vertices give
+    the true surface minimum.
+    """
+    minx, miny, maxx, maxy = poly.bounds
+    j0 = max(int(np.searchsorted(xs, minx)) - 1, 0)
+    j1 = min(int(np.searchsorted(xs, maxx)) + 1, len(xs) - 1)
+    i0 = max(int(np.searchsorted(ys, miny)) - 1, 0)
+    i1 = min(int(np.searchsorted(ys, maxy)) + 1, len(ys) - 1)
+    vals = []
+    if j1 > j0 and i1 > i0:
+        GX, GY = np.meshgrid(xs[j0:j1 + 1], ys[i0:i1 + 1])
+        inside = shapely.contains_xy(poly, GX, GY)
+        if inside.any():
+            vals.append(float(sampler(np.column_stack((GX[inside], GY[inside]))).min()))
+    coords = [np.asarray(ring.coords)
+              for p in _iter_polygon_components(poly)
+              for ring in [p.exterior, *p.interiors]]
+    if coords:
+        vals.append(float(sampler(np.vstack(coords)).min()))
+    return min(vals) if vals else None
+
+
+def build_region_prism_fast(poly, top_fn, bottom_fn, xs, ys, key_scale=1e6):
+    """Watertight prism for one 2D region, extruded over the shared DEM grid.
+
+    ``poly`` is a shapely (Multi)Polygon in model mm; ``top_fn``/``bottom_fn`` are
+    callables (N,2 xy)->z for the two surfaces (a constant lambda for a flat face,
+    the DEM sampler for a draped one, or ``DEM - t`` for a uniform-thickness floor).
+    Interior grid cells are meshed vectorized; only the ~perimeter boundary cells
+    are clipped with shapely (CDT).  Neighbours share boundary vertices (same grid +
+    same polygon edge) so separately-built regions abut with no crack and no
+    boolean.  Winding is correct by construction (CCW-from-above top, reversed
+    bottom, walls oriented from the top surface's boundary edges) so no
+    fix_normals/merge is needed (those dominate runtime on multi-million-face meshes).
+    Returns a trimesh.Trimesh or None if the region covers no cells.
+    """
+    minx, miny, maxx, maxy = poly.bounds
+    j0 = max(int(np.searchsorted(xs, minx)) - 1, 0)
+    j1 = min(int(np.searchsorted(xs, maxx)) + 1, len(xs) - 1)
+    i0 = max(int(np.searchsorted(ys, miny)) - 1, 0)
+    i1 = min(int(np.searchsorted(ys, maxy)) + 1, len(ys) - 1)
+    gx = xs[j0:j1 + 1]; gy = ys[i0:i1 + 1]
+    ni, nj = len(gy), len(gx)
+    if ni < 2 or nj < 2:
+        return None
+    GX, GY = np.meshgrid(gx, gy)
+    inside = shapely.contains_xy(poly, GX, GY)
+
+    c00 = inside[:-1, :-1]; c10 = inside[1:, :-1]
+    c11 = inside[1:, 1:];   c01 = inside[:-1, 1:]
+    all_in = c00 & c10 & c11 & c01
+    bnd = (c00 | c10 | c11 | c01) & ~all_in
+    if not all_in.any() and not bnd.any():
+        return None
+
+    usedcell = all_in | bnd
+    ptused = np.zeros((ni, nj), bool)
+    ptused[:-1, :-1] |= usedcell; ptused[1:, :-1] |= usedcell
+    ptused[1:, 1:] |= usedcell;   ptused[:-1, 1:] |= usedcell
+    gridvid = np.full((ni, nj), -1, np.int64)
+    pi, pj = np.where(ptused)
+    n_grid = len(pi)
+    gridvid[pi, pj] = np.arange(n_grid)
+    grid_xy = np.column_stack((gx[pj], gy[pi]))
+
+    gxkey = {round(v * key_scale): k for k, v in enumerate(gx)}
+    gykey = {round(v * key_scale): k for k, v in enumerate(gy)}
+    cross_xy = []
+    cross_tbl = {}
+
+    def vid(x, y):
+        kx = round(x * key_scale); ky = round(y * key_scale)
+        j = gxkey.get(kx); i = gykey.get(ky)
+        if i is not None and j is not None and gridvid[i, j] >= 0:
+            return int(gridvid[i, j])
+        k = (kx, ky)
+        got = cross_tbl.get(k)
+        if got is None:
+            got = cross_tbl[k] = n_grid + len(cross_xy)
+            cross_xy.append((x, y))
+        return got
+
+    ci, cj = np.where(all_in)
+    v00 = gridvid[ci, cj]; v10 = gridvid[ci + 1, cj]
+    v11 = gridvid[ci + 1, cj + 1]; v01 = gridvid[ci, cj + 1]
+    top_faces = [np.column_stack((v00, v01, v11)),
+                 np.column_stack((v00, v11, v10))]
+
+    bci, bcj = np.where(bnd)
+    bnd_tris = []
+    for i, j in zip(bci.tolist(), bcj.tolist()):
+        inter = poly.intersection(shapely.geometry.box(gx[j], gy[i], gx[j + 1], gy[i + 1]))
+        geoms = inter.geoms if inter.geom_type in (
+            "MultiPolygon", "GeometryCollection") else [inter]
+        for g in geoms:
+            if g.geom_type != "Polygon" or g.is_empty or g.area <= 0:
+                continue
+            for t in _region_triangles(g):
+                if (t[1][0] - t[0][0]) * (t[2][1] - t[0][1]) - \
+                   (t[1][1] - t[0][1]) * (t[2][0] - t[0][0]) < 0:
+                    t = [t[0], t[2], t[1]]
+                bnd_tris.append([vid(*t[0]), vid(*t[1]), vid(*t[2])])
+    if bnd_tris:
+        top_faces.append(np.array(bnd_tris, np.int64))
+    top_faces = np.vstack(top_faces)
+
+    n = n_grid + len(cross_xy)
+    xy = grid_xy if not cross_xy else np.vstack((grid_xy, np.array(cross_xy)))
+    verts = np.empty((2 * n, 3))
+    verts[:n, :2] = xy; verts[:n, 2] = top_fn(xy)
+    verts[n:, :2] = xy; verts[n:, 2] = bottom_fn(xy)
+
+    de = np.vstack((top_faces[:, [0, 1]], top_faces[:, [1, 2]], top_faces[:, [2, 0]]))
+    key = np.minimum(de[:, 0], de[:, 1]) * np.int64(2 ** 32) + np.maximum(de[:, 0], de[:, 1])
+    _, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
+    wall_de = de[cnt[inv] == 1]
+    a, b = wall_de[:, 0], wall_de[:, 1]
+    faces = np.vstack((top_faces, top_faces[:, ::-1] + n,
+                       np.column_stack((a, b + n, b)),
+                       np.column_stack((a, a + n, b + n))))
+    return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+
 def build_all_terrain_meshes(
     dem: np.ndarray,
     class_geometries: dict,
@@ -1518,151 +1684,70 @@ def build_all_terrain_meshes(
     # the model's largest coordinate where float32's absolute step is coarsest.
     output_resolution = np.spacing(np.float32(max(X.max(), Y.max())))
 
-    overlay_components = []
+    # 2D-first setup: ascending model grid + a bilinear DEM sampler (model mm ==
+    # print mm), and helpers to flatten a Z and to finalize a body.
+    xs = np.asarray(X[0, :], dtype=float)
+    ys = np.asarray(Y[::-1, 0], dtype=float)          # Y descends with row -> reverse
+    z_grid_asc = np.asarray(z_surface_mm[::-1, :], dtype=float)
+    if not np.isfinite(z_grid_asc).all():
+        fill = float(np.nanmin(z_grid_asc))
+        z_grid_asc = np.where(np.isfinite(z_grid_asc), z_grid_asc, fill)
+        print("[WARN] DEM has voids inside the cutout; the base plate fills them "
+              "with the minimum height (no spikes).", flush=True)
+    sample_dem = _dem_sampler(z_grid_asc, xs, ys)
+    max_terrain_z = float(np.max(z_grid_asc))
+
+    def _flat(z):
+        return lambda xy: np.full(len(xy), float(z))
+
+    def _finalize(mesh):
+        verts = mesh.vertices
+        if cutout_type == "rectangular" and c1_x_crs is not None:
+            verts = _apply_rect_cutout_transform(
+                verts, dem.shape, px_size_x, x_size_mm, ref_transform, X, Y, bearing,
+                c1_x_crs, c1_y_crs, c2_x_crs, c2_y_crs)
+        v = verts.astype(np.float32)
+        return v, mesh.faces.astype(np.int64), float(np.max(v[:, 2]))
+
+    base_outline = (cutout_footprint if cutout_footprint is not None
+                    else shapely.geometry.box(float(X.min()), float(Y.min()),
+                                              float(X.max()), float(Y.max())))
+    base_mask = masks.get(base_class)
+    if base_mask is not None:
+        base_mask = shapely.simplify(
+            base_mask, simplify_tol_mm, preserve_topology=True).buffer(0)
+        if base_mask.is_empty:
+            base_mask = None
+
+    # Per insert component, in 2D: the pocket carved in the base (component +
+    # convex corner relief) and the printed insert footprint (inset + reflex
+    # relief), both clipped to the cutout. Floors come from the DEM minimum over the
+    # footprint (pocket: min - thickness; insert part: min - (thickness -
+    # z_clearance)); uniform mode drapes DEM - thickness instead of a flat floor.
+    overlay_specs = []                                     # (tc, pocket_poly, flat_z|None)
+    insert_specs = {tc: [] for tc in all_overlay_classes}  # tc -> [(part, floor|None)]
     for tc in all_overlay_classes:
         union_poly = class_polys_mm[tc]
         if union_poly is None:
             continue
         for component in _iter_polygon_components(union_poly):
-            # Corner relief: convex discs enlarge the rock pocket, reflex discs are
-            # subtracted from the insert (below).  flat_z/solid stay on the nominal
-            # component (relief only changes XY at corners, not the recess depth,
-            # and keeps the no-clearance solid reuse valid).
             pocket_extra, insert_cut = _corner_reliefs(
                 component, insert_xy_clearance_mm, insert_corner_relief_mm,
                 insert_corner_min_angle_deg)
             pocket_component = (unary_union([component, pocket_extra])
                                 if pocket_extra is not None else component)
-            if recess_mode == "uniform":
-                overlay_components.append(
-                    (tc, component, None, None, pocket_component, insert_cut))
-                continue
-            pocket_poly = _clip_to_footprint(component, cutout_footprint)
-            if pocket_poly is None:
-                continue
-            pocket_poly = _quantize_to_f32(pocket_poly, output_resolution)
-            if pocket_poly is None:
-                continue
-            solid = _build_overlay_solid(
-                pocket_poly, z_surface_mm, X, Y, valid_mask, overlay_thickness_mm)
-            if solid is None:
-                continue
-            top_min = _surface_top_min(solid)
-            if top_min is None:
-                continue
-            flat_z = max(top_min - overlay_thickness_mm, 0.01)
-            overlay_components.append(
-                (tc, component, flat_z, solid, pocket_component, insert_cut))
+            pocket_poly = _clip_to_footprint(pocket_component, base_outline)
+            if pocket_poly is not None:
+                pocket_poly = _quantize_to_f32(pocket_poly, output_resolution)
+            if pocket_poly is not None:
+                if recess_mode == "uniform":
+                    overlay_specs.append((tc, pocket_poly, None))
+                else:
+                    tmin = _dem_min_over(pocket_poly, sample_dem, xs, ys)
+                    if tmin is not None:
+                        overlay_specs.append(
+                            (tc, pocket_poly, max(tmin - overlay_thickness_mm, 0.01)))
 
-    # Build rock base mesh: recess first, then cutout.
-    # Overlay polygons are NOT clipped to the cutout boundary, so recess
-    # prisms extend beyond the DEM grid — no coplanar faces with the DEM
-    # perimeter wall.  The cutout shape then cleanly trims the result.
-    rock_verts, rock_faces, _ = _build_rectangular_mesh(
-        rows, cols, X, Y, z_surface_mm, valid_mask,
-    )
-    rock_mesh = trimesh.Trimesh(vertices=rock_verts, faces=rock_faces, process=False)
-
-    # Step 1: Subtract recess volumes from the full DEM mesh
-    max_terrain_z = float(np.max(z_surface_mm[valid_mask]))
-    recess_volumes = []
-    if recess_mode == "uniform":
-        for tc, _, _, _, pocket_component, _ in overlay_components:
-            bbox = _polygon_bbox_to_grid(pocket_component, X, Y)
-            if bbox is None:
-                continue
-            i_min, i_max, j_min, j_max = bbox
-            X_crop = X[i_min:i_max + 1, j_min:j_max + 1]
-            Y_crop = Y[i_min:i_max + 1, j_min:j_max + 1]
-            z_crop = z_surface_mm[i_min:i_max + 1, j_min:j_max + 1]
-            valid_crop = valid_mask[i_min:i_max + 1, j_min:j_max + 1]
-            crop_rows = i_max - i_min + 1
-            crop_cols = j_max - j_min + 1
-            # Pocket floor sits a full overlay thickness below the terrain; the
-            # Z clearance is taken on the insert (made thinner), not the pocket.
-            z_base_crop = z_crop - overlay_thickness_mm
-            # Use a high flat top (well above terrain) to avoid coplanarity
-            # with the rock mesh's terrain surface during boolean difference.
-            z_top_high = np.full_like(z_crop, max_terrain_z + overlay_thickness_mm * 2)
-            verts, faces, _ = _build_rectangular_mesh(
-                crop_rows, crop_cols, X_crop, Y_crop, z_top_high, valid_crop,
-                z_base=z_base_crop,
-            )
-            if len(faces) == 0:
-                continue
-            recess_vol = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-            # Intersect with tall polygon prism for XY clipping
-            min_base_z = float(np.min(z_crop[valid_crop])) - overlay_thickness_mm
-            prism = _build_polygon_prism(pocket_component, min_base_z - overlay_thickness_mm,
-                                         max_terrain_z + overlay_thickness_mm * 2)
-            if prism is not None:
-                clipped = trimesh.boolean.intersection([recess_vol, prism], check_volume=False)
-                if not clipped.is_empty and len(clipped.faces) > 0:
-                    recess_volumes.append(clipped)
-    else:
-        for tc, _, flat_z, _, pocket_component, _ in overlay_components:
-            prism_top = max(max_terrain_z * 2, flat_z + overlay_thickness_mm * 10)
-            # Pocket floor at flat_z (a full thickness below the terrain min); the
-            # Z clearance is taken on the insert, which sits clearance above this.
-            prism = _build_polygon_prism(pocket_component, flat_z, prism_top)
-            if prism is not None:
-                recess_volumes.append(prism)
-
-    if recess_volumes and rock_mesh.is_volume:
-        if len(recess_volumes) == 1:
-            combined = recess_volumes[0]
-        else:
-            combined = trimesh.boolean.union(recess_volumes, check_volume=False)
-        subtracted = trimesh.boolean.difference([rock_mesh, combined], check_volume=False)
-        if not subtracted.is_empty and len(subtracted.faces) > 0:
-            rock_mesh = subtracted
-
-    # Step 2: Apply cutout shape
-    if cutout_shape is not None:
-        result_mesh = trimesh.boolean.intersection([rock_mesh, cutout_shape], check_volume=False)
-        if not result_mesh.is_empty and len(result_mesh.faces) > 0:
-            rock_mesh = result_mesh
-
-    # Step 3: For rectangular cutout, rescale and un-rotate to final model space
-    rock_verts = rock_mesh.vertices
-    if cutout_type == "rectangular" and c1_x_crs is not None:
-        rock_verts = _apply_rect_cutout_transform(
-            rock_verts, dem.shape, px_size_x, x_size_mm,
-            ref_transform, X, Y, bearing,
-            c1_x_crs, c1_y_crs, c2_x_crs, c2_y_crs,
-        )
-    rock_verts = rock_verts.astype(np.float32)
-    rock_faces = rock_mesh.faces.astype(np.int64)
-    rock_max_z = float(np.max(rock_verts[:, 2]))
-
-    result = {base_name: (rock_verts, rock_faces, rock_max_z)}
-
-    # Build overlays via boolean intersection with vector polygon prisms
-    # Group components by terrain class
-    from collections import defaultdict
-    class_components = defaultdict(list)
-    for tc, component, flat_z, solid, _, insert_cut in overlay_components:
-        class_components[tc].append((component, flat_z, solid, insert_cut))
-
-    for terrain_class in all_overlay_classes:
-        name = TERRAIN_NAMES[terrain_class]
-        components = class_components.get(terrain_class, [])
-        if not components:
-            result[name] = None
-            continue
-
-        component_meshes = []
-        for component, flat_z, solid, insert_cut in components:
-            # Shrink the insert walls for separate printing, cut the sharp reflex
-            # corners back (corner relief), then clip to the cutout footprint — all
-            # in 2D, before any solid is built.  The rock pocket (carved above)
-            # keeps the full polygon plus convex-corner relief, so the flat gap is
-            # the inset and sharp corners get inset+relief; clipping (rather than
-            # insetting) at the cutout edge keeps the insert flush there, so
-            # clearance applies only to interior insert/rock seams, never the outer
-            # model edge.  Doing every same-XY operation on the polygon means the
-            # insert's vertical walls are never subdivided by a solid-vs-solid
-            # boolean.
             if insert_xy_clearance_mm > 0 or insert_cut is not None:
                 insert_poly = _inset_polygon(component, insert_xy_clearance_mm)
                 if insert_poly is None:
@@ -1671,91 +1756,100 @@ def build_all_terrain_meshes(
                     insert_poly = insert_poly.difference(insert_cut).buffer(0)
                     if insert_poly.is_empty:
                         continue
-                insert_poly = _clip_to_footprint(insert_poly, cutout_footprint)
-                if insert_poly is None:
-                    continue
-                insert_poly = _quantize_to_f32(insert_poly, output_resolution)
-                if insert_poly is None:
-                    continue
             else:
-                insert_poly = None  # no inset/relief: reuse the pocket solid below
-
-            if recess_mode == "uniform":
-                if insert_poly is None:
-                    insert_poly = _clip_to_footprint(component, cutout_footprint)
-                    if insert_poly is None:
-                        continue
-                    insert_poly = _quantize_to_f32(insert_poly, output_resolution)
-                    if insert_poly is None:
-                        continue
-                mesh = _build_overlay_component(
-                    insert_poly, flat_z, z_surface_mm, X, Y, valid_mask, overlay_thickness_mm,
-                    recess_mode="uniform", z_clearance_mm=insert_z_clearance_mm,
-                )
-                if mesh is not None and not mesh.is_empty and len(mesh.faces) > 0:
-                    component_meshes.append(mesh)
-            else:
-                # Flat mode: build the insert solid from the final 2D outline
-                # (reusing the pocket solid when there is no clearance), then
-                # split into parts and flatten each to its own surface minimum
-                # minus (thickness - clearance), so every printed part is exactly
-                # that thick at its thinnest.
-                if insert_poly is None:
-                    insert_solid = solid
+                insert_poly = component
+            insert_poly = _clip_to_footprint(insert_poly, base_outline)
+            if insert_poly is None:
+                continue
+            insert_poly = _quantize_to_f32(insert_poly, output_resolution)
+            if insert_poly is None:
+                continue
+            for part in _iter_polygon_components(insert_poly):
+                if recess_mode == "uniform":
+                    insert_specs[tc].append((part, None))
                 else:
-                    insert_solid = _build_overlay_solid(
-                        insert_poly, z_surface_mm, X, Y, valid_mask, overlay_thickness_mm)
-                    if insert_solid is None:
-                        continue
-                component_meshes.extend(_slice_solid_to_parts(
-                    insert_solid, overlay_thickness_mm - insert_z_clearance_mm))
+                    pmin = _dem_min_over(part, sample_dem, xs, ys)
+                    if pmin is not None:
+                        insert_specs[tc].append(
+                            (part, max(pmin - (overlay_thickness_mm - insert_z_clearance_mm), 0.01)))
 
-        if not component_meshes:
-            result[name] = None
-            continue
+    # --- Base plate: foliage (DEM top) + pockets (recess floor) + gaps (flat),
+    # each a watertight prism, concatenated as multiple bodies (no cross-merge).
+    # Non-foliage areas are FLAT, so drop_unprintable's opened-off leftovers can
+    # never stand as terrain-height fins. No solid-vs-solid boolean anywhere.
+    pocket_polys = [pk for _, pk, _ in overlay_specs]
+    pocket_union = unary_union(pocket_polys) if pocket_polys else None
+    base_bodies = []
 
-        # Boolean-union parts into a single output mesh (already cutout-clipped)
-        if len(component_meshes) == 1:
-            combined = component_meshes[0]
+    def _add_base(poly, top_fn, bottom_fn):
+        if poly is None or poly.is_empty:
+            return
+        for part in _iter_polygon_components(poly):
+            m = build_region_prism_fast(part, top_fn, bottom_fn, xs, ys)
+            if m is not None and len(m.faces) > 0:
+                base_bodies.append(m)
+
+    for tc, pocket_poly, flat_z in overlay_specs:
+        if recess_mode == "uniform":
+            top_fn = lambda xy: sample_dem(xy) - overlay_thickness_mm
         else:
-            combined = trimesh.boolean.union(component_meshes, check_volume=False)
+            top_fn = _flat(flat_z)
+        _add_base(pocket_poly, top_fn, _flat(0.0))
 
-        overlay_verts = combined.vertices
-        overlay_faces = combined.faces
+    if base_mask is not None:
+        # foliage terrain (base class), minus the pockets it borders
+        foliage = _clip_to_footprint(base_mask, base_outline)
+        if foliage is not None and pocket_union is not None:
+            foliage = foliage.difference(pocket_union).buffer(0)
+        if foliage is not None:
+            foliage = _quantize_to_f32(foliage, output_resolution)
+        _add_base(foliage, sample_dem, _flat(0.0))
 
-        # For rectangular cutout, apply rescale + rotation undo
-        if cutout_type == "rectangular" and c1_x_crs is not None:
-            overlay_verts = _apply_rect_cutout_transform(
-                overlay_verts, dem.shape, px_size_x, x_size_mm,
-                ref_transform, X, Y, bearing,
-                c1_x_crs, c1_y_crs, c2_x_crs, c2_y_crs,
-            )
+        # gaps = cutout - foliage - pockets (the opened/despeckled bits): flat-topped
+        gaps = base_outline.difference(base_mask).buffer(0)
+        if pocket_union is not None:
+            gaps = gaps.difference(pocket_union).buffer(0)
+        gaps = _clip_to_footprint(gaps, base_outline)
+        if gaps is not None:
+            gaps = _quantize_to_f32(gaps, output_resolution)
+        if gaps is not None:
+            for part in _iter_polygon_components(gaps):
+                gmin = _dem_min_over(part, sample_dem, xs, ys)
+                floor = max((gmin if gmin is not None else 0.0) - overlay_thickness_mm, 0.01)
+                _add_base(part, _flat(floor), _flat(0.0))
+    else:
+        # base IS the raw complement (rock-based scene): DEM top over cutout - pockets
+        base_fp = base_outline
+        if pocket_union is not None:
+            base_fp = base_fp.difference(pocket_union).buffer(0)
+        if base_fp is not None:
+            base_fp = _quantize_to_f32(base_fp, output_resolution)
+        _add_base(base_fp, sample_dem, _flat(0.0))
 
-        # Drop degenerate faces on the exact float32 coordinates the STL stores.
-        # The insert inset/relief on a barely-1-pixel component can leave a thin
-        # wall whose two sides fall within one float32 ULP; the cast then collapses
-        # it to a zero-area triangle (zero-length edge) that breaks watertightness.
-        # Snapping to float32 first exposes those coincidences to merge_vertices, and
-        # nondegenerate_faces() removes only the resulting zero-normal faces, so the
-        # valid solid is untouched (a real thin insert is still a proper volume).
-        overlay_verts, overlay_faces = _drop_degenerate_faces(
-            overlay_verts.astype(np.float32), overlay_faces)
+    if base_bodies:
+        result = {base_name: _finalize(trimesh.util.concatenate(base_bodies))}
+    else:
+        result = {base_name: None}
 
-        # The boolean union (or the degenerate-face drop) can collapse to nothing
-        # when every part is degenerate or the union fails -- guard the empty
-        # reduction and report the class rather than crashing the whole build.
-        if overlay_verts.shape[0] == 0 or overlay_faces.shape[0] == 0:
-            print(f"[WARN] terrain class '{name}': {len(component_meshes)} part(s) "
-                  f"collapsed to an empty mesh after union; skipping.", flush=True)
+    # --- Inserts: each part a DEM-topped prism with a flat bottom (flat mode) or a
+    # DEM-(thickness-clearance) bottom (uniform), concatenated as multiple bodies.
+    # The 2D inset/relief/clip already gave the seating clearance; no boolean here.
+    for tc in all_overlay_classes:
+        name = TERRAIN_NAMES[tc]
+        bodies = []
+        for part, floor in insert_specs.get(tc, []):
+            if recess_mode == "uniform":
+                bottom_fn = (lambda xy: sample_dem(xy)
+                             - (overlay_thickness_mm - insert_z_clearance_mm))
+            else:
+                bottom_fn = _flat(floor)
+            m = build_region_prism_fast(part, sample_dem, bottom_fn, xs, ys)
+            if m is not None and len(m.faces) > 0:
+                bodies.append(m)
+        if not bodies:
             result[name] = None
             continue
-
-        max_z = float(np.max(overlay_verts[:, 2]))
-        result[name] = (
-            overlay_verts.astype(np.float32),
-            overlay_faces.astype(np.int64),
-            max_z,
-        )
+        result[name] = _finalize(trimesh.util.concatenate(bodies))
 
     return result
 
