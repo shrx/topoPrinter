@@ -1608,6 +1608,25 @@ def build_all_terrain_meshes(
                 class_polys_mm[candidate] = unary_union([class_polys_mm[candidate], *comps])
         class_polys_mm[tc] = None
 
+    # Collapse boundary detail finer than the surface grid BEFORE the layers are
+    # combined. A satellite mask can carry huge sub-pixel wiggle (~76k vertices,
+    # 90% below one DEM sample) and every vertex becomes extruded walls. Half the
+    # model-space DEM pitch is below what the sampled surface can represent, so
+    # simplifying to it changes no printable shape (area drift < 0.1%) while
+    # cutting vertices ~20x. All per-layer boundary processing must happen here,
+    # before resolve_layers: the resolver's exact boolean differences are the last
+    # thing to touch shared boundaries, so the circle stays exactly partitioned
+    # (simplifying afterwards would move each layer's chords independently,
+    # creating overlaps and orphan slivers along every shared boundary).
+    grid_pitch_mm = (float(X.max()) - float(X.min())) / max(cols - 1, 1)
+    simplify_tol_mm = 0.5 * grid_pitch_mm
+    for tc in TERRAIN_PRECEDENCE:
+        poly = class_polys_mm.get(tc)
+        if poly is None:
+            continue
+        poly = shapely.simplify(poly, simplify_tol_mm, preserve_topology=True).buffer(0)
+        class_polys_mm[tc] = poly if not poly.is_empty else None
+
     # Resolve masks -> mutually-exclusive inserts + base plate. Model mm is print
     # mm, so scale_m_per_mm=1.0. The oversized domain leaves inserts unclipped (the
     # cutout trims later); the complement it carves is clipped there too.
@@ -1616,27 +1635,11 @@ def build_all_terrain_meshes(
                                   float(X.max()) + margin, float(Y.max()) + margin)
     masks = {tc: class_polys_mm[tc] for tc in TERRAIN_PRECEDENCE
              if class_polys_mm.get(tc) is not None}
-    _, resolved_inserts = resolve_layers(
+    base_poly_mm, resolved_inserts = resolve_layers(
         domain, masks, base_class,
         min_thickness_mm=MIN_THICKNESS_MM, min_blob_mm=MIN_BLOB_MM, scale_m_per_mm=1.0)
     for tc in TERRAIN_PRECEDENCE:
         class_polys_mm[tc] = resolved_inserts.get(tc)
-
-    # Collapse boundary detail finer than the surface grid before extruding. An
-    # insert outline can carry huge sub-pixel wiggle -- the satellite rock
-    # complement (cutout minus fine vegetation) is ~76k vertices, 90% of which are
-    # below one DEM sample -- and every one becomes extruded walls that are then
-    # boolean-unioned, which is what exhausts memory. Half the model-space DEM
-    # pitch is below what the sampled surface can represent, so simplifying to it
-    # changes no printable shape (area drift < 0.1%) while cutting vertices ~20x.
-    grid_pitch_mm = (float(X.max()) - float(X.min())) / max(cols - 1, 1)
-    simplify_tol_mm = 0.5 * grid_pitch_mm
-    for tc in PRIORITY_ORDER:
-        poly = class_polys_mm[tc]
-        if poly is None:
-            continue
-        poly = shapely.simplify(poly, simplify_tol_mm, preserve_topology=True).buffer(0)
-        class_polys_mm[tc] = poly if not poly.is_empty else None
 
     # Compute CRS corners for rectangular cutout (needed for rock mesh and transforms)
     c1_x_crs = c1_y_crs = c2_x_crs = c2_y_crs = None
@@ -1712,12 +1715,7 @@ def build_all_terrain_meshes(
     base_outline = (cutout_footprint if cutout_footprint is not None
                     else shapely.geometry.box(float(X.min()), float(Y.min()),
                                               float(X.max()), float(Y.max())))
-    base_mask = masks.get(base_class)
-    if base_mask is not None:
-        base_mask = shapely.simplify(
-            base_mask, simplify_tol_mm, preserve_topology=True).buffer(0)
-        if base_mask.is_empty:
-            base_mask = None
+    base_mask = base_poly_mm if not base_poly_mm.is_empty else None
 
     # Per insert component, in 2D: the pocket carved in the base (component +
     # convex corner relief) and the printed insert footprint (inset + reflex

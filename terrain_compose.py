@@ -121,6 +121,33 @@ def resolve_layers(cutout, layer_geoms, base_class,
     base = cutout.buffer(0)
     for gi in inserts.values():
         base = base.difference(gi).buffer(0)
+
+    # Snow-interface cleanup (the ONLY interface touched here). A locked satellite
+    # boundary (snow) frets the base into thin necks between its tendrils. Each
+    # thin base bit that touches such a boundary is merged into its non-satellite
+    # neighbour: where it also borders the unmasked complement it is given to that
+    # insert; a bit fenced only by satellite + base stays base (it is base-joined,
+    # so it prints as supported base rather than a fragile island). The complement's
+    # own bits are already resolved -- its isolated sub-blob specks went to the base
+    # via the despeckle above, and a strand joined to the main body stays with it.
+    # Only bits meeting the satellite boundary are touched, so the base interior
+    # and the base<->complement interface are left alone.
+    sat_geoms = [g for tc, g in inserts.items()
+                 if tc not in (unmasked_cls, base_class)]
+    complement = inserts.get(unmasked_cls)
+    if sat_geoms and complement is not None and not complement.is_empty:
+        sat = unary_union(sat_geoms)
+        r = min_thickness_mm * scale_m_per_mm / 2.0
+        thin = base.difference(base.buffer(-r).buffer(r)).buffer(0)
+        pieces = thin.geoms if thin.geom_type == "MultiPolygon" else [thin]
+        give = [p for p in pieces if not p.is_empty
+                and p.intersects(sat.boundary) and p.intersects(complement)]
+        if give:
+            complement = complement.union(unary_union(give)).buffer(0)
+            inserts[unmasked_cls] = complement
+            base = cutout.buffer(0)
+            for gi in inserts.values():
+                base = base.difference(gi).buffer(0)
     return base, inserts
 
 
