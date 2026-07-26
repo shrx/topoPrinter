@@ -1380,7 +1380,7 @@ def _dem_min_over(poly, sampler, xs: np.ndarray, ys: np.ndarray) -> Optional[flo
     return float(np.min(sampler(xy[used])))
 
 
-def _region_top_surface(poly, xs, ys, key_scale=1e6):
+def _region_top_surface(poly, xs, ys):
     """Top-surface vertices + triangulation for one 2D region over the DEM grid.
 
     Returns ``(xy, top_faces)``: ``xy`` is the (N, 2) array of every top-surface
@@ -1423,13 +1423,22 @@ def _region_top_surface(poly, xs, ys, key_scale=1e6):
     gridvid[pi, pj] = np.arange(n_grid)
     grid_xy = np.column_stack((gx[pj], gy[pi]))
 
-    gxkey = {round(v * key_scale): k for k, v in enumerate(gx)}
-    gykey = {round(v * key_scale): k for k, v in enumerate(gy)}
+    # Intern at the float32 export resolution: two coordinates that round to the
+    # same float32 (as the binary STL will) MUST become one vertex.  Keying finer
+    # than that -- the old round(v * 1e6), i.e. 1e-6 mm -- let two vertices ~1e-5
+    # mm apart (below the float32 ULP at model scale, ~1.6e-5 mm) take distinct
+    # ids during construction, forming a sub-float32 sliver triangle that then
+    # collapsed to a degenerate, non-manifold face on export.  float32 keying can
+    # never over-merge: distinct grid lines are a whole pitch (~0.18 mm) apart.
+    def _k(v):
+        return float(np.float32(v))
+    gxkey = {_k(v): k for k, v in enumerate(gx)}
+    gykey = {_k(v): k for k, v in enumerate(gy)}
     cross_xy = []
     cross_tbl = {}
 
     def vid(x, y):
-        kx = round(x * key_scale); ky = round(y * key_scale)
+        kx = _k(x); ky = _k(y)
         j = gxkey.get(kx); i = gykey.get(ky)
         if i is not None and j is not None and gridvid[i, j] >= 0:
             return int(gridvid[i, j])
@@ -1516,7 +1525,7 @@ def _region_top_surface(poly, xs, ys, key_scale=1e6):
     return xy, top_faces
 
 
-def build_region_prism_fast(poly, top_fn, bottom_fn, xs, ys, key_scale=1e6):
+def build_region_prism_fast(poly, top_fn, bottom_fn, xs, ys):
     """Watertight prism for one 2D region, extruded over the shared DEM grid.
 
     ``poly`` is a shapely (Multi)Polygon in model mm; ``top_fn``/``bottom_fn`` are
@@ -1530,7 +1539,7 @@ def build_region_prism_fast(poly, top_fn, bottom_fn, xs, ys, key_scale=1e6):
     fix_normals/merge is needed (those dominate runtime on multi-million-face meshes).
     Returns a trimesh.Trimesh or None if the region covers no cells.
     """
-    xy, top_faces = _region_top_surface(poly, xs, ys, key_scale)
+    xy, top_faces = _region_top_surface(poly, xs, ys)
     if xy is None:
         return None
     n = len(xy)
