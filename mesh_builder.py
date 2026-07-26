@@ -1446,20 +1446,68 @@ def _region_top_surface(poly, xs, ys, key_scale=1e6):
     top_faces = [np.column_stack((v00, v01, v11)),
                  np.column_stack((v00, v11, v10))]
 
-    bci, bcj = np.where(bnd)
+    # Clip every boundary cell in a SINGLE noded arrangement instead of one
+    # poly.intersection(box) per cell.  A crossing where the polygon boundary
+    # meets a grid line is shared by the two (edge) or four (corner) cells that
+    # touch that line; clipping each cell independently made GEOS recompute that
+    # crossing once per touching cell, and two evaluations landing on opposite
+    # sides of a vid bucket produced a duplicate vertex (a degenerate sliver) or
+    # collapsed a triangle.  Noding the polygon boundary together with the
+    # boundary cells' grid edges once computes each crossing exactly one time, so
+    # neighbouring cells intern the identical coordinate -- and it overlays the
+    # (large) polygon a single time instead of per cell.  Interior all_in cells
+    # stay on the vectorized quad path above; only ~perimeter cells arrive here.
+    bi, bj = np.where(bnd)
     bnd_tris = []
-    for i, j in zip(bci.tolist(), bcj.tolist()):
-        inter = poly.intersection(shapely.geometry.box(gx[j], gy[i], gx[j + 1], gy[i + 1]))
-        geoms = inter.geoms if inter.geom_type in (
-            "MultiPolygon", "GeometryCollection") else [inter]
-        for g in geoms:
-            if g.geom_type != "Polygon" or g.is_empty or g.area <= 0:
-                continue
+    if len(bi):
+        # Unique unit grid edges of the boundary cells, built vectorized: each
+        # cell contributes its two horizontal edges (rows i, i+1 over column j)
+        # and two vertical edges (columns j, j+1 over row i).
+        he = np.unique(np.column_stack(
+            (np.concatenate((bi, bi + 1)), np.concatenate((bj, bj)))), axis=0)
+        ve = np.unique(np.column_stack(
+            (np.concatenate((bj, bj + 1)), np.concatenate((bi, bi)))), axis=0)
+        hcoords = np.stack((
+            np.column_stack((gx[he[:, 1]], gy[he[:, 0]])),
+            np.column_stack((gx[he[:, 1] + 1], gy[he[:, 0]]))), axis=1)
+        vcoords = np.stack((
+            np.column_stack((gx[ve[:, 0]], gy[ve[:, 1]])),
+            np.column_stack((gx[ve[:, 0]], gy[ve[:, 1] + 1]))), axis=1)
+        seglines = np.concatenate((
+            np.array([poly.boundary], dtype=object),
+            shapely.linestrings(hcoords), shapely.linestrings(vcoords)))
+        noded = shapely.unary_union(seglines)
+        faces = shapely.get_parts(shapely.polygonize(shapely.get_parts(noded)))
+
+        # Keep only the boundary-cell clip pieces (vectorized filter): a face that
+        # fits in one cell, whose interior point lands in a bnd cell and inside
+        # the polygon.  Drops the interior all_in blob (spans many cells), full
+        # interior cells (already meshed), and the outside-polygon cell remnants.
+        dxg = float(gx[1] - gx[0]); dyg = float(gy[1] - gy[0])
+        gb = shapely.bounds(faces)
+        keep = (gb[:, 2] - gb[:, 0] <= 1.5 * dxg) & (gb[:, 3] - gb[:, 1] <= 1.5 * dyg)
+        reps = shapely.point_on_surface(faces)
+        rx = shapely.get_x(reps); ry = shapely.get_y(reps)
+        jj = np.searchsorted(gx, rx) - 1
+        ii = np.searchsorted(gy, ry) - 1
+        oncell = (ii >= 0) & (ii < ni - 1) & (jj >= 0) & (jj < nj - 1)
+        keep &= oncell
+        keep[keep] &= bnd[ii[keep], jj[keep]]
+        keep &= shapely.contains_xy(poly, rx, ry)
+
+        for g in faces[keep]:
             for t in _region_triangles(g):
                 if (t[1][0] - t[0][0]) * (t[2][1] - t[0][1]) - \
                    (t[1][1] - t[0][1]) * (t[2][0] - t[0][0]) < 0:
                     t = [t[0], t[2], t[1]]
-                bnd_tris.append([vid(*t[0]), vid(*t[1]), vid(*t[2])])
+                va, vb, vc = vid(*t[0]), vid(*t[1]), vid(*t[2])
+                if va == vb or vb == vc or va == vc:
+                    # A crossing still interning into a grid node's vid bucket
+                    # collapses this triangle to a line; it has zero area, so skip
+                    # it rather than emit a degenerate face that would push its
+                    # real edges non-manifold.
+                    continue
+                bnd_tris.append([va, vb, vc])
     if bnd_tris:
         top_faces.append(np.array(bnd_tris, np.int64))
     top_faces = np.vstack(top_faces)
