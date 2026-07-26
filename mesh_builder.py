@@ -440,9 +440,13 @@ def _corner_reliefs(
     if relief_mm <= 0:
         return None, None
     r = clearance_mm + relief_mm
-    oriented = orient(component, 1.0)   # exterior CCW, holes CW: solid is on the left
     convex, reflex = [], []
-    for ring in [oriented.exterior, *oriented.interiors]:
+    polys = component.geoms if component.geom_type == "MultiPolygon" else [component]
+    rings = []
+    for poly in polys:
+        oriented = orient(poly, 1.0)    # exterior CCW, holes CW: solid is on the left
+        rings.extend([oriented.exterior, *oriented.interiors])
+    for ring in rings:
         pts = list(ring.coords)[:-1]
         n = len(pts)
         if n < 3:
@@ -496,6 +500,32 @@ def _clip_to_footprint(
             if not merged.is_empty:
                 return merged
     return None
+
+
+def _drop_small_rim_bits(
+    polygon_mm: Optional[Union[ShapelyPolygon, MultiPolygon]],
+    rim,
+    min_area_mm2: float,
+) -> Optional[Union[ShapelyPolygon, MultiPolygon]]:
+    """Drop connected components smaller than ``min_area_mm2`` that touch the rim.
+
+    Clipping an insert footprint to the cutout can shear a sub-printable lobe off at
+    the rim.  Removed here -- BEFORE the inset clearance step -- so the insert and
+    its pocket are built from one cleaned footprint: otherwise the inset erases the
+    lobe from the insert (``buffer(-clearance)``) while the pocket keeps it, leaving
+    an empty recessed notch in the perimeter.  The dropped area sits in no pocket, so
+    it stays ordinary base terrain (base = cutout - pockets).  Interior components
+    are untouched (resolve_layers already enforced min_blob on whole components);
+    only rim-touching runts go.  Returns the cleaned geometry, or None if nothing
+    printable remains.
+    """
+    if polygon_mm is None or polygon_mm.is_empty:
+        return None
+    keep = [c for c in _iter_polygon_components(polygon_mm)
+            if not (c.area < min_area_mm2 and rim.intersects(c))]
+    if not keep:
+        return None
+    return keep[0] if len(keep) == 1 else unary_union(keep)
 
 
 def _quantize_to_f32(
@@ -1535,7 +1565,8 @@ def build_all_terrain_meshes(
     """
     from terrain_classifier import (TERRAIN_ROCK, TERRAIN_NAMES,
                                      TERRAIN_PRECEDENCE, overlay_precedence)
-    from terrain_compose import resolve_layers, MIN_THICKNESS_MM, MIN_BLOB_MM
+    from terrain_compose import (resolve_layers, fretted_bit_moves,
+                                 MIN_THICKNESS_MM, MIN_BLOB_MM)
 
     # The base plate is the "leftover" class (never rasterized: it is whatever the
     # overlays don't cover). Rock is the base for normal prints; the satellite
@@ -1675,6 +1706,31 @@ def build_all_terrain_meshes(
         rect_corner2_lon=rect_corner2_lon,
     )
 
+    # Absorb sub-printable bits the cutout rim frets off any layer into a neighbour,
+    # by the same rule the satellite interface uses in resolve_layers. The circular
+    # cutout slices the resolved layers, and where it pinches a piece touching the
+    # rim thinner than min_thickness it would print as a fragile edge sliver; that
+    # bit is handed to whichever other layer it borders most. Bits are found on the
+    # in-cutout footprint (so the rim is a real edge) but removed from / added to the
+    # full (pre-cutout) polygons, so kept components keep their true outline and
+    # insert inset/relief still seat flush against the rim.
+    if cutout_footprint is not None:
+        full = {base_class: base_poly_mm}
+        for tc in all_overlay_classes:
+            if class_polys_mm.get(tc) is not None:
+                full[tc] = class_polys_mm[tc]
+        clipped = {k: g.intersection(cutout_footprint).buffer(0)
+                   for k, g in full.items()}
+        moves = fretted_bit_moves(clipped, cutout_footprint.boundary,
+                                  MIN_BLOB_MM, scale_m_per_mm=1.0)
+        for frm, to, bit in moves:
+            full[frm] = full[frm].difference(bit).buffer(0)
+            full[to] = unary_union([full[to], bit]).buffer(0)
+        base_poly_mm = full[base_class]
+        for tc in all_overlay_classes:
+            g = full.get(tc)
+            class_polys_mm[tc] = g if g is not None and not g.is_empty else None
+
     # Pre-compute per overlay component: the recess flat_z (used by the rock
     # pocket) and, in flat mode, the cutout-clipped surface solid that the flat_z
     # is read from — reused below for the insert when there is no XY clearance.
@@ -1715,7 +1771,6 @@ def build_all_terrain_meshes(
     base_outline = (cutout_footprint if cutout_footprint is not None
                     else shapely.geometry.box(float(X.min()), float(Y.min()),
                                               float(X.max()), float(Y.max())))
-    base_mask = base_poly_mm if not base_poly_mm.is_empty else None
 
     # Per insert component, in 2D: the pocket carved in the base (component +
     # convex corner relief) and the printed insert footprint (inset + reflex
@@ -1729,11 +1784,28 @@ def build_all_terrain_meshes(
         if union_poly is None:
             continue
         for component in _iter_polygon_components(union_poly):
+            # Clip to the cutout, then drop small rim bits BEFORE the inset clearance
+            # step, so the insert and its pocket are built from one cleaned footprint.
+            # The rim clip can shear a sub-min_blob lobe off a component; left in, the
+            # inset erases it from the insert while the pocket keeps it as an empty
+            # recessed notch. Removing it here means no seat is carved where no insert
+            # seats; the dropped area stays base terrain (base = cutout - pockets).
+            insert_src = _clip_to_footprint(component, base_outline)
+            insert_src = _drop_small_rim_bits(
+                insert_src, base_outline.boundary, MIN_BLOB_MM ** 2)
+            if insert_src is None:
+                continue
+
+            # Corner relief comes off the cleaned, clipped footprint -- not the raw
+            # component -- so a convex corner that lies outside the cutout cannot drop
+            # a relief disc that floats just inside the rim as an orphan pocket blob.
             pocket_extra, insert_cut = _corner_reliefs(
-                component, insert_xy_clearance_mm, insert_corner_relief_mm,
+                insert_src, insert_xy_clearance_mm, insert_corner_relief_mm,
                 insert_corner_min_angle_deg)
-            pocket_component = (unary_union([component, pocket_extra])
-                                if pocket_extra is not None else component)
+
+            # Pocket = the cleaned footprint (the seat) + convex corner relief.
+            pocket_component = (unary_union([insert_src, pocket_extra])
+                                if pocket_extra is not None else insert_src)
             pocket_poly = _clip_to_footprint(pocket_component, base_outline)
             if pocket_poly is not None:
                 pocket_poly = _quantize_to_f32(pocket_poly, output_resolution)
@@ -1746,8 +1818,9 @@ def build_all_terrain_meshes(
                         overlay_specs.append(
                             (tc, pocket_poly, max(tmin - overlay_thickness_mm, 0.01)))
 
+            # Printed insert footprint: inset by the clearance + reflex corner relief.
             if insert_xy_clearance_mm > 0 or insert_cut is not None:
-                insert_poly = _inset_polygon(component, insert_xy_clearance_mm)
+                insert_poly = _inset_polygon(insert_src, insert_xy_clearance_mm)
                 if insert_poly is None:
                     continue
                 if insert_cut is not None:
@@ -1755,10 +1828,7 @@ def build_all_terrain_meshes(
                     if insert_poly.is_empty:
                         continue
             else:
-                insert_poly = component
-            insert_poly = _clip_to_footprint(insert_poly, base_outline)
-            if insert_poly is None:
-                continue
+                insert_poly = insert_src
             insert_poly = _quantize_to_f32(insert_poly, output_resolution)
             if insert_poly is None:
                 continue
@@ -1771,10 +1841,13 @@ def build_all_terrain_meshes(
                         insert_specs[tc].append(
                             (part, max(pmin - (overlay_thickness_mm - insert_z_clearance_mm), 0.01)))
 
-    # --- Base plate: foliage (DEM top) + pockets (recess floor) + gaps (flat),
-    # each a watertight prism, concatenated as multiple bodies (no cross-merge).
-    # Non-foliage areas are FLAT, so drop_unprintable's opened-off leftovers can
-    # never stand as terrain-height fins. No solid-vs-solid boolean anywhere.
+    # --- Base plate: terrain top (base class) everywhere an insert doesn't seat, plus
+    # each pocket recess floor. Base = cutout - pockets, one DEM-topped prism per
+    # component; the pockets are the only recessed regions. Because a pocket is only
+    # carved where an insert seats (small rim bits were dropped before the inset), the
+    # base has no empty recessed notches. drop_unprintable's opened-off leftovers sit
+    # in no pocket, so they stay at terrain height, flush with the surrounding base (a
+    # sliver flush on both sides is not a fin). No solid-vs-solid boolean anywhere.
     pocket_polys = [pk for _, pk, _ in overlay_specs]
     pocket_union = unary_union(pocket_polys) if pocket_polys else None
     base_bodies = []
@@ -1794,35 +1867,15 @@ def build_all_terrain_meshes(
             top_fn = _flat(flat_z)
         _add_base(pocket_poly, top_fn, _flat(0.0))
 
-    if base_mask is not None:
-        # foliage terrain (base class), minus the pockets it borders
-        foliage = _clip_to_footprint(base_mask, base_outline)
-        if foliage is not None and pocket_union is not None:
-            foliage = foliage.difference(pocket_union).buffer(0)
-        if foliage is not None:
-            foliage = _quantize_to_f32(foliage, output_resolution)
-        _add_base(foliage, sample_dem, _flat(0.0))
-
-        # gaps = cutout - foliage - pockets (the opened/despeckled bits): flat-topped
-        gaps = base_outline.difference(base_mask).buffer(0)
-        if pocket_union is not None:
-            gaps = gaps.difference(pocket_union).buffer(0)
-        gaps = _clip_to_footprint(gaps, base_outline)
-        if gaps is not None:
-            gaps = _quantize_to_f32(gaps, output_resolution)
-        if gaps is not None:
-            for part in _iter_polygon_components(gaps):
-                gmin = _dem_min_over(part, sample_dem, xs, ys)
-                floor = max((gmin if gmin is not None else 0.0) - overlay_thickness_mm, 0.01)
-                _add_base(part, _flat(floor), _flat(0.0))
-    else:
-        # base IS the raw complement (rock-based scene): DEM top over cutout - pockets
-        base_fp = base_outline
-        if pocket_union is not None:
-            base_fp = base_fp.difference(pocket_union).buffer(0)
-        if base_fp is not None:
-            base_fp = _quantize_to_f32(base_fp, output_resolution)
-        _add_base(base_fp, sample_dem, _flat(0.0))
+    # Base terrain: the cutout minus the insert pockets, draped at DEM height. The
+    # base class (foliage when inverted, rock otherwise) is the terrain surface, and
+    # the pockets are the only recessed regions -- so this holds for both scenes.
+    base_fp = base_outline
+    if pocket_union is not None:
+        base_fp = base_fp.difference(pocket_union).buffer(0)
+    if base_fp is not None:
+        base_fp = _quantize_to_f32(base_fp, output_resolution)
+    _add_base(base_fp, sample_dem, _flat(0.0))
 
     if base_bodies:
         result = {base_name: _finalize(trimesh.util.concatenate(base_bodies))}

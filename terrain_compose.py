@@ -63,6 +63,51 @@ def drop_unprintable(geom, min_thickness_mm=MIN_THICKNESS_MM, min_blob_mm=MIN_BL
     return despeckle(opened, min_blob_m2)
 
 
+def fretted_bit_moves(layers, boundary, min_blob_mm=MIN_BLOB_MM,
+                      scale_m_per_mm=SCALE_M_PER_MM, locked=()):
+    """Move small bits a locked boundary leaves along it into a neighbouring layer.
+
+    A locked seam -- a satellite outline, or the cutout rim -- can pare a layer to a
+    small piece too tiny to print as its own insert. Any connected component of a
+    layer that touches the seam and is smaller than a ``min_blob_mm`` blob is such a
+    bit; it is reassigned to whichever OTHER layer it shares the most boundary with.
+
+    ``locked`` names the layer(s) that OWN the seam (a satellite outline is the
+    authoritative shape of its own insert): they are neither pared as a source nor
+    grown as a recipient, so the seam only frets the flexible layers around them.
+    The cutout rim owns nothing, so there ``locked`` is empty and every layer is
+    both a source and a candidate.
+
+    ``layers`` is a disjoint partition ``{key: polygon}`` already restricted to the
+    region of interest; ``boundary`` is the fretting geometry. Returns a list of
+    ``(from_key, to_key, bit_polygon)``; the caller applies each move (difference
+    the bit from ``from_key``, union it into ``to_key``), so it may apply them to a
+    different -- e.g. unclipped -- representation of the same layers. Moves conserve
+    area, so the partition stays exact.
+    """
+    keys = [k for k, g in layers.items()
+            if g is not None and not g.is_empty and k not in locked]
+    min_area = (min_blob_mm * scale_m_per_mm) ** 2
+    eps = 0.5 * scale_m_per_mm                          # neighbour-probe radius
+    moves = []
+    for k in keys:
+        g = layers[k]
+        for bit in (g.geoms if g.geom_type == "MultiPolygon" else [g]):
+            if bit.is_empty or bit.area >= min_area or not boundary.intersects(bit):
+                continue
+            ring = bit.buffer(eps)
+            best, best_contact = None, 0.0
+            for k2 in keys:
+                if k2 == k:
+                    continue
+                contact = ring.intersection(layers[k2]).area
+                if contact > best_contact:
+                    best, best_contact = k2, contact
+            if best is not None:
+                moves.append((k, best, bit))
+    return moves
+
+
 def resolve_layers(cutout, layer_geoms, base_class,
                    min_thickness_mm=MIN_THICKNESS_MM, min_blob_mm=MIN_BLOB_MM,
                    scale_m_per_mm=SCALE_M_PER_MM):
@@ -122,32 +167,24 @@ def resolve_layers(cutout, layer_geoms, base_class,
     for gi in inserts.values():
         base = base.difference(gi).buffer(0)
 
-    # Snow-interface cleanup (the ONLY interface touched here). A locked satellite
-    # boundary (snow) frets the base into thin necks between its tendrils. Each
-    # thin base bit that touches such a boundary is merged into its non-satellite
-    # neighbour: where it also borders the unmasked complement it is given to that
-    # insert; a bit fenced only by satellite + base stays base (it is base-joined,
-    # so it prints as supported base rather than a fragile island). The complement's
-    # own bits are already resolved -- its isolated sub-blob specks went to the base
-    # via the despeckle above, and a strand joined to the main body stays with it.
-    # Only bits meeting the satellite boundary are touched, so the base interior
-    # and the base<->complement interface are left alone.
-    sat_geoms = [g for tc, g in inserts.items()
-                 if tc not in (unmasked_cls, base_class)]
-    complement = inserts.get(unmasked_cls)
-    if sat_geoms and complement is not None and not complement.is_empty:
-        sat = unary_union(sat_geoms)
-        r = min_thickness_mm * scale_m_per_mm / 2.0
-        thin = base.difference(base.buffer(-r).buffer(r)).buffer(0)
-        pieces = thin.geoms if thin.geom_type == "MultiPolygon" else [thin]
-        give = [p for p in pieces if not p.is_empty
-                and p.intersects(sat.boundary) and p.intersects(complement)]
-        if give:
-            complement = complement.union(unary_union(give)).buffer(0)
-            inserts[unmasked_cls] = complement
-            base = cutout.buffer(0)
-            for gi in inserts.values():
-                base = base.difference(gi).buffer(0)
+    # Satellite-interface cleanup. A locked satellite outline (snow) frets the base
+    # into thin necks between its tendrils; each such neck is fragile and is handed
+    # to whichever neighbouring layer it borders most, via the shared fretted-bit
+    # rule (fretted_bit_moves) -- the identical treatment the cutout rim gets in the
+    # mesh builder. Every layer is a source and every other layer a candidate, so
+    # the whole partition {base + inserts} is passed in and split back out.
+    sat_classes = [tc for tc in inserts if tc not in (unmasked_cls, base_class)]
+    if sat_classes:
+        part = dict(inserts)
+        part[base_class] = base
+        sat_boundary = unary_union([inserts[tc] for tc in sat_classes]).boundary
+        moves = fretted_bit_moves(part, sat_boundary, min_blob_mm,
+                                  scale_m_per_mm, locked=sat_classes)
+        for frm, to, bit in moves:
+            part[frm] = part[frm].difference(bit).buffer(0)
+            part[to] = unary_union([part[to], bit]).buffer(0)
+        base = part.pop(base_class)
+        inserts = {tc: g for tc, g in part.items() if not g.is_empty}
     return base, inserts
 
 
