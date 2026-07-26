@@ -136,7 +136,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         default=220,
         help="Area-preserving curve-shortening (APCSF) iterations for snow cleanup: "
              "higher = more finger retraction / blobbier, thicker inserts (area is "
-             "preserved throughout). Default 220 (sub-1 mm slivers < 1%, 2 pieces, at "
+             "preserved throughout). Default 220 (sub-1 mm slivers < 1%%, 2 pieces, at "
              "RESAMPLE_M=15; tied to RESAMPLE_M, re-sweep if you change it).",
     )
     parser.add_argument(
@@ -166,7 +166,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         type=int,
         default=100,
         help="APCSF iterations for foliage cleanup (see --snow-iterations). "
-             "Default 100 (sub-1 mm base-plate slivers < 1% at RESAMPLE_M=15).",
+             "Default 100 (sub-1 mm base-plate slivers < 1%% at RESAMPLE_M=15).",
     )
     parser.add_argument(
         "--invert-base",
