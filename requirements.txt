@@ -5,3 +5,5 @@ GDAL
 pyproj
 trimesh
 manifold3d
+rtree
+triangle

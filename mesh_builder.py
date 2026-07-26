@@ -1558,6 +1558,204 @@ def build_region_prism_fast(poly, top_fn, bottom_fn, xs, ys):
     return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
 
 
+def build_base_solid(base_outline, boundary_geoms, pockets, pocket_top_fns,
+                     base_top_fn, xs, ys):
+    """One watertight, manifold terraced solid for the whole base plate.
+
+    The plate is a 2.5D terrain with vertical cliffs: the base class is draped at the
+    DEM everywhere an insert does not seat, and each pocket is a flat (or DEM-minus-
+    thickness) recess floor.  It is built from ONE constrained Delaunay triangulation
+    of the whole cutout -- every region border in ``boundary_geoms`` is a constraint
+    segment and every DEM grid point inside ``base_outline`` is an input vertex -- so
+    each interior edge is shared by exactly two triangles by construction (no per-region
+    re-triangulation, hence no cracks).  Each triangle's top z comes from the pocket
+    (highest priority = lowest index in ``pockets``) whose interior holds its centroid,
+    else ``base_top_fn``; top vertices are keyed by (column, f32 z) so equal-z seams
+    weld flush and differing-z seams get a single vertical cliff.  A cliff's vertical
+    sides run through every plateau level present at their column, so the T-vertex where
+    a third plateau meets is built in, not repaired.  Every cliff's low side is flat (a
+    pocket floor, or z=0 for the outline), giving a shared-bottom convex vertical polygon
+    triangulated by a branchless zip.  Fully vectorized; returns a Trimesh or None.
+    """
+    import triangle as _triangle
+
+    reg_fns = list(pocket_top_fns)
+    # ---- 1. PSLG: region-border segments + all interior DEM grid points (f32-deduped)
+    ring_xy = []
+    for g in boundary_geoms:
+        parts = ([g] if g.geom_type == "LineString"
+                 else shapely.get_parts(shapely.line_merge(g)))
+        for ls in parts:
+            c = np.asarray(ls.coords, float)
+            if len(c) >= 2:
+                ring_xy.append(c)
+    if not ring_xy:
+        return None
+    ring_all = np.vstack(ring_xy)
+    GX, GY = np.meshgrid(xs, ys)
+    ins = shapely.contains_xy(base_outline, GX, GY)
+    grid_xy = np.column_stack((GX[ins], GY[ins]))
+    allxy = np.vstack((ring_all, grid_xy)).astype(float)
+    _, first, inv = np.unique(allxy.astype(np.float32), axis=0,
+                              return_index=True, return_inverse=True)
+    V = allxy[first]
+    n_ring = len(ring_all)
+    off = 0
+    segs = []
+    for c in ring_xy:
+        m = len(c)
+        idx = inv[off:off + m]; off += m
+        segs.append(np.column_stack((idx[:-1], idx[1:])))
+    seg = np.vstack(segs)
+    seg = seg[seg[:, 0] != seg[:, 1]]
+    seg = np.unique(np.sort(seg, axis=1), axis=0)
+
+    # ---- 2. one constrained Delaunay triangulation (no Steiner points added) ----
+    B = _triangle.triangulate({"vertices": V, "segments": seg}, "pYQ")
+    Vt = B["vertices"]; T = B["triangles"]
+    cen = Vt[T].mean(axis=1)
+    inb = shapely.contains_xy(base_outline, cen[:, 0], cen[:, 1])
+    T = T[inb]; cen = cen[inb]
+    if not len(T):
+        return None
+
+    # ---- 3. per-triangle top_fn: highest-priority pocket holding its centroid ----
+    tri_fn = np.full(len(T), -1, np.int64)              # -1 = base
+    if pockets:
+        pr = shapely.STRtree(pockets).query(shapely.points(cen), predicate="within")
+        if pr.size:
+            o = np.lexsort((pr[1], pr[0]))
+            pc = pr[0][o]; pp = pr[1][o]
+            fst = np.ones(len(pc), bool); fst[1:] = pc[1:] != pc[:-1]
+            tri_fn[pc[fst]] = pp[fst]
+
+    # ---- 4. top vertices keyed by (column vertex, f32 z): equal z welds, diff steps
+    corner_v = T.reshape(-1)
+    corner_fn = np.repeat(tri_fn, 3)
+    corner_xy = Vt[corner_v]
+    cz = np.empty(len(corner_v))
+    for fi in np.unique(corner_fn):
+        m = corner_fn == fi
+        cz[m] = (base_top_fn if fi == -1 else reg_fns[fi])(corner_xy[m])
+    czf = cz.astype(np.float32)
+    topkey = np.column_stack((corner_v.astype(np.int64),
+                              czf.view(np.int32).astype(np.int64)))
+    uk, uinv = np.unique(topkey, axis=0, return_inverse=True)
+    n_top = len(uk)
+    top_z = uk[:, 1].astype(np.int32).view(np.float32).astype(float)
+    TOPV = np.column_stack((Vt[uk[:, 0], 0], Vt[uk[:, 0], 1], top_z))
+    top_faces = uinv.reshape(-1, 3)
+
+    # ---- 5. single z=0 bottom (one vertex per used column) ----
+    used_v = np.unique(T)
+    bot_map = np.full(len(Vt), -1, np.int64)
+    bot_map[used_v] = np.arange(len(used_v)) + n_top
+    BOTV = np.column_stack((Vt[used_v, 0], Vt[used_v, 1], np.zeros(len(used_v))))
+    bot_faces = bot_map[T[:, ::-1]]
+
+    P = np.vstack((TOPV, BOTV))
+    base_of = np.empty(len(P), np.int64)
+    base_of[:n_top] = uk[:, 0]
+    base_of[n_top:] = used_v
+
+    # per-column sorted top vertices (colcount>=3 marks a tripoint)
+    o = np.lexsort((top_z, uk[:, 0]))
+    scol = uk[o, 0]; sz = top_z[o]; sid = o.astype(np.int64)
+    col_l = np.searchsorted(scol, np.arange(len(Vt)), "left")
+    col_r = np.searchsorted(scol, np.arange(len(Vt)), "right")
+    colcount = col_r - col_l
+
+    # ---- 6. edge pool over the shared CDT (each interior edge -> exactly 2 tris) ----
+    tv = uinv.reshape(-1, 3)
+    ei = np.array([0, 1, 2]); ej = np.array([1, 2, 0])
+    va = T[:, ei].reshape(-1); vb = T[:, ej].reshape(-1)
+    ta = tv[:, ei].reshape(-1); tb = tv[:, ej].reshape(-1)
+    tri_of = np.repeat(np.arange(len(T)), 3)
+    swap = va > vb
+    lo = np.where(swap, vb, va); hi = np.where(swap, va, vb)
+    tlo = np.where(swap, tb, ta); thi = np.where(swap, ta, tb)
+    ekey = lo.astype(np.int64) * (2 ** 32) + hi
+    sidx = np.argsort(ekey, kind="stable")
+    sk = ekey[sidx]
+    _, start, cnt = np.unique(sk, return_index=True, return_counts=True)
+    if (cnt > 2).any():
+        raise ValueError(f"base edge shared by >2 triangles ({int((cnt > 2).sum())})")
+
+    # ---- 7. cliffs: an upper (high) top edge over a lower one (a lower plateau, or
+    # the z=0 bottom for an outline edge) ----
+    ul = []; uh = []; ll = []; lh = []; rf = []
+    b1 = cnt == 1                                       # outline edge -> down to z=0
+    if b1.any():
+        r = sidx[start[b1]]
+        ul.append(tlo[r]); uh.append(thi[r])
+        ll.append(bot_map[lo[r]]); lh.append(bot_map[hi[r]]); rf.append(tri_of[r])
+    i2 = cnt == 2                                       # seam -> step where z differs
+    if i2.any():
+        s0 = start[i2]; r0 = sidx[s0]; r1 = sidx[s0 + 1]
+        stp = ~((tlo[r0] == tlo[r1]) & (thi[r0] == thi[r1]))
+        r0 = r0[stp]; r1 = r1[stp]
+        hi0 = P[tlo[r0], 2] + P[thi[r0], 2] >= P[tlo[r1], 2] + P[thi[r1], 2]
+        hR = np.where(hi0, r0, r1); lR = np.where(hi0, r1, r0)
+        ul.append(tlo[hR]); uh.append(thi[hR])
+        ll.append(tlo[lR]); lh.append(thi[lR]); rf.append(tri_of[hR])
+
+    wall_faces = np.empty((0, 3), np.int64)
+    if ul:
+        Alo = np.concatenate(ul); Ahi = np.concatenate(uh)
+        Blo = np.concatenate(ll); Bhi = np.concatenate(lh)
+        refc = np.concatenate(rf)
+        N = len(Alo)
+        cp = base_of[Blo]; cq = base_of[Bhi]
+        zAlo = P[Alo, 2]; zBlo = P[Blo, 2]; zAhi = P[Ahi, 2]; zBhi = P[Bhi, 2]
+
+        def _mids(col, zl, zh):
+            # ragged, loop-free: per cliff, its column's top vertices with zl<z<zh
+            k = colcount[col]
+            seg_ = np.repeat(np.arange(N), k)
+            within = np.arange(int(k.sum())) - np.repeat(np.cumsum(k) - k, k)
+            src = np.repeat(col_l[col], k) + within
+            z = sz[src]
+            m = (z > np.repeat(zl, k) + 1e-9) & (z < np.repeat(zh, k) - 1e-9)
+            return seg_[m], sid[src][m]
+
+        pseg, pmid = _mids(cp, zBlo, zAlo)
+        qseg, qmid = _mids(cq, zBhi, zAhi)
+
+        # every cliff vertex tagged by cliff, side (p=0/q=1); each side is a vertical
+        # chain [floor, mids..., top].  The floor is flat -> a shared-bottom convex
+        # polygon triangulated by: for each vertex above the two bottom corners emit
+        # (v, prevSameSide, prevOppSide) -- two verts from one column, one from the
+        # other, never the 3-collinear sliver a fan makes at a subdivided side.
+        cvid = np.concatenate([Blo, Alo, Bhi, Ahi, pmid, qmid])
+        cclf = np.concatenate([np.arange(N), np.arange(N), np.arange(N), np.arange(N),
+                               pseg, qseg])
+        cside = np.concatenate([np.zeros(2 * N, np.int8), np.ones(2 * N, np.int8),
+                                np.zeros(len(pmid), np.int8), np.ones(len(qmid), np.int8)])
+        oz = np.lexsort((P[cvid, 2], cclf))
+        mclf = cclf[oz]; mside = cside[oz]; mvid = cvid[oz]
+        nn = len(mvid); pos = np.arange(nn)
+        lastA = np.maximum.accumulate(np.where(mside == 0, pos, -1))
+        lastB = np.maximum.accumulate(np.where(mside == 1, pos, -1))
+        lastA_pre = np.concatenate(([-1], lastA[:-1]))
+        lastB_pre = np.concatenate(([-1], lastB[:-1]))
+        isA = mside == 0
+        prevSame = np.where(isA, lastA_pre, lastB_pre)
+        prevOpp = np.where(isA, lastB, lastA)
+        ok = (prevSame >= 0) & (prevOpp >= 0)
+        ok[ok] &= (mclf[prevSame[ok]] == mclf[ok]) & (mclf[prevOpp[ok]] == mclf[ok])
+        k = np.where(ok)[0]
+        tris = np.column_stack((mvid[k], mvid[prevSame[k]], mvid[prevOpp[k]]))
+        ck = mclf[k]
+        out = 0.5 * (P[Alo[ck], :2] + P[Ahi[ck], :2]) - cen[refc[ck]]
+        nrm = np.cross(P[tris[:, 1]] - P[tris[:, 0]], P[tris[:, 2]] - P[tris[:, 0]])
+        flip = (nrm[:, 0] * out[:, 0] + nrm[:, 1] * out[:, 1]) < 0
+        tris[flip] = tris[flip][:, ::-1]
+        wall_faces = tris
+
+    faces = np.vstack([top_faces, bot_faces, wall_faces])
+    return trimesh.Trimesh(vertices=P, faces=faces, process=False)
+
+
 def build_all_terrain_meshes(
     dem: np.ndarray,
     class_geometries: dict,
@@ -1729,6 +1927,7 @@ def build_all_terrain_meshes(
     for tc in TERRAIN_PRECEDENCE:
         class_polys_mm[tc] = resolved_inserts.get(tc)
 
+
     # Compute CRS corners for rectangular cutout (needed for rock mesh and transforms)
     c1_x_crs = c1_y_crs = c2_x_crs = c2_y_crs = None
     if cutout_type == "rectangular" and ref_transform and ref_crs:
@@ -1898,44 +2097,27 @@ def build_all_terrain_meshes(
                         insert_specs[tc].append(
                             (part, max(pmin - (overlay_thickness_mm - insert_z_clearance_mm), 0.01)))
 
-    # --- Base plate: terrain top (base class) everywhere an insert doesn't seat, plus
-    # each pocket recess floor. Base = cutout - pockets, one DEM-topped prism per
-    # component; the pockets are the only recessed regions. Because a pocket is only
-    # carved where an insert seats (small rim bits were dropped before the inset), the
-    # base has no empty recessed notches. drop_unprintable's opened-off leftovers sit
-    # in no pocket, so they stay at terrain height, flush with the surrounding base (a
-    # sliver flush on both sides is not a fin). No solid-vs-solid boolean anywhere.
-    pocket_polys = [pk for _, pk, _ in overlay_specs]
-    pocket_union = unary_union(pocket_polys) if pocket_polys else None
-    base_bodies = []
+    # --- Base plate: base-class terrain at the DEM everywhere an insert doesn't seat,
+    # plus each pocket recess floor -- one watertight, manifold terraced solid.
+    # build_base_solid triangulates the whole cutout ONCE with every region border as a
+    # constraint (so shared edges are bit-identical, no cracks) and drapes/floors each
+    # triangle by the highest-priority pocket holding its centroid, else the DEM. Pockets
+    # may overlap (convex corner-relief discs bulge across the glacier/rock snow line,
+    # plus a tiny resolve_layers leftover); the centroid-priority assignment resolves the
+    # overlap, and pockets only floor the recess (insert seating is built from
+    # insert_specs) so a relief overlap never touches the insert fit.
+    raw_pockets = [pk for _, pk, _ in overlay_specs]
+    pocket_top_fns = [
+        (lambda xy: sample_dem(xy) - overlay_thickness_mm) if recess_mode == "uniform"
+        else _flat(flat_z)
+        for _, _, flat_z in overlay_specs]
+    boundaries = [base_outline.boundary] + [pk.boundary for pk in raw_pockets]
+    noded = unary_union(boundaries)
 
-    def _add_base(poly, top_fn, bottom_fn):
-        if poly is None or poly.is_empty:
-            return
-        for part in _iter_polygon_components(poly):
-            m = build_region_prism_fast(part, top_fn, bottom_fn, xs, ys)
-            if m is not None and len(m.faces) > 0:
-                base_bodies.append(m)
-
-    for tc, pocket_poly, flat_z in overlay_specs:
-        if recess_mode == "uniform":
-            top_fn = lambda xy: sample_dem(xy) - overlay_thickness_mm
-        else:
-            top_fn = _flat(flat_z)
-        _add_base(pocket_poly, top_fn, _flat(0.0))
-
-    # Base terrain: the cutout minus the insert pockets, draped at DEM height. The
-    # base class (foliage when inverted, rock otherwise) is the terrain surface, and
-    # the pockets are the only recessed regions -- so this holds for both scenes.
-    base_fp = base_outline
-    if pocket_union is not None:
-        base_fp = base_fp.difference(pocket_union).buffer(0)
-    if base_fp is not None:
-        base_fp = _quantize_to_f32(base_fp, output_resolution)
-    _add_base(base_fp, sample_dem, _flat(0.0))
-
-    if base_bodies:
-        result = {base_name: _finalize(trimesh.util.concatenate(base_bodies))}
+    base_mesh = build_base_solid(base_outline, [noded], raw_pockets, pocket_top_fns,
+                                 sample_dem, xs, ys)
+    if base_mesh is not None and len(base_mesh.faces) > 0:
+        result = {base_name: _finalize(base_mesh)}
     else:
         result = {base_name: None}
 
