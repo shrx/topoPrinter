@@ -163,6 +163,16 @@ def resolve_layers(cutout, layer_geoms, base_class,
         if not gi.is_empty:
             inserts[tc] = gi
 
+    # drop_unprintable just moved the unmasked insert's boundary (the opening).
+    # Re-cut every other insert against that FINAL boundary so a shared seam is one
+    # set of vertices, not two near-miss copies that f32 rounding crosses into
+    # zero-width point-touches (non-manifold pinches) when the base is built.
+    if unmasked_cls in inserts:
+        rf = inserts[unmasked_cls]
+        for tc in list(inserts):
+            if tc != unmasked_cls:
+                inserts[tc] = inserts[tc].difference(rf).buffer(0)
+
     base = cutout.buffer(0)
     for gi in inserts.values():
         base = base.difference(gi).buffer(0)
