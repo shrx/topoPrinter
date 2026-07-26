@@ -1361,45 +1361,38 @@ def _dem_sampler(z_grid_asc: np.ndarray, xs: np.ndarray, ys: np.ndarray):
 
 
 def _dem_min_over(poly, sampler, xs: np.ndarray, ys: np.ndarray) -> Optional[float]:
-    """Minimum DEM value over a footprint (interior grid points + boundary vertices).
+    """Exact minimum of the extruded top surface over a footprint.
 
-    Matches the flat recess floor the old code read from the clipped surface: grid
-    crossings interpolate between bracketing grid points, so they never fall below
-    the interior grid-point minimum -- interior grid points + polygon vertices give
-    the true surface minimum.
+    Reads the minimum from the SAME vertex set build_region_prism_fast emits for
+    this region (via _region_top_surface): grid points inside the region PLUS the
+    polygon-edge x grid-line crossing points the boundary cells' CDT introduces.
+    A crossing point is a bilinear DEM sample that can dip below every interior grid
+    point and every polygon vertex, so sampling only those (the old approximation)
+    overestimated the minimum -- placing a flat floor at ``min - offset`` a hair too
+    high and thinning the wall below ``offset`` at that crossing.  Only vertices the
+    top faces reference are considered (boundary cells also carry their outside grid
+    corners as unused vertices, which must not pull the minimum down).
     """
-    minx, miny, maxx, maxy = poly.bounds
-    j0 = max(int(np.searchsorted(xs, minx)) - 1, 0)
-    j1 = min(int(np.searchsorted(xs, maxx)) + 1, len(xs) - 1)
-    i0 = max(int(np.searchsorted(ys, miny)) - 1, 0)
-    i1 = min(int(np.searchsorted(ys, maxy)) + 1, len(ys) - 1)
-    vals = []
-    if j1 > j0 and i1 > i0:
-        GX, GY = np.meshgrid(xs[j0:j1 + 1], ys[i0:i1 + 1])
-        inside = shapely.contains_xy(poly, GX, GY)
-        if inside.any():
-            vals.append(float(sampler(np.column_stack((GX[inside], GY[inside]))).min()))
-    coords = [np.asarray(ring.coords)
-              for p in _iter_polygon_components(poly)
-              for ring in [p.exterior, *p.interiors]]
-    if coords:
-        vals.append(float(sampler(np.vstack(coords)).min()))
-    return min(vals) if vals else None
+    xy, top_faces = _region_top_surface(poly, xs, ys)
+    if xy is None:
+        return None
+    used = np.unique(top_faces)
+    return float(np.min(sampler(xy[used])))
 
 
-def build_region_prism_fast(poly, top_fn, bottom_fn, xs, ys, key_scale=1e6):
-    """Watertight prism for one 2D region, extruded over the shared DEM grid.
+def _region_top_surface(poly, xs, ys, key_scale=1e6):
+    """Top-surface vertices + triangulation for one 2D region over the DEM grid.
 
-    ``poly`` is a shapely (Multi)Polygon in model mm; ``top_fn``/``bottom_fn`` are
-    callables (N,2 xy)->z for the two surfaces (a constant lambda for a flat face,
-    the DEM sampler for a draped one, or ``DEM - t`` for a uniform-thickness floor).
-    Interior grid cells are meshed vectorized; only the ~perimeter boundary cells
-    are clipped with shapely (CDT).  Neighbours share boundary vertices (same grid +
-    same polygon edge) so separately-built regions abut with no crack and no
-    boolean.  Winding is correct by construction (CCW-from-above top, reversed
-    bottom, walls oriented from the top surface's boundary edges) so no
-    fix_normals/merge is needed (those dominate runtime on multi-million-face meshes).
-    Returns a trimesh.Trimesh or None if the region covers no cells.
+    Returns ``(xy, top_faces)``: ``xy`` is the (N, 2) array of every top-surface
+    vertex the region emits -- grid points of the used cells plus the polygon-edge x
+    grid-line crossing points the boundary cells' CDT introduces -- and ``top_faces``
+    (M, 3) indexes them CCW-from-above.  ``(None, None)`` if the region covers no
+    cell.  Note ``xy`` also carries the outside corners of boundary cells (needed so
+    the prism's walls close), which no top face references; callers that want the
+    true surface extent must restrict to ``np.unique(top_faces)``.
+
+    Factored out of build_region_prism_fast so the flat-floor placement reads the
+    surface minimum from the identical vertex set the mesh is built on.
     """
     minx, miny, maxx, maxy = poly.bounds
     j0 = max(int(np.searchsorted(xs, minx)) - 1, 0)
@@ -1409,7 +1402,7 @@ def build_region_prism_fast(poly, top_fn, bottom_fn, xs, ys, key_scale=1e6):
     gx = xs[j0:j1 + 1]; gy = ys[i0:i1 + 1]
     ni, nj = len(gy), len(gx)
     if ni < 2 or nj < 2:
-        return None
+        return None, None
     GX, GY = np.meshgrid(gx, gy)
     inside = shapely.contains_xy(poly, GX, GY)
 
@@ -1418,7 +1411,7 @@ def build_region_prism_fast(poly, top_fn, bottom_fn, xs, ys, key_scale=1e6):
     all_in = c00 & c10 & c11 & c01
     bnd = (c00 | c10 | c11 | c01) & ~all_in
     if not all_in.any() and not bnd.any():
-        return None
+        return None, None
 
     usedcell = all_in | bnd
     ptused = np.zeros((ni, nj), bool)
@@ -1471,8 +1464,28 @@ def build_region_prism_fast(poly, top_fn, bottom_fn, xs, ys, key_scale=1e6):
         top_faces.append(np.array(bnd_tris, np.int64))
     top_faces = np.vstack(top_faces)
 
-    n = n_grid + len(cross_xy)
     xy = grid_xy if not cross_xy else np.vstack((grid_xy, np.array(cross_xy)))
+    return xy, top_faces
+
+
+def build_region_prism_fast(poly, top_fn, bottom_fn, xs, ys, key_scale=1e6):
+    """Watertight prism for one 2D region, extruded over the shared DEM grid.
+
+    ``poly`` is a shapely (Multi)Polygon in model mm; ``top_fn``/``bottom_fn`` are
+    callables (N,2 xy)->z for the two surfaces (a constant lambda for a flat face,
+    the DEM sampler for a draped one, or ``DEM - t`` for a uniform-thickness floor).
+    Interior grid cells are meshed vectorized; only the ~perimeter boundary cells
+    are clipped with shapely (CDT).  Neighbours share boundary vertices (same grid +
+    same polygon edge) so separately-built regions abut with no crack and no
+    boolean.  Winding is correct by construction (CCW-from-above top, reversed
+    bottom, walls oriented from the top surface's boundary edges) so no
+    fix_normals/merge is needed (those dominate runtime on multi-million-face meshes).
+    Returns a trimesh.Trimesh or None if the region covers no cells.
+    """
+    xy, top_faces = _region_top_surface(poly, xs, ys, key_scale)
+    if xy is None:
+        return None
+    n = len(xy)
     verts = np.empty((2 * n, 3))
     verts[:n, :2] = xy; verts[:n, 2] = top_fn(xy)
     verts[n:, :2] = xy; verts[n:, 2] = bottom_fn(xy)
