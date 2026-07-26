@@ -547,27 +547,14 @@ def _quantize_to_f32(
     quantized = shapely.set_precision(polygon_mm, output_resolution)
     if quantized.is_empty or quantized.geom_type not in ("Polygon", "MultiPolygon"):
         return None
-    return quantized
-
-
-def _drop_degenerate_faces(
-    vertices: np.ndarray,
-    faces: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Weld coincident vertices and drop the zero-area faces they leave behind.
-
-    Operates on the final (float32-cast) coordinates so that two vertices which
-    round to the same float32 value are welded, collapsing any sub-ULP thin wall
-    into a zero-length edge; ``nondegenerate_faces()`` (zero-normal test) then
-    removes only those collapsed faces.  Real inserts — even thin ones — keep a
-    non-zero normal and are preserved, so the valid solid is untouched.  Returns
-    the cleaned (vertices, faces).
-    """
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    mesh.merge_vertices()
-    mesh.update_faces(mesh.nondegenerate_faces())
-    mesh.remove_unreferenced_vertices()
-    return mesh.vertices, mesh.faces
+    # set_precision leaves a *persistent* fixed precision model on the geometry.  Any
+    # later GEOS overlay (the per-cell poly.intersection in _region_top_surface) would
+    # then run OverlayNG under that model and snap-round every output vertex to the
+    # grid -- moving exact grid corners off-grid and producing duplicate vertices,
+    # spurious interior walls, and non-manifold edges.  The coordinates are already
+    # quantized; clear the model back to floating so downstream intersections preserve
+    # pass-through vertices exactly (grid_size=0 leaves coordinates bit-identical).
+    return shapely.set_precision(quantized, 0.0)
 
 
 def _slice_solid_to_parts(
