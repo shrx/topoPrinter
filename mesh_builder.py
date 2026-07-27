@@ -2027,6 +2027,12 @@ def build_all_terrain_meshes(
     base_outline = (cutout_footprint if cutout_footprint is not None
                     else shapely.geometry.box(float(X.min()), float(Y.min()),
                                               float(X.max()), float(Y.max())))
+    # The pockets cut from this outline are snapped to the f32 output grid (as
+    # one arrangement, below); the outline they share their rim edge with must
+    # live on the same grid, or the rim exists in two near-coincident copies and
+    # the base solid drapes the hairline cell between them to the full DEM -- a
+    # zero-width, full-height razor fin along the rim.
+    base_outline = _quantize_to_f32(base_outline, output_resolution)
 
     # Per insert component, in 2D: the pocket carved in the base (component +
     # convex corner relief) and the printed insert footprint (inset + reflex
@@ -2062,9 +2068,15 @@ def build_all_terrain_meshes(
             # Pocket = the cleaned footprint (the seat) + convex corner relief.
             pocket_component = (unary_union([insert_src, pocket_extra])
                                 if pocket_extra is not None else insert_src)
+            # NOT quantized here: set_precision snap-rounds each polygon against
+            # its own hot pixels, so quantizing pockets one by one diverges the
+            # two copies of every shared seam (pocket/pocket and pocket/rim) by
+            # up to a pixel -- the noded arrangement then keeps both copies and
+            # the base solid drapes the degenerate ribbon cell between them to
+            # the DEM: a zero-width full-height razor fin. The whole arrangement
+            # is snapped to the f32 grid in ONE set_precision call below, which
+            # collapses shared seams onto identical coordinates instead.
             pocket_poly = _clip_to_footprint(pocket_component, base_outline)
-            if pocket_poly is not None:
-                pocket_poly = _quantize_to_f32(pocket_poly, output_resolution)
             if pocket_poly is not None:
                 if recess_mode == "uniform":
                     overlay_specs.append((tc, pocket_poly, None))
@@ -2113,6 +2125,15 @@ def build_all_terrain_meshes(
         for _, _, flat_z in overlay_specs]
     boundaries = [base_outline.boundary] + [pk.boundary for pk in raw_pockets]
     noded = unary_union(boundaries)
+    # Quantize the arrangement ONCE, all boundaries together: a single global
+    # snap-round collapses every near-coincident copy of a shared seam onto the
+    # same grid points (the per-polygon quantize it replaces diverged them; see
+    # the pocket loop above). unary_union afterwards dissolves the now-duplicate
+    # segments so each seam is exactly one constraint edge, and set_precision(0)
+    # clears the persistent precision model (see _quantize_to_f32).
+    noded = shapely.set_precision(noded, output_resolution)
+    noded = shapely.set_precision(noded, 0.0)
+    noded = unary_union(noded)
 
     base_mesh = build_base_solid(base_outline, [noded], raw_pockets, pocket_top_fns,
                                  sample_dem, xs, ys)
