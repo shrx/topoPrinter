@@ -126,11 +126,14 @@ def resolve_layers(cutout, layer_geoms, base_class,
 
     drop_unprintable is applied to that raw complement, and only when it is an
     INSERT: its slivers (thinner than min_thickness_mm) and specks (smaller than
-    min_blob_mm) are opened/despeckled off so it yields chunky, seatable inserts,
-    and the removed area falls through into the base below. When the raw complement
-    IS the base it is left whole -- a continuous base plate prints fine and needs no
-    opening. Satellite insert outlines are never re-opened (re-opening the APCSF
-    snow severs its interior necks and shaves ~0.6% of it).
+    min_blob_mm) are opened/despeckled off so it yields chunky, seatable inserts.
+    Because that op moves the layer's boundary, the partition is repaired
+    immediately: each vacated piece either merges into the base (when the base is
+    its main neighbour) or returns to the unmasked insert (restoring the original
+    seam bit-exactly), so no gap can open between two inserts. When
+    the raw complement IS the base it is left whole -- a continuous base plate
+    prints fine and needs no opening. Satellite insert outlines are never re-opened
+    (re-opening the APCSF snow severs its interior necks and shaves ~0.6% of it).
 
     The BOTTOM (`base_class`) is the complement of the finished inserts -- the
     cutout minus every insert above it -- so it spans the whole disc.
@@ -153,20 +156,58 @@ def resolve_layers(cutout, layer_geoms, base_class,
     layers[unmasked_cls] = remaining          # unmasked = cutout - every mask
 
     inserts = {}
+    vacated = None
     for tc, g in layers.items():
         if tc == base_class or g.is_empty:
             continue
-        # The raw-complement insert is opened to chunky pieces; its removed slivers
-        # fall through to the base. Satellite inserts arrive pre-cleaned.
-        gi = (drop_unprintable(g, min_thickness_mm, min_blob_mm, scale_m_per_mm)
-              if tc == unmasked_cls else g)
+        # The raw-complement insert is opened to chunky pieces. The area the
+        # opening vacates is NOT left to fall through implicitly: the boundary
+        # just moved, so every touching layer is updated right below.
+        if tc == unmasked_cls:
+            gi = drop_unprintable(g, min_thickness_mm, min_blob_mm, scale_m_per_mm)
+            vacated = g.difference(gi).buffer(0)
+        else:
+            gi = g                    # satellite inserts arrive pre-cleaned
         if not gi.is_empty:
             inserts[tc] = gi
 
-    # drop_unprintable just moved the unmasked insert's boundary (the opening).
-    # Re-cut every other insert against that FINAL boundary so a shared seam is one
-    # set of vertices, not two near-miss copies that f32 rounding crosses into
-    # zero-width point-touches (non-manifold pinches) when the base is built.
+    # drop_unprintable moved the unmasked insert's boundary; update the touching
+    # layers IMMEDIATELY so the partition stays exact. Left to the complement, a
+    # sliver vacated along the seam with another insert would become a hairline
+    # wall of base standing between two recessed pockets -- a full-height fin.
+    # Each vacated piece goes to whichever of BASE and the unmasked insert itself
+    # it borders more:
+    #   * mostly alongside the base -> it stays out of the inserts and the
+    #     complement below absorbs it into the base bulk (no fin: its long side
+    #     IS the base);
+    #   * otherwise -> it returns to the unmasked insert. Its outer edge is the
+    #     original partition seam, bit-identical to the neighbouring layer's
+    #     boundary, so the seam is restored exactly -- the gap closes without
+    #     touching any satellite outline (growing a satellite insert instead
+    #     glues the opening's reconstructed, near-coincident-but-unshared edge
+    #     onto it, which f32 export collapses into non-manifold self-touches).
+    if vacated is not None and not vacated.is_empty:
+        eps = 0.5 * scale_m_per_mm                      # neighbour-probe radius
+        base_geom = layers.get(base_class, Polygon())
+        opened = inserts.get(unmasked_cls, Polygon())
+        returned = []
+        for piece in (vacated.geoms if vacated.geom_type == "MultiPolygon"
+                      else [vacated]):
+            if piece.geom_type != "Polygon" or piece.is_empty:
+                continue
+            ring = piece.buffer(eps)
+            if ring.intersection(base_geom).area < ring.intersection(opened).area:
+                returned.append(piece)
+        if returned and unmasked_cls in inserts:
+            # unary_union without buffer(0): it nodes only the touching segments,
+            # so every coordinate away from the joined pieces stays bit-identical
+            # and downstream seams keep matching exactly.
+            inserts[unmasked_cls] = unary_union([inserts[unmasked_cls], *returned])
+
+    # The unmasked insert's boundary is now final. Re-cut every other insert
+    # against it so a shared seam is one set of vertices, not two near-miss copies
+    # that f32 rounding crosses into zero-width point-touches (non-manifold
+    # pinches) when the base is built.
     if unmasked_cls in inserts:
         rf = inserts[unmasked_cls]
         for tc in list(inserts):
