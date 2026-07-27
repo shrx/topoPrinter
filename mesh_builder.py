@@ -669,18 +669,6 @@ def _apply_rect_cutout_transform(
     return result
 
 
-def _region_triangles(piece: ShapelyPolygon):
-    """Constrained-Delaunay triangulate a polygon piece -> list of xy coord triples.
-
-    Uses only the piece's own vertices (no Steiner points), so a boundary shared
-    with a neighbour keeps identical vertices on both sides.
-    """
-    tc = shapely.constrained_delaunay_triangles(piece)
-    if tc.is_empty:
-        return []
-    return [list(t.exterior.coords)[:3] for t in tc.geoms]
-
-
 def _dem_sampler(z_grid_asc: np.ndarray, xs: np.ndarray, ys: np.ndarray):
     """Bilinear DEM sampler on an ascending-x, ascending-y grid.
 
@@ -711,14 +699,18 @@ def _dem_min_over(poly, sampler, xs: np.ndarray, ys: np.ndarray) -> Optional[flo
     """Exact minimum of the extruded top surface over a footprint.
 
     Reads the minimum from the SAME vertex set build_region_prism_fast emits for
-    this region (via _region_top_surface): grid points inside the region PLUS the
-    polygon-edge x grid-line crossing points the boundary cells' CDT introduces.
-    A crossing point is a bilinear DEM sample that can dip below every interior grid
-    point and every polygon vertex, so sampling only those (the old approximation)
-    overestimated the minimum -- placing a flat floor at ``min - offset`` a hair too
-    high and thinning the wall below ``offset`` at that crossing.  Only vertices the
-    top faces reference are considered (boundary cells also carry their outside grid
-    corners as unused vertices, which must not pull the minimum down).
+    this region (via _region_top_surface), so a flat floor at ``min - offset`` leaves
+    a wall exactly ``offset`` thick at its thinnest point: each top triangle is a
+    linear interpolant, whose minimum over the triangle is attained at a corner, so
+    the minimum over the vertices IS the minimum over the built surface.  It is not
+    the minimum of the underlying DEM over the footprint -- a boundary edge spanning
+    several cells is one chord, riding above whatever the terrain does between its
+    endpoints.  Densifying region boundaries on the grid lines would close that gap
+    and belongs in the 2D stage, not here.
+
+    Only vertices the top faces reference are considered: _region_top_surface also
+    emits grid points that its CDT left outside the region, and those must not pull
+    the minimum down.
     """
     xy, top_faces = _region_top_surface(poly, xs, ys)
     if xy is None:
@@ -730,146 +722,92 @@ def _dem_min_over(poly, sampler, xs: np.ndarray, ys: np.ndarray) -> Optional[flo
 def _region_top_surface(poly, xs, ys):
     """Top-surface vertices + triangulation for one 2D region over the DEM grid.
 
-    Returns ``(xy, top_faces)``: ``xy`` is the (N, 2) array of every top-surface
-    vertex the region emits -- grid points of the used cells plus the polygon-edge x
-    grid-line crossing points the boundary cells' CDT introduces -- and ``top_faces``
-    (M, 3) indexes them CCW-from-above.  ``(None, None)`` if the region covers no
-    cell.  Note ``xy`` also carries the outside corners of boundary cells (needed so
-    the prism's walls close), which no top face references; callers that want the
-    true surface extent must restrict to ``np.unique(top_faces)``.
+    Returns ``(xy, top_faces)``: ``xy`` is the (N, 2) array of top-surface vertices
+    -- the region's own boundary coordinates plus every DEM grid point inside it --
+    and ``top_faces`` (M, 3) indexes them CCW-from-above.  ``(None, None)`` if the
+    region has no area.
 
-    Factored out of build_region_prism_fast so the flat-floor placement reads the
-    surface minimum from the identical vertex set the mesh is built on.
+    Built the same way ``build_base_solid`` builds the base plate: ONE constrained
+    Delaunay triangulation whose constraint segments are the region's boundary rings
+    and whose free vertices are the interior grid points.  The boundary is therefore
+    reproduced exactly instead of being sampled, and the surface still follows the
+    DEM at full grid resolution.
+
+    The grid-walk this replaces classified each grid CELL by testing its four corner
+    samples for containment, and skipped cells with no corner inside.  That is a
+    proxy for "does this cell meet the region", and it fails wherever the boundary
+    cuts a corner-free path through a cell: such a part of the region was silently
+    dropped from the surface, whatever the region's overall size (a sub-cell bump on
+    a large polygon vanished; so did any region smaller than one cell).  The pocket
+    the insert seats into is built by the exact CDT path, so the two disagreed by up
+    to a cell -- several times the designed XY clearance.  Constraining on the
+    boundary removes the failure mode rather than narrowing it; measured at Ararat
+    scale the two paths cost the same.
+
+    ``-p`` takes the PSLG, ``-Y`` forbids Steiner points on the segments (so a
+    boundary shared with a neighbour keeps identical vertices on both sides), ``-Q``
+    is quiet.  No quality or area flags, so no interior Steiner points either.
     """
+    import triangle as _triangle
+
+    rings = []
+    for p in (poly.geoms if poly.geom_type == "MultiPolygon" else [poly]):
+        rings.append(np.asarray(p.exterior.coords, float)[:-1])
+        for h in p.interiors:
+            rings.append(np.asarray(h.coords, float)[:-1])
+    rings = [r for r in rings if len(r) >= 3]
+    if not rings:
+        return None, None
+
+    # Interior grid points, over the region's bbox window only.
     minx, miny, maxx, maxy = poly.bounds
     j0 = max(int(np.searchsorted(xs, minx)) - 1, 0)
     j1 = min(int(np.searchsorted(xs, maxx)) + 1, len(xs) - 1)
     i0 = max(int(np.searchsorted(ys, miny)) - 1, 0)
     i1 = min(int(np.searchsorted(ys, maxy)) + 1, len(ys) - 1)
-    gx = xs[j0:j1 + 1]; gy = ys[i0:i1 + 1]
-    ni, nj = len(gy), len(gx)
-    if ni < 2 or nj < 2:
+    GX, GY = np.meshgrid(xs[j0:j1 + 1], ys[i0:i1 + 1])
+    ins = shapely.contains_xy(poly, GX, GY)
+    grid_xy = np.column_stack((GX[ins], GY[ins]))
+
+    ring_all = np.vstack(rings)
+    allxy = (np.vstack((ring_all, grid_xy)) if len(grid_xy) else ring_all).astype(float)
+
+    # Intern at the float32 export resolution: two coordinates that round to the same
+    # float32 (as the binary STL will) MUST become one vertex, or a sub-float32 sliver
+    # triangle survives construction and collapses to a degenerate, non-manifold face
+    # on export.  float32 keying can never over-merge: distinct grid lines are a whole
+    # pitch (~0.18 mm at Ararat scale) apart.
+    _, first, inv = np.unique(allxy.astype(np.float32), axis=0,
+                              return_index=True, return_inverse=True)
+    V = allxy[first]
+
+    segs = []
+    off = 0
+    for r in rings:
+        m = len(r)
+        idx = inv[off:off + m]; off += m
+        segs.append(np.column_stack((idx, np.roll(idx, -1))))   # ring closes on itself
+    seg = np.vstack(segs)
+    seg = seg[seg[:, 0] != seg[:, 1]]           # rings that f32-interning collapsed
+    seg = np.unique(np.sort(seg, axis=1), axis=0)
+    if not len(seg):
         return None, None
-    GX, GY = np.meshgrid(gx, gy)
-    inside = shapely.contains_xy(poly, GX, GY)
 
-    c00 = inside[:-1, :-1]; c10 = inside[1:, :-1]
-    c11 = inside[1:, 1:];   c01 = inside[:-1, 1:]
-    all_in = c00 & c10 & c11 & c01
-    bnd = (c00 | c10 | c11 | c01) & ~all_in
-    if not all_in.any() and not bnd.any():
+    B = _triangle.triangulate({"vertices": V, "segments": seg}, "pYQ")
+    Vt = B["vertices"]; T = B["triangles"]
+
+    # The triangulation fills the segments' convex hull; keep the triangles actually
+    # inside the region, which drops both the concavities and the holes.
+    cen = Vt[T].mean(axis=1)
+    T = T[shapely.contains_xy(poly, cen[:, 0], cen[:, 1])]
+    if not len(T):
         return None, None
 
-    usedcell = all_in | bnd
-    ptused = np.zeros((ni, nj), bool)
-    ptused[:-1, :-1] |= usedcell; ptused[1:, :-1] |= usedcell
-    ptused[1:, 1:] |= usedcell;   ptused[:-1, 1:] |= usedcell
-    gridvid = np.full((ni, nj), -1, np.int64)
-    pi, pj = np.where(ptused)
-    n_grid = len(pi)
-    gridvid[pi, pj] = np.arange(n_grid)
-    grid_xy = np.column_stack((gx[pj], gy[pi]))
-
-    # Intern at the float32 export resolution: two coordinates that round to the
-    # same float32 (as the binary STL will) MUST become one vertex.  Keying finer
-    # than that -- the old round(v * 1e6), i.e. 1e-6 mm -- let two vertices ~1e-5
-    # mm apart (below the float32 ULP at model scale, ~1.6e-5 mm) take distinct
-    # ids during construction, forming a sub-float32 sliver triangle that then
-    # collapsed to a degenerate, non-manifold face on export.  float32 keying can
-    # never over-merge: distinct grid lines are a whole pitch (~0.18 mm) apart.
-    def _k(v):
-        return float(np.float32(v))
-    gxkey = {_k(v): k for k, v in enumerate(gx)}
-    gykey = {_k(v): k for k, v in enumerate(gy)}
-    cross_xy = []
-    cross_tbl = {}
-
-    def vid(x, y):
-        kx = _k(x); ky = _k(y)
-        j = gxkey.get(kx); i = gykey.get(ky)
-        if i is not None and j is not None and gridvid[i, j] >= 0:
-            return int(gridvid[i, j])
-        k = (kx, ky)
-        got = cross_tbl.get(k)
-        if got is None:
-            got = cross_tbl[k] = n_grid + len(cross_xy)
-            cross_xy.append((x, y))
-        return got
-
-    ci, cj = np.where(all_in)
-    v00 = gridvid[ci, cj]; v10 = gridvid[ci + 1, cj]
-    v11 = gridvid[ci + 1, cj + 1]; v01 = gridvid[ci, cj + 1]
-    top_faces = [np.column_stack((v00, v01, v11)),
-                 np.column_stack((v00, v11, v10))]
-
-    # Clip every boundary cell in a SINGLE noded arrangement instead of one
-    # poly.intersection(box) per cell.  A crossing where the polygon boundary
-    # meets a grid line is shared by the two (edge) or four (corner) cells that
-    # touch that line; clipping each cell independently made GEOS recompute that
-    # crossing once per touching cell, and two evaluations landing on opposite
-    # sides of a vid bucket produced a duplicate vertex (a degenerate sliver) or
-    # collapsed a triangle.  Noding the polygon boundary together with the
-    # boundary cells' grid edges once computes each crossing exactly one time, so
-    # neighbouring cells intern the identical coordinate -- and it overlays the
-    # (large) polygon a single time instead of per cell.  Interior all_in cells
-    # stay on the vectorized quad path above; only ~perimeter cells arrive here.
-    bi, bj = np.where(bnd)
-    bnd_tris = []
-    if len(bi):
-        # Unique unit grid edges of the boundary cells, built vectorized: each
-        # cell contributes its two horizontal edges (rows i, i+1 over column j)
-        # and two vertical edges (columns j, j+1 over row i).
-        he = np.unique(np.column_stack(
-            (np.concatenate((bi, bi + 1)), np.concatenate((bj, bj)))), axis=0)
-        ve = np.unique(np.column_stack(
-            (np.concatenate((bj, bj + 1)), np.concatenate((bi, bi)))), axis=0)
-        hcoords = np.stack((
-            np.column_stack((gx[he[:, 1]], gy[he[:, 0]])),
-            np.column_stack((gx[he[:, 1] + 1], gy[he[:, 0]]))), axis=1)
-        vcoords = np.stack((
-            np.column_stack((gx[ve[:, 0]], gy[ve[:, 1]])),
-            np.column_stack((gx[ve[:, 0]], gy[ve[:, 1] + 1]))), axis=1)
-        seglines = np.concatenate((
-            np.array([poly.boundary], dtype=object),
-            shapely.linestrings(hcoords), shapely.linestrings(vcoords)))
-        noded = shapely.unary_union(seglines)
-        faces = shapely.get_parts(shapely.polygonize(shapely.get_parts(noded)))
-
-        # Keep only the boundary-cell clip pieces (vectorized filter): a face that
-        # fits in one cell, whose interior point lands in a bnd cell and inside
-        # the polygon.  Drops the interior all_in blob (spans many cells), full
-        # interior cells (already meshed), and the outside-polygon cell remnants.
-        dxg = float(gx[1] - gx[0]); dyg = float(gy[1] - gy[0])
-        gb = shapely.bounds(faces)
-        keep = (gb[:, 2] - gb[:, 0] <= 1.5 * dxg) & (gb[:, 3] - gb[:, 1] <= 1.5 * dyg)
-        reps = shapely.point_on_surface(faces)
-        rx = shapely.get_x(reps); ry = shapely.get_y(reps)
-        jj = np.searchsorted(gx, rx) - 1
-        ii = np.searchsorted(gy, ry) - 1
-        oncell = (ii >= 0) & (ii < ni - 1) & (jj >= 0) & (jj < nj - 1)
-        keep &= oncell
-        keep[keep] &= bnd[ii[keep], jj[keep]]
-        keep &= shapely.contains_xy(poly, rx, ry)
-
-        for g in faces[keep]:
-            for t in _region_triangles(g):
-                if (t[1][0] - t[0][0]) * (t[2][1] - t[0][1]) - \
-                   (t[1][1] - t[0][1]) * (t[2][0] - t[0][0]) < 0:
-                    t = [t[0], t[2], t[1]]
-                va, vb, vc = vid(*t[0]), vid(*t[1]), vid(*t[2])
-                if va == vb or vb == vc or va == vc:
-                    # A crossing still interning into a grid node's vid bucket
-                    # collapses this triangle to a line; it has zero area, so skip
-                    # it rather than emit a degenerate face that would push its
-                    # real edges non-manifold.
-                    continue
-                bnd_tris.append([va, vb, vc])
-    if bnd_tris:
-        top_faces.append(np.array(bnd_tris, np.int64))
-    top_faces = np.vstack(top_faces)
-
-    xy = grid_xy if not cross_xy else np.vstack((grid_xy, np.array(cross_xy)))
-    return xy, top_faces
+    a, b, c = Vt[T[:, 0]], Vt[T[:, 1]], Vt[T[:, 2]]
+    cw = ((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
+          - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])) < 0
+    T[cw] = T[cw][:, ::-1]
+    return Vt, T
 
 
 def build_region_prism_fast(poly, top_fn, bottom_fn, xs, ys):
@@ -878,13 +816,13 @@ def build_region_prism_fast(poly, top_fn, bottom_fn, xs, ys):
     ``poly`` is a shapely (Multi)Polygon in model mm; ``top_fn``/``bottom_fn`` are
     callables (N,2 xy)->z for the two surfaces (a constant lambda for a flat face,
     the DEM sampler for a draped one, or ``DEM - t`` for a uniform-thickness floor).
-    Interior grid cells are meshed vectorized; only the ~perimeter boundary cells
-    are clipped with shapely (CDT).  Neighbours share boundary vertices (same grid +
-    same polygon edge) so separately-built regions abut with no crack and no
-    boolean.  Winding is correct by construction (CCW-from-above top, reversed
-    bottom, walls oriented from the top surface's boundary edges) so no
-    fix_normals/merge is needed (those dominate runtime on multi-million-face meshes).
-    Returns a trimesh.Trimesh or None if the region covers no cells.
+    The top surface comes from ``_region_top_surface``, which constrains the region's
+    own boundary into one CDT, so neighbours share boundary vertices (same segments +
+    same grid) and separately-built regions abut with no crack and no boolean.
+    Winding is correct by construction (CCW-from-above top, reversed bottom, walls
+    oriented from the top surface's boundary edges) so no fix_normals/merge is needed
+    (those dominate runtime on multi-million-face meshes).
+    Returns a trimesh.Trimesh or None if the region has no area on the grid.
     """
     xy, top_faces = _region_top_surface(poly, xs, ys)
     if xy is None:

@@ -383,7 +383,8 @@ def build_terrain_layout(
             contain ``TERRAIN_ROCK``: rock is the one class with no mask, derived
             by ``resolve_layers`` as the leftover of all the others.
         outline: the cutout footprint in model mm (``cutout_footprint``), or None
-            for the whole grid.
+            for the whole grid. Clipped to the DEM extent, so no part of the print
+            can be placed where there is no elevation data.
         base_class: the terrain class used as the base plate the inserts seat into.
             Defaults to rock. The satellite-inverted Ararat print passes foliage,
             which makes rock an ordinary insert -- still derived, not supplied.
@@ -469,6 +470,18 @@ def build_terrain_layout(
         poly = shapely.simplify(poly, simplify_tol_mm, preserve_topology=True).buffer(0)
         class_polys_mm[tc] = poly if not poly.is_empty else None
 
+    # Nothing may be built beyond the DEM: the height sampler clamps outside the grid,
+    # so terrain there would come out flat at the nearest edge value. Bounding the
+    # OUTLINE bounds everything, because the pockets, the insert footprints and the
+    # base plate are all cut from it. A cutout reaching past the raster is not a
+    # geometry case but a coverage one -- crop_to_cutout clamps its window to the tiles
+    # it was handed (dem_processing.py:261-264), so a cutout larger than the supplied
+    # DEM coverage passes through silently. Clipped only when it actually overhangs, so
+    # the ordinary case keeps the outline's own coordinates untouched.
+    dem_extent = box(*frame.bounds_mm)
+    if outline is not None and not dem_extent.covers(outline):
+        outline = outline.intersection(dem_extent)
+
     # Resolve masks -> mutually-exclusive inserts + base plate. Model mm is print mm,
     # so scale_m_per_mm=1.0. The oversized domain leaves inserts unclipped (the cutout
     # trims later); the complement it carves is clipped there too.
@@ -509,7 +522,7 @@ def build_terrain_layout(
 
     # Downsample polygons to the float32 STL output resolution before 2D->3D.
     output_resolution = frame.output_resolution
-    base_outline = outline if outline is not None else box(minx, miny, maxx, maxy)
+    base_outline = outline if outline is not None else dem_extent
     # The pockets cut from this outline are snapped to the f32 output grid (as one
     # arrangement, in node_and_snap); the outline they share their rim edge with must
     # live on the same grid, or the rim exists in two near-coincident copies and the
