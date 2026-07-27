@@ -12,7 +12,7 @@ from typing import Iterable, List
 from dem_processing import load_and_merge
 from downloader import CACHE_DIR, download_dem, ensure_dir, read_url_list
 import numpy as np
-from mesh_builder import build_all_terrain_meshes, dem_to_vertices_and_faces, save_stl
+from mesh_builder import build_terrain_meshes, dem_to_vertices_and_faces, save_stl
 
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
@@ -426,32 +426,49 @@ def main(argv: Iterable[str]) -> int:
             base_name = f"{base_name}_mosaic"
 
         if (args.terrain or args.invert_base) and class_geometries is not None:
-            terrain_meshes = build_all_terrain_meshes(
-                dem, class_geometries,
-                px_size_x, px_size_y,
-                x_size_model, max_height_mm, z_exaggeration,
-                args.base_thickness_mm, args.terrain_thickness_mm,
-                use_true_scale=use_true_scale,
-                base_class=base_class,
+            from model_frame import ModelFrame
+            from terrain_layout import (CutoutSpec, InsertFit, build_terrain_layout,
+                                        cutout_footprint)
+
+            frame = ModelFrame.from_dem(dem.shape, px_size_x, px_size_y,
+                                        x_size_model, ref_transform, ref_crs)
+            cutout = CutoutSpec(
                 cutout_type=cutout_type_for_mesh,
-                cutout_center_lat=center_lat,
-                cutout_center_lon=center_lon,
-                cutout_radius_m=cutout_radius_m,
-                cutout_side_length_km=args.side_length,
-                ref_transform=ref_transform,
-                ref_crs=ref_crs,
+                center_lat=center_lat,
+                center_lon=center_lon,
+                radius_m=cutout_radius_m,
+                side_length_km=args.side_length,
                 n_gon_sides=args.ngon_sides,
                 bearing=args.bearing,
                 rect_corner1_lat=rect_lat1,
                 rect_corner1_lon=rect_lon1,
                 rect_corner2_lat=rect_lat2,
                 rect_corner2_lon=rect_lon2,
-                recess_mode=args.terrain_recess_mode,
+            )
+
+            # Stage 1: masks -> final 2D polygons (no elevations involved).
+            layout = build_terrain_layout(
+                frame, class_geometries,
+                outline=cutout_footprint(frame, cutout),
+                base_class=base_class,
                 terrain_types=terrain_type_list,
-                insert_xy_clearance_mm=args.insert_xy_clearance_mm,
+                fit=InsertFit(
+                    xy_clearance_mm=args.insert_xy_clearance_mm,
+                    z_clearance_mm=args.insert_z_clearance_mm,
+                    corner_relief_mm=args.insert_corner_relief_mm,
+                    corner_min_angle_deg=args.insert_corner_min_angle_deg,
+                ),
+            )
+
+            # Stage 2: extrude that layout over the DEM.
+            terrain_meshes = build_terrain_meshes(
+                layout, frame, dem,
+                max_height_mm, z_exaggeration,
+                args.base_thickness_mm, args.terrain_thickness_mm,
+                use_true_scale=use_true_scale,
+                recess_mode=args.terrain_recess_mode,
                 insert_z_clearance_mm=args.insert_z_clearance_mm,
-                insert_corner_relief_mm=args.insert_corner_relief_mm,
-                insert_corner_min_angle_deg=args.insert_corner_min_angle_deg,
+                cutout=cutout,
             )
             for terrain_name, mesh_data in terrain_meshes.items():
                 if mesh_data is None:
