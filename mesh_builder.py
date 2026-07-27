@@ -14,6 +14,8 @@ from typing import Tuple, Optional
 
 import numpy as np
 from pyproj import Transformer
+from rasterio.features import rasterize
+from rasterio.transform import from_origin
 import trimesh
 
 from shapely.geometry import Polygon as ShapelyPolygon
@@ -695,7 +697,8 @@ def _dem_sampler(z_grid_asc: np.ndarray, xs: np.ndarray, ys: np.ndarray):
     return sample
 
 
-def _dem_min_over(poly, sampler, xs: np.ndarray, ys: np.ndarray) -> Optional[float]:
+def _dem_min_over(poly, sampler, xs: np.ndarray, ys: np.ndarray,
+                  resolution: float) -> Optional[float]:
     """Exact minimum of the extruded top surface over a footprint.
 
     Reads the minimum from the SAME vertex set build_region_prism_fast emits for
@@ -712,14 +715,192 @@ def _dem_min_over(poly, sampler, xs: np.ndarray, ys: np.ndarray) -> Optional[flo
     emits grid points that its CDT left outside the region, and those must not pull
     the minimum down.
     """
-    xy, top_faces = _region_top_surface(poly, xs, ys)
+    xy, top_faces = _region_top_surface(poly, xs, ys, resolution)
     if xy is None:
         return None
     used = np.unique(top_faces)
     return float(np.min(sampler(xy[used])))
 
 
-def _region_top_surface(poly, xs, ys):
+def _interior_grid_points(region, constraints, xs, ys, resolution):
+    """DEM sampling points inside ``region`` that the export can tell from its edges.
+
+    A grid point closer to a constraint edge than one float32 step of the output is
+    not a usable sample: written to the STL it keeps its own value on one axis but
+    collapses onto the edge's on the other, flattening the sliver triangle it
+    anchors into a zero-area face. It carries nothing the edge does not already --
+    boundaries are densified on these same grid lines -- so it is dropped rather
+    than snapped, which would move a boundary vertex.
+
+    Only the constraints are used for the proximity test, not ``region.bounds``, so
+    the base plate excludes points hugging a pocket seam as well as the rim.
+
+    The test is driven from the SEGMENTS, not from the points. ``resolution`` is
+    four orders below the grid pitch, so each segment can only endanger the handful
+    of nodes in its own bounding box, and the constraints are densified -- no
+    segment spans more than one cell. That makes the work proportional to the
+    boundary, not to the interior: a shapely ``dwithin`` over every interior point
+    costs 45s on the Ararat base plate and finds nothing, where this costs
+    milliseconds.
+    """
+    minx, miny, maxx, maxy = region.bounds
+    j0 = max(int(np.searchsorted(xs, minx)) - 1, 0)
+    j1 = min(int(np.searchsorted(xs, maxx)) + 1, len(xs) - 1)
+    i0 = max(int(np.searchsorted(ys, miny)) - 1, 0)
+    i1 = min(int(np.searchsorted(ys, maxy)) + 1, len(ys) - 1)
+    wx, wy = xs[j0:j1 + 1], ys[i0:i1 + 1]
+    GX, GY = np.meshgrid(wx, wy)
+    ins = shapely.contains_xy(region, GX, GY)
+    if not ins.any():
+        return np.empty((0, 2))
+
+    A, B = _constraint_segments(constraints)
+    if len(A):
+        too_close = _nodes_near_segments(A, B, wx, wy, resolution)
+        ins &= ~too_close
+        if not ins.any():
+            return np.empty((0, 2))
+    return np.column_stack((GX[ins], GY[ins]))
+
+
+def _cells_crossed_by(geom, xs, ys):
+    """Boolean (rows-1, cols-1) mask of grid cells a boundary passes through.
+
+    Complete only because the layout densifies boundaries on the grid lines: no
+    segment crosses a cell any more, so a segment's own bounding box reaches every
+    cell it can touch. Over-marking is harmless (the cell just gets the exact test);
+    under-marking is not, so the box is taken generously on both sides.
+    """
+    nj, ni = len(xs) - 1, len(ys) - 1
+    mask = np.zeros((ni, nj), bool)
+    for g in (geom.geoms if geom.geom_type == "MultiPolygon" else [geom]):
+        for ring in [g.exterior] + list(g.interiors):
+            c = np.asarray(ring.coords, float)
+            if len(c) < 2:
+                continue
+            a, b = c[:-1], c[1:]
+            j0 = np.clip(np.searchsorted(xs, np.minimum(a[:, 0], b[:, 0]), "left") - 1,
+                         0, nj - 1)
+            j1 = np.clip(np.searchsorted(xs, np.maximum(a[:, 0], b[:, 0]), "right") - 1,
+                         0, nj - 1)
+            i0 = np.clip(np.searchsorted(ys, np.minimum(a[:, 1], b[:, 1]), "left") - 1,
+                         0, ni - 1)
+            i1 = np.clip(np.searchsorted(ys, np.maximum(a[:, 1], b[:, 1]), "right") - 1,
+                         0, ni - 1)
+            for dj in range(3):
+                for di in range(3):
+                    mask[np.minimum(i0 + di, i1), np.minimum(j0 + dj, j1)] = True
+    return mask
+
+
+def _assign_pockets(cen, pockets, xs, ys):
+    """Index of the first pocket containing each triangle centroid; -1 for none.
+
+    Testing every centroid against every candidate pocket is what the base plate
+    used to do, and on a real build it was 35 s of a 41 s mesh stage: ~900k
+    point-in-polygon tests against boundaries carrying tens of thousands of
+    coordinates.
+
+    Almost all of that work is redundant. A grid cell that no pocket boundary
+    crosses lies wholly inside or wholly outside every pocket, so one sample
+    answers for every triangle in it -- and those cells are ~94% of the plate.
+    Rasterising the pockets onto the cell grid answers them in one pass; only
+    triangles in a crossed cell get the real test.
+
+    Ties follow the same rule as before: the FIRST pocket in the list wins, which
+    is the documented precedence in TerrainLayout.pockets. rasterize paints later
+    shapes over earlier ones, so the list is burned in reverse.
+    """
+    ni, nj = len(ys) - 1, len(xs) - 1
+    out = np.full(len(cen), -1, np.int64)
+    if ni < 1 or nj < 1 or not len(cen):
+        return out
+
+    dx = float(xs[1] - xs[0])
+    dy = float(ys[1] - ys[0])
+    burn = rasterize([(pk, k + 1) for k, pk in enumerate(pockets)][::-1],
+                     out_shape=(ni, nj), transform=from_origin(xs[0], ys[-1], dx, dy),
+                     fill=0, all_touched=False, dtype="int32")[::-1]
+
+    crossed = np.zeros((ni, nj), bool)
+    for pk in pockets:
+        crossed |= _cells_crossed_by(pk, xs, ys)
+
+    jj = np.clip(np.searchsorted(xs, cen[:, 0], "right") - 1, 0, nj - 1)
+    ii = np.clip(np.searchsorted(ys, cen[:, 1], "right") - 1, 0, ni - 1)
+    out[:] = burn[ii, jj].astype(np.int64) - 1
+
+    exact = crossed[ii, jj]
+    if exact.any():
+        hits = shapely.STRtree(pockets).query(shapely.points(cen[exact]),
+                                              predicate="within")
+        got = np.full(int(exact.sum()), -1, np.int64)
+        if hits.size:
+            o = np.lexsort((hits[1], hits[0]))
+            pc, pp = hits[0][o], hits[1][o]
+            fst = np.ones(len(pc), bool)
+            fst[1:] = pc[1:] != pc[:-1]
+            got[pc[fst]] = pp[fst]
+        out[exact] = got
+    return out
+
+
+def _constraint_segments(geom):
+    """(A, B) endpoint arrays for every segment of a line or polygon boundary."""
+    parts = [geom] if geom.geom_type in ("LineString", "LinearRing") \
+        else list(shapely.get_parts(geom))
+    A, B = [], []
+    for ls in parts:
+        if ls.geom_type not in ("LineString", "LinearRing"):
+            continue
+        c = np.asarray(ls.coords, float)
+        if len(c) >= 2:
+            A.append(c[:-1])
+            B.append(c[1:])
+    if not A:
+        return np.empty((0, 2)), np.empty((0, 2))
+    return np.vstack(A), np.vstack(B)
+
+
+def _nodes_near_segments(A, B, wx, wy, resolution):
+    """Boolean (len(wy), len(wx)) mask of nodes within ``resolution`` of a segment."""
+    lox = np.minimum(A[:, 0], B[:, 0]) - resolution
+    hix = np.maximum(A[:, 0], B[:, 0]) + resolution
+    loy = np.minimum(A[:, 1], B[:, 1]) - resolution
+    hiy = np.maximum(A[:, 1], B[:, 1]) + resolution
+    j0 = np.searchsorted(wx, lox, "left")
+    j1 = np.searchsorted(wx, hix, "right")
+    i0 = np.searchsorted(wy, loy, "left")
+    i1 = np.searchsorted(wy, hiy, "right")
+
+    nj = np.maximum(j1 - j0, 0)
+    ni = np.maximum(i1 - i0, 0)
+    cnt = nj * ni
+    keep = cnt > 0
+    mask = np.zeros((len(wy), len(wx)), bool)
+    if not keep.any():
+        return mask
+
+    # Expand each surviving segment's node box into flat (segment, i, j) triples.
+    seg = np.repeat(np.flatnonzero(keep), cnt[keep])
+    within = np.arange(cnt[keep].sum()) - np.repeat(
+        np.concatenate(([0], np.cumsum(cnt[keep])[:-1])), cnt[keep])
+    jj = j0[seg] + within % nj[seg]
+    ii = i0[seg] + within // nj[seg]
+
+    P = np.column_stack((wx[jj], wy[ii]))
+    a, b = A[seg], B[seg]
+    d = b - a
+    dd = (d * d).sum(1)
+    t = np.where(dd > 0, ((P - a) * d).sum(1) / np.where(dd > 0, dd, 1.0), 0.0)
+    t = np.clip(t, 0.0, 1.0)
+    foot = a + t[:, None] * d
+    near = np.hypot(P[:, 0] - foot[:, 0], P[:, 1] - foot[:, 1]) < resolution
+    mask[ii[near], jj[near]] = True
+    return mask
+
+
+def _region_top_surface(poly, xs, ys, resolution):
     """Top-surface vertices + triangulation for one 2D region over the DEM grid.
 
     Returns ``(xy, top_faces)``: ``xy`` is the (N, 2) array of top-surface vertices
@@ -760,14 +941,7 @@ def _region_top_surface(poly, xs, ys):
         return None, None
 
     # Interior grid points, over the region's bbox window only.
-    minx, miny, maxx, maxy = poly.bounds
-    j0 = max(int(np.searchsorted(xs, minx)) - 1, 0)
-    j1 = min(int(np.searchsorted(xs, maxx)) + 1, len(xs) - 1)
-    i0 = max(int(np.searchsorted(ys, miny)) - 1, 0)
-    i1 = min(int(np.searchsorted(ys, maxy)) + 1, len(ys) - 1)
-    GX, GY = np.meshgrid(xs[j0:j1 + 1], ys[i0:i1 + 1])
-    ins = shapely.contains_xy(poly, GX, GY)
-    grid_xy = np.column_stack((GX[ins], GY[ins]))
+    grid_xy = _interior_grid_points(poly, poly.boundary, xs, ys, resolution)
 
     ring_all = np.vstack(rings)
     allxy = (np.vstack((ring_all, grid_xy)) if len(grid_xy) else ring_all).astype(float)
@@ -810,7 +984,7 @@ def _region_top_surface(poly, xs, ys):
     return Vt, T
 
 
-def build_region_prism_fast(poly, top_fn, bottom_fn, xs, ys):
+def build_region_prism_fast(poly, top_fn, bottom_fn, xs, ys, resolution):
     """Watertight prism for one 2D region, extruded over the shared DEM grid.
 
     ``poly`` is a shapely (Multi)Polygon in model mm; ``top_fn``/``bottom_fn`` are
@@ -824,7 +998,7 @@ def build_region_prism_fast(poly, top_fn, bottom_fn, xs, ys):
     (those dominate runtime on multi-million-face meshes).
     Returns a trimesh.Trimesh or None if the region has no area on the grid.
     """
-    xy, top_faces = _region_top_surface(poly, xs, ys)
+    xy, top_faces = _region_top_surface(poly, xs, ys, resolution)
     if xy is None:
         return None
     n = len(xy)
@@ -844,7 +1018,7 @@ def build_region_prism_fast(poly, top_fn, bottom_fn, xs, ys):
 
 
 def build_base_solid(base_outline, boundary_geoms, pockets, pocket_top_fns,
-                     base_top_fn, xs, ys):
+                     base_top_fn, xs, ys, resolution):
     """One watertight, manifold terraced solid for the whole base plate.
 
     The plate is a 2.5D terrain with vertical cliffs: the base class is draped at the
@@ -877,9 +1051,11 @@ def build_base_solid(base_outline, boundary_geoms, pockets, pocket_top_fns,
     if not ring_xy:
         return None
     ring_all = np.vstack(ring_xy)
-    GX, GY = np.meshgrid(xs, ys)
-    ins = shapely.contains_xy(base_outline, GX, GY)
-    grid_xy = np.column_stack((GX[ins], GY[ins]))
+    # Constraints here are the whole noded arrangement, not just the rim: a grid
+    # point hugging a pocket seam collapses onto it on export exactly as one
+    # hugging the outline would.
+    grid_xy = _interior_grid_points(base_outline, unary_union(list(boundary_geoms)),
+                                    xs, ys, resolution)
     allxy = np.vstack((ring_all, grid_xy)).astype(float)
     _, first, inv = np.unique(allxy.astype(np.float32), axis=0,
                               return_index=True, return_inverse=True)
@@ -905,14 +1081,8 @@ def build_base_solid(base_outline, boundary_geoms, pockets, pocket_top_fns,
         return None
 
     # ---- 3. per-triangle top_fn: highest-priority pocket holding its centroid ----
-    tri_fn = np.full(len(T), -1, np.int64)              # -1 = base
-    if pockets:
-        pr = shapely.STRtree(pockets).query(shapely.points(cen), predicate="within")
-        if pr.size:
-            o = np.lexsort((pr[1], pr[0]))
-            pc = pr[0][o]; pp = pr[1][o]
-            fst = np.ones(len(pc), bool); fst[1:] = pc[1:] != pc[:-1]
-            tri_fn[pc[fst]] = pp[fst]
+    tri_fn = (_assign_pockets(cen, pockets, xs, ys) if pockets
+              else np.full(len(T), -1, np.int64))      # -1 = base
 
     # ---- 4. top vertices keyed by (column vertex, f32 z): equal z welds, diff steps
     corner_v = T.reshape(-1)
@@ -1083,7 +1253,7 @@ def build_terrain_meshes(
         dict mapping terrain name to (vertices, faces, max_z) or None.
     """
     from terrain_classifier import TERRAIN_NAMES
-    from terrain_layout import node_and_snap, rect_crs_corners
+    from terrain_layout import rect_crs_corners
 
     # Model coordinates + surface heights. The horizontal half of this duplicates
     # `frame`; the Z half (exaggeration, base thickness, true scale) is what is
@@ -1102,6 +1272,7 @@ def build_terrain_meshes(
     # print mm), and helpers to flatten a Z and to finalize a body.
     xs = np.asarray(X[0, :], dtype=float)
     ys = np.asarray(Y[::-1, 0], dtype=float)          # Y descends with row -> reverse
+    resolution = float(frame.output_resolution)
     z_grid_asc = np.asarray(z_surface_mm[::-1, :], dtype=float)
     if not np.isfinite(z_grid_asc).all():
         fill = float(np.nanmin(z_grid_asc))
@@ -1123,20 +1294,19 @@ def build_terrain_meshes(
         v = verts.astype(np.float32)
         return v, mesh.faces.astype(np.int64), float(np.max(v[:, 2]))
 
-    # --- Pocket floors. A pocket covering no grid cell yields no top surface and is
-    # dropped here, BEFORE the arrangement is noded, so the base plate's constraint
-    # edges and its draped regions describe the same set of pockets.
-    raw_pockets = []
+    # --- Pocket floors. Every pocket the layout emitted is built: it owns the 2D
+    # geometry, including which pieces are viable, so nothing is filtered here.
+    raw_pockets = [pocket_poly for _tc, pocket_poly in layout.pockets]
     pocket_top_fns = []
-    for _tc, pocket_poly in layout.pockets:
+    for pocket_poly in raw_pockets:
         if recess_mode == "uniform":
-            raw_pockets.append(pocket_poly)
             pocket_top_fns.append(lambda xy: sample_dem(xy) - overlay_thickness_mm)
             continue
-        tmin = _dem_min_over(pocket_poly, sample_dem, xs, ys)
+        tmin = _dem_min_over(pocket_poly, sample_dem, xs, ys, resolution)
         if tmin is None:
-            continue
-        raw_pockets.append(pocket_poly)
+            raise ValueError(
+                "pocket has no top surface; the layout must not emit a degenerate "
+                "region, and the mesh stage must not drop one")
         pocket_top_fns.append(_flat(max(tmin - overlay_thickness_mm, 0.01)))
 
     # --- Base plate: base-class terrain at the DEM everywhere an insert doesn't seat,
@@ -1148,10 +1318,9 @@ def build_terrain_meshes(
     # plus a tiny resolve_layers leftover); the centroid-priority assignment resolves the
     # overlap, and pockets only floor the recess (insert seating is built from
     # layout.insert_parts) so a relief overlap never touches the insert fit.
-    noded = node_and_snap(layout.base_outline, raw_pockets, frame.output_resolution)
-
-    base_mesh = build_base_solid(layout.base_outline, [noded], raw_pockets,
-                                 pocket_top_fns, sample_dem, xs, ys)
+    base_mesh = build_base_solid(layout.base_outline, [layout.noded_boundaries],
+                                 raw_pockets,
+                                 pocket_top_fns, sample_dem, xs, ys, resolution)
     if base_mesh is not None and len(base_mesh.faces) > 0:
         result = {layout.base_name: _finalize(base_mesh)}
     else:
@@ -1168,12 +1337,15 @@ def build_terrain_meshes(
                 bottom_fn = (lambda xy: sample_dem(xy)
                              - (overlay_thickness_mm - insert_z_clearance_mm))
             else:
-                pmin = _dem_min_over(part, sample_dem, xs, ys)
+                pmin = _dem_min_over(part, sample_dem, xs, ys, resolution)
                 if pmin is None:
-                    continue
+                    raise ValueError(
+                        "insert part has no top surface; the layout must not emit a "
+                        "degenerate region, and the mesh stage must not drop one")
                 bottom_fn = _flat(
                     max(pmin - (overlay_thickness_mm - insert_z_clearance_mm), 0.01))
-            m = build_region_prism_fast(part, sample_dem, bottom_fn, xs, ys)
+            m = build_region_prism_fast(part, sample_dem, bottom_fn, xs, ys,
+                                        resolution)
             if m is not None and len(m.faces) > 0:
                 bodies.append(m)
         if not bodies:

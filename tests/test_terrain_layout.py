@@ -10,7 +10,7 @@ from mesh_builder import _compute_model_coordinates
 from model_frame import ModelFrame
 from terrain_classifier import (TERRAIN_FOLIAGE, TERRAIN_GLACIER, TERRAIN_ROCK,
                                 TERRAIN_WATER)
-from terrain_layout import InsertFit, build_terrain_layout
+from terrain_layout import InsertFit, build_terrain_layout, densify_on_grid
 
 
 ROWS, COLS = 41, 61
@@ -64,6 +64,91 @@ class TestModelFrame:
     def test_scale_m_per_mm(self):
         frame = _frame(x_size_mm=120.0)
         assert frame.scale_m_per_mm == pytest.approx((COLS - 1) * PX / 120.0)
+
+    def test_grid_lines_are_bit_identical_to_the_mesh_grid(self):
+        """Not approx: boundaries are densified on these and meshed on those.
+
+        A last-bit difference would put a densified vertex a hair off the grid line
+        it was meant to sit on, which is exactly the near-coincidence that snaps
+        into a sliver.
+        """
+        frame = _frame()
+        X, Y, *_ = _compute_model_coordinates(
+            np.zeros((ROWS, COLS)), PX, PX, frame.x_size_mm, max_height_mm=30.0,
+            z_exaggeration=1.0, base_thickness_mm=2.0, use_true_scale=False,
+        )
+        assert np.array_equal(frame.grid_xs, X[0, :])
+        assert np.array_equal(frame.grid_ys, Y[::-1, 0])
+
+
+class TestDensifyOnGrid:
+    """Densification must add vertices without moving the shape."""
+
+    def test_inserts_a_vertex_at_every_crossing(self):
+        xs = np.array([0.0, 1.0, 2.0, 3.0])
+        ys = np.array([0.0, 1.0, 2.0, 3.0])
+        poly = ShapelyPolygon([(0.5, 0.5), (2.5, 0.5), (2.5, 2.5), (0.5, 2.5)])
+        dense = densify_on_grid(poly, xs, ys)
+
+        assert dense.equals(poly), "densifying must not change the shape"
+        assert dense.area == poly.area
+        # 4 corners + 2 crossings per side (the x=1,2 / y=1,2 lines).
+        assert len(dense.exterior.coords) - 1 == 12
+
+    def test_diagonal_edge_crosses_both_families(self):
+        xs = np.array([0.0, 1.0, 2.0])
+        ys = np.array([0.0, 1.0, 2.0])
+        poly = ShapelyPolygon([(0.0, 0.0), (2.0, 2.0), (0.0, 2.0)])
+        dense = densify_on_grid(poly, xs, ys)
+        assert dense.equals(poly)
+        # The diagonal meets x=1 and y=1 at the same point -- one vertex, not two.
+        assert (1.0, 1.0) in list(dense.exterior.coords)
+
+    def test_holes_are_densified_too(self):
+        xs = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
+        ys = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
+        poly = ShapelyPolygon([(0.5, 0.5), (3.5, 0.5), (3.5, 3.5), (0.5, 3.5)],
+                              [[(1.5, 1.5), (1.5, 2.5), (2.5, 2.5), (2.5, 1.5)]])
+        dense = densify_on_grid(poly, xs, ys)
+        assert dense.equals(poly)
+        assert len(dense.interiors[0].coords) > len(poly.interiors[0].coords)
+
+    def test_shared_seam_densifies_identically_from_either_side(self):
+        """Two regions meeting on one edge must not diverge along it."""
+        xs = np.array([0.0, 1.0, 2.0, 3.0])
+        ys = np.array([0.0, 1.0, 2.0, 3.0])
+        left = ShapelyPolygon([(0.0, 0.2), (1.5, 0.2), (1.5, 2.8), (0.0, 2.8)])
+        right = ShapelyPolygon([(1.5, 0.2), (3.0, 0.2), (3.0, 2.8), (1.5, 2.8)])
+        dl = densify_on_grid(left, xs, ys)
+        dr = densify_on_grid(right, xs, ys)
+
+        # As a set: the rings run along the seam in opposite directions, and one of
+        # them closes on it, so the coordinate LISTS legitimately differ.
+        seam_l = {c for c in dl.exterior.coords if c[0] == 1.5}
+        seam_r = {c for c in dr.exterior.coords if c[0] == 1.5}
+        assert seam_l == seam_r
+        assert (1.5, 1.0) in seam_l and (1.5, 2.0) in seam_l
+
+    def test_slanted_shared_seam_is_bit_identical_from_either_side(self):
+        """The general case: no axis-aligned luck, and equality to the last bit.
+
+        A seam whose two copies differ by an ULP is the hairline cell the base
+        solid drapes to full DEM height as a razor fin, so approx is not enough.
+        """
+        xs = np.linspace(0.0, 3.0, 7)
+        ys = np.linspace(0.0, 3.0, 5)
+        a, b = (0.3, 0.4), (2.7, 2.6)
+        left = ShapelyPolygon([a, b, (0.0, 3.0)])
+        right = ShapelyPolygon([b, a, (3.0, 0.0)])     # same seam, walked backwards
+
+        cl = np.asarray(densify_on_grid(left, xs, ys).exterior.coords)
+        cr = np.asarray(densify_on_grid(right, xs, ys).exterior.coords)
+        seam_l = cl[:np.flatnonzero((cl == b).all(axis=1))[0] + 1]
+        i = np.flatnonzero((cr == a).all(axis=1))[0]
+        seam_r = cr[:i + 1][::-1]
+
+        assert len(seam_l) > 2, "the seam should have picked up crossings"
+        assert np.array_equal(seam_l, seam_r)
 
 
 class TestBuildTerrainLayout:

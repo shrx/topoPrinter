@@ -78,10 +78,22 @@ class InsertFit:
 class TerrainLayout:
     """The finished 2D geometry of one print, in model mm.
 
+    Every xy coordinate the print will ever have is fixed here. The mesh stage may
+    only give each of these vertices a z and raise walls between them: it must not
+    move, add, merge or drop a boundary vertex, and it must not drop a region. So
+    the boundaries arrive already densified on the DEM grid lines, already noded
+    and snapped into one arrangement, already quantized to the export's float32
+    resolution, and already free of degenerate pieces.
+
     ``pockets`` is ORDERED: where two pockets overlap (a convex corner-relief disc
     can bulge across a neighbouring layer), the base solid resolves the overlap by
     the first pocket whose region holds the triangle centroid, so this order is
     the precedence and must not be rearranged.
+
+    ``noded_boundaries`` is the constraint set the base plate is triangulated
+    against -- the outline and every pocket boundary as one snapped arrangement.
+    It is built here, from exactly the pockets in ``pockets``, so the constraint
+    edges and the draped regions can never describe different sets.
     """
 
     base_class: int
@@ -89,6 +101,7 @@ class TerrainLayout:
     base_outline: ShapelyPolygon
     pockets: List[Tuple[int, Union[ShapelyPolygon, MultiPolygon]]] = field(default_factory=list)
     insert_parts: Dict[int, List[ShapelyPolygon]] = field(default_factory=dict)
+    noded_boundaries: object = None
 
     @property
     def base_name(self) -> str:
@@ -335,6 +348,78 @@ def _quantize_to_f32(polygon_mm, output_resolution):
     return shapely.set_precision(quantized, 0.0)
 
 
+def densify_on_grid(geom, xs, ys):
+    """Insert a boundary vertex wherever a segment crosses a DEM grid line.
+
+    Pure vertex insertion: every ring passes through exactly the points it did
+    before, so the footprint is the same shape and the same area. What changes is
+    how well the mesh stage can follow the terrain along that boundary.
+
+    It has to happen here because the 2D stage owns every xy coordinate. The mesh
+    stage reads a z for each boundary vertex and interpolates linearly between
+    them, so a boundary edge spanning several cells becomes one chord riding over
+    whatever the DEM does in between -- even though the DEM's bilinear interpolant
+    already defines that profile exactly. Splitting at the crossings puts the
+    breaks where the interpolant's own breaks are, and matches the interior, whose
+    every grid node is already a vertex.
+
+    Two rings sharing a seam traverse it in OPPOSITE directions, so the crossings
+    must not depend on which way the segment is walked: ``y0 + t * (y1 - y0)`` and
+    ``y1 + (1 - t) * (y0 - y1)`` differ in the last bits, and a seam whose two
+    copies sit an ULP apart is precisely the hairline cell the base solid drapes to
+    full DEM height as a razor fin. Each segment is therefore oriented canonically
+    (lexicographically smaller endpoint first) before its crossings are computed,
+    and the crossed coordinate is taken as the grid value itself rather than
+    interpolated, so a crossing sits exactly on its grid line.
+    """
+    def ring(coords):
+        c = np.asarray(coords, float)
+        out = []
+        for k in range(len(c) - 1):
+            p0, p1 = c[k], c[k + 1]
+            flip = (p1[0], p1[1]) < (p0[0], p0[1])
+            (x0, y0), (x1, y1) = (p1, p0) if flip else (p0, p1)
+            cx = np.empty(0)
+            cy = np.empty(0)
+            if x1 != x0:
+                lo, hi = (x0, x1) if x0 < x1 else (x1, x0)
+                gx = xs[(xs > lo) & (xs < hi)]
+                cx = np.concatenate((cx, gx))
+                cy = np.concatenate((cy, y0 + (gx - x0) / (x1 - x0) * (y1 - y0)))
+            if y1 != y0:
+                lo, hi = (y0, y1) if y0 < y1 else (y1, y0)
+                gy = ys[(ys > lo) & (ys < hi)]
+                cx = np.concatenate((cx, x0 + (gy - y0) / (y1 - y0) * (x1 - x0)))
+                cy = np.concatenate((cy, gy))
+            if len(cx):
+                # Order along the canonical direction, then drop the duplicate a
+                # segment through a grid NODE produces (it crosses one line of each
+                # family at the same point).
+                d = (cx - x0) * (x1 - x0) + (cy - y0) * (y1 - y0)
+                o = np.argsort(d, kind="stable")
+                pts = np.column_stack((cx[o], cy[o]))
+                keep = np.ones(len(pts), bool)
+                keep[1:] = np.any(pts[1:] != pts[:-1], axis=1)
+                pts = pts[keep]
+                if flip:
+                    pts = pts[::-1]
+            else:
+                pts = np.empty((0, 2))
+            out.append(np.vstack((p0[None, :], pts)))
+        out.append(c[-1:])
+        return np.vstack(out)
+
+    def one(p):
+        return ShapelyPolygon(ring(p.exterior.coords),
+                              [ring(h.coords) for h in p.interiors])
+
+    if geom is None or geom.is_empty:
+        return geom
+    if geom.geom_type == "MultiPolygon":
+        return MultiPolygon([one(p) for p in geom.geoms])
+    return one(geom)
+
+
 def node_and_snap(base_outline, pockets, output_resolution):
     """Node the base outline + pocket boundaries into ONE snapped arrangement.
 
@@ -522,7 +607,11 @@ def build_terrain_layout(
 
     # Downsample polygons to the float32 STL output resolution before 2D->3D.
     output_resolution = frame.output_resolution
+    grid_xs, grid_ys = frame.grid_xs, frame.grid_ys
     base_outline = outline if outline is not None else dem_extent
+    # Densify BEFORE quantizing, so the f32 snap absorbs any inserted vertex that
+    # lands within a ULP of a corner instead of leaving a sub-resolution sliver.
+    base_outline = densify_on_grid(base_outline, grid_xs, grid_ys)
     # The pockets cut from this outline are snapped to the f32 output grid (as one
     # arrangement, in node_and_snap); the outline they share their rim edge with must
     # live on the same grid, or the rim exists in two near-coincident copies and the
@@ -561,8 +650,10 @@ def build_terrain_layout(
             pocket_component = (unary_union([insert_src, pocket_extra])
                                 if pocket_extra is not None else insert_src)
             pocket_poly = _clip_to_footprint(pocket_component, base_outline)
-            if pocket_poly is not None:
-                pockets.append((tc, pocket_poly))
+            if pocket_poly is not None and pocket_poly.area > 0:
+                # Corner-relief arcs and the inset are new curves, not clipped from
+                # anything already densified, so they need their own crossings.
+                pockets.append((tc, densify_on_grid(pocket_poly, grid_xs, grid_ys)))
 
             # Printed insert footprint: inset by the clearance + reflex corner relief.
             if fit.xy_clearance_mm > 0 or insert_cut is not None:
@@ -575,10 +666,14 @@ def build_terrain_layout(
                         continue
             else:
                 insert_poly = insert_src
+            insert_poly = densify_on_grid(insert_poly, grid_xs, grid_ys)
             insert_poly = _quantize_to_f32(insert_poly, output_resolution)
             if insert_poly is None:
                 continue
-            insert_parts[tc].extend(iter_polygon_components(insert_poly))
+            # A part with no area yields no triangles and would be silently skipped
+            # downstream -- i.e. the mesh stage dropping a region. Drop it here.
+            insert_parts[tc].extend(p for p in iter_polygon_components(insert_poly)
+                                    if p.area > 0)
 
     return TerrainLayout(
         base_class=base_class,
@@ -586,4 +681,6 @@ def build_terrain_layout(
         base_outline=base_outline,
         pockets=pockets,
         insert_parts=insert_parts,
+        noded_boundaries=node_and_snap(base_outline, [pk for _tc, pk in pockets],
+                                       output_resolution),
     )

@@ -66,6 +66,25 @@ class ModelFrame:
         return self.x_size_mm / max(self.cols - 1, 1)
 
     @property
+    def grid_xs(self) -> np.ndarray:
+        """Model-space X of each DEM column, ascending.
+
+        Bit-identical to the X meshgrid ``_compute_model_coordinates`` builds, so a
+        boundary densified against this lands exactly on the mesh stage's grid lines.
+        """
+        return np.linspace(0.0, self.x_size_mm, self.cols)
+
+    @property
+    def grid_ys(self) -> np.ndarray:
+        """Model-space Y of each DEM row, ascending.
+
+        Row 0 of the DEM is the TOP row, so the mesh stage builds Y descending; this
+        reverses that array rather than re-running ``linspace`` the other way round,
+        because the two are not bit-identical in the interior.
+        """
+        return np.linspace(self.model_y_mm, 0.0, self.rows)[::-1]
+
+    @property
     def output_resolution(self) -> np.float32:
         """The float32 ULP at the model's largest coordinate.
 
