@@ -3,6 +3,7 @@ rasterio
 requests
 GDAL
 pyproj
+shapely
 trimesh
 manifold3d
 rtree
