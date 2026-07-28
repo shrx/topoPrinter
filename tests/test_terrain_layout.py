@@ -9,8 +9,8 @@ from shapely.geometry import Polygon as ShapelyPolygon, box, mapping
 from bearing_utils import rotate_from_bearing_frame
 from mesh_builder import _compute_model_coordinates
 from model_frame import ModelFrame
-from terrain_classifier import (TERRAIN_FOLIAGE, TERRAIN_GLACIER, TERRAIN_ROCK,
-                                TERRAIN_WATER)
+from masks import (TERRAIN_FOLIAGE, TERRAIN_GLACIER, TERRAIN_ROCK,
+                   TERRAIN_WATER)
 from terrain_layout import (InsertFit, build_terrain_layout, densify_on_grid,
                             rect_extent_m)
 

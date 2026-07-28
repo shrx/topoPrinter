@@ -41,8 +41,8 @@ from shapely.ops import unary_union
 
 from bearing_utils import rotate_from_bearing_frame, rotate_to_bearing_frame
 from model_frame import ModelFrame
-from terrain_classifier import (TERRAIN_NAMES, TERRAIN_PRECEDENCE, TERRAIN_ROCK,
-                                overlay_precedence)
+from masks import (TERRAIN_NAMES, TERRAIN_PRECEDENCE, TERRAIN_ROCK,
+                   overlay_precedence)
 from terrain_compose import (MIN_BLOB_MM, MIN_THICKNESS_MM, fretted_bit_moves,
                              resolve_layers)
 

@@ -1210,7 +1210,7 @@ def build_terrain_meshes(
     Returns:
         dict mapping terrain name to (vertices, faces, max_z) or None.
     """
-    from terrain_classifier import TERRAIN_NAMES
+    from masks import TERRAIN_NAMES
 
     # Model coordinates + surface heights. The horizontal half of this duplicates
     # `frame`; the Z half (exaggeration, base thickness, true scale) is what is

@@ -1,4 +1,4 @@
-"""Tests for terrain_classifier module."""
+"""Tests for the masks.osm provider module."""
 
 from unittest.mock import patch, MagicMock
 
@@ -6,11 +6,13 @@ import numpy as np
 import pytest
 from rasterio.transform import from_bounds
 
-from terrain_classifier import (
+from masks import (
     TERRAIN_ROCK,
     TERRAIN_GLACIER,
     TERRAIN_WATER,
     TERRAIN_FOLIAGE,
+)
+from masks.osm import (
     _classify_element,
     _build_overpass_query,
     _way_to_geojson,
@@ -196,7 +198,7 @@ class TestClassifyTerrain:
             ]
         }
 
-    @patch("terrain_classifier.requests.post")
+    @patch("masks.osm.requests.post")
     def test_classify_terrain_basic(self, mock_post):
         """Test that classification produces a valid array with correct shape."""
         mock_resp = MagicMock()
@@ -216,8 +218,8 @@ class TestClassifyTerrain:
         assert TERRAIN_WATER in class_geoms
         assert TERRAIN_FOLIAGE in class_geoms
 
-    @patch("terrain_classifier.time.sleep")  # skip retry delays
-    @patch("terrain_classifier.requests.post")
+    @patch("masks.osm.time.sleep")  # skip retry delays
+    @patch("masks.osm.requests.post")
     def test_classify_terrain_api_failure_returns_all_rock(self, mock_post, mock_sleep):
         """On API failure, should return all-rock classification."""
         mock_post.side_effect = Exception("Network error")
@@ -229,7 +231,7 @@ class TestClassifyTerrain:
 
         assert all(len(v) == 0 for v in class_geoms.values())
 
-    @patch("terrain_classifier.requests.post")
+    @patch("masks.osm.requests.post")
     def test_classify_terrain_empty_response(self, mock_post):
         """Empty Overpass response should return all rock."""
         mock_resp = MagicMock()

@@ -24,22 +24,13 @@ All geometry is in the cutout CRS (metres).
 from shapely.geometry import Polygon
 from shapely.ops import unary_union
 
-from snow_overlay import (despeckle, apcsf_clean, load_geojson_layer,
-                          MIN_FEATURE_M2, SCALE_M_PER_MM)
-from terrain_classifier import (TERRAIN_PRECEDENCE, TERRAIN_GLACIER,
-                                TERRAIN_FOLIAGE, TERRAIN_ROCK)
+from masks import (TERRAIN_PRECEDENCE, TERRAIN_GLACIER, TERRAIN_FOLIAGE,
+                   TERRAIN_ROCK)
+from masks.sentinel2 import despeckle, SCALE_M_PER_MM
 
-VEG_ITERS = 100         # foliage APCSF iterations (sub-1mm base slivers <1% at RESAMPLE_M=15)
 # Printable-feature rules, by feature shape (at 1:133k, 0.4 mm nozzle):
 MIN_THICKNESS_MM = 1.0  # ELONGATED features must be >= this wide (thin ridges/slivers)
 MIN_BLOB_MM = 2.0       # COMPACT features must be >= this across (small islands)
-
-
-def load_and_clean_veg(geojson_path, iterations=VEG_ITERS,
-                       min_feature_m2=MIN_FEATURE_M2):
-    """Load a satellite foliage polygon and clean it (despeckle + APCSF)."""
-    geom, src_epsg = load_geojson_layer(geojson_path)
-    return apcsf_clean(geom, iterations, min_feature_m2=min_feature_m2), src_epsg
 
 
 def open_min_width(geom, min_width_m):

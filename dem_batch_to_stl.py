@@ -387,54 +387,44 @@ def main(argv: Iterable[str]) -> int:
         if cutout_w_m:
             x_size_model = args.x_size_mm * terrain_w_m / cutout_w_m
 
-        # True print scale (real terrain metres per printed mm), after cropping and
-        # the cutout pin. Feature-size rules are defined in mm, so the satellite-layer
-        # cleaning must use THIS scale rather than snow_overlay's nominal constant.
-        scale_m_per_mm = terrain_w_m / x_size_model
-
         # Terrain classification / composition
         class_geometries = None
         base_class = None
         terrain_type_list = None
+        frame = None
         if args.terrain or args.invert_base:
-            from terrain_classifier import (TERRAIN_GLACIER, TERRAIN_FOLIAGE,
-                                            TERRAIN_ROCK)
-            from snow_overlay import (load_and_clean_snow, snow_to_ref_geoms,
-                                      despeckle_area_m2)
+            from masks import TERRAIN_FOLIAGE, TERRAIN_ROCK, merge_masks
+            from model_frame import ModelFrame
+            from terrain_layout import frame_with_print_motion
+
+            frame = ModelFrame.from_dem(dem.shape, px_size_x, px_size_y,
+                                        x_size_model, ref_transform, ref_crs)
+            # The grid -> print motion, so the 2D stage emits the coordinates the STL
+            # will carry and its float32 snap is the last thing to touch them.
+            frame = frame_with_print_motion(frame, cutout)
+
             terrain_type_list = args.terrain_types.split(",") if args.terrain_types else None
-            class_geometries = {}
 
             # Masks come from whichever data sources are given, independent of the
-            # bottom-layer mapping.
+            # bottom-layer mapping. Providers clean in CRS metres, applying mm
+            # feature-size rules at the frame's true print scale.
+            providers = []
             if args.terrain:
-                from terrain_classifier import classify_terrain
+                from masks.osm import OsmMasks
                 if args.lake_range_percent > 0 and args.lake_lowering_mm > 0:
                     print("[WARN] --terrain ignores --lake-range-percent / "
                           "--lake-lowering-mm (OSM water is used instead).", flush=True)
-                print("[INFO] Classifying terrain from OSM data...", flush=True)
-                class_geometries = classify_terrain(dem.shape, ref_transform, ref_crs)
-
+                providers.append(OsmMasks())
             if args.snow_geojson:
-                snow_min_feature_m2 = (args.snow_min_feature_m2
-                                       if args.snow_min_feature_m2 is not None
-                                       else despeckle_area_m2(scale_m_per_mm))
-                snow_geom, snow_epsg = load_and_clean_snow(
+                from masks.sentinel2 import SnowMasks
+                providers.append(SnowMasks(
                     args.snow_geojson, iterations=args.snow_iterations,
-                    dt=args.snow_dt, min_feature_m2=snow_min_feature_m2)
-                class_geometries.setdefault(TERRAIN_GLACIER, []).extend(
-                    snow_to_ref_geoms(snow_geom, snow_epsg, ref_crs))
-                print(f"[INFO] snow -> glacier: {snow_geom.area / 1e6:.1f} km^2",
-                      flush=True)
-
+                    dt=args.snow_dt, min_feature_m2=args.snow_min_feature_m2))
             if args.foliage_geojson:
-                from terrain_compose import load_and_clean_veg
-                fol_geom, fol_epsg = load_and_clean_veg(
-                    args.foliage_geojson, iterations=args.foliage_iterations,
-                    min_feature_m2=despeckle_area_m2(scale_m_per_mm))
-                class_geometries.setdefault(TERRAIN_FOLIAGE, []).extend(
-                    snow_to_ref_geoms(fol_geom, fol_epsg, ref_crs))
-                print(f"[INFO] foliage -> foliage: {fol_geom.area / 1e6:.1f} km^2",
-                      flush=True)
+                from masks.sentinel2 import FoliageMasks
+                providers.append(FoliageMasks(
+                    args.foliage_geojson, iterations=args.foliage_iterations))
+            class_geometries = merge_masks(frame, providers)
 
             # The only thing --invert-base changes: which terrain type is the bottom.
             base_class = TERRAIN_FOLIAGE if args.invert_base else TERRAIN_ROCK
@@ -450,15 +440,8 @@ def main(argv: Iterable[str]) -> int:
             base_name = f"{base_name}_mosaic"
 
         if (args.terrain or args.invert_base) and class_geometries is not None:
-            from model_frame import ModelFrame
             from terrain_layout import (InsertFit, build_terrain_layout,
-                                        cutout_footprint, frame_with_print_motion)
-
-            frame = ModelFrame.from_dem(dem.shape, px_size_x, px_size_y,
-                                        x_size_model, ref_transform, ref_crs)
-            # The grid -> print motion, so the 2D stage emits the coordinates the STL
-            # will carry and its float32 snap is the last thing to touch them.
-            frame = frame_with_print_motion(frame, cutout)
+                                        cutout_footprint)
 
             # Stage 1: masks -> final 2D polygons (no elevations involved).
             layout = build_terrain_layout(
@@ -492,7 +475,7 @@ def main(argv: Iterable[str]) -> int:
                 save_stl(verts, fcs, stl_path)
 
             rows, cols = dem.shape
-            from terrain_classifier import TERRAIN_NAMES as _TN
+            from masks import TERRAIN_NAMES as _TN
             base_name_out = _TN[base_class] if base_class is not None else "rock"
             base_data = terrain_meshes[base_name_out]
             # Report the actual printed bounding box (the base plate = the cutout,
