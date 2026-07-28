@@ -112,16 +112,16 @@ class TerrainLayout:
 # Cutout
 # --------------------------------------------------------------------------
 
-def rect_crs_corners(frame: ModelFrame, spec: CutoutSpec):
+def rect_crs_corners(ref_crs, spec: CutoutSpec):
     """The rectangular cutout's two opposite corners in CRS coords, or Nones.
 
-    Used by the mesh builder's post-build vertex transform; pure geodesy, so it
-    lives with the cutout rather than with the meshing.
+    Pure geodesy in the DEM's CRS -- it needs no model scale, which is what lets the
+    caller size the model FROM the rectangle (see ``rect_extent_m``) instead of the
+    other way round.
     """
-    if (spec is None or spec.cutout_type != "rectangular"
-            or not frame.ref_transform or not frame.ref_crs):
+    if spec is None or spec.cutout_type != "rectangular" or not ref_crs:
         return None, None, None, None
-    transformer = Transformer.from_crs("EPSG:4326", frame.ref_crs, always_xy=True)
+    transformer = Transformer.from_crs("EPSG:4326", ref_crs, always_xy=True)
     bearing_rad = np.radians(spec.bearing)
     if spec.rect_corner1_lat is not None:
         c1_x, c1_y = transformer.transform(spec.rect_corner1_lon, spec.rect_corner1_lat)
@@ -134,6 +134,26 @@ def rect_crs_corners(frame: ModelFrame, spec: CutoutSpec):
         de2, dn2 = rotate_from_bearing_frame(half, half, bearing_rad)
         c2_x, c2_y = cx + de2, cy + dn2
     return c1_x, c1_y, c2_x, c2_y
+
+
+def rect_extent_m(ref_crs, spec: CutoutSpec):
+    """The rectangular cutout's (width, height) in metres, or (None, None).
+
+    Width runs perpendicular to the bearing (the AB edge, the one ``--x-size-mm``
+    sizes) and height along it. The corners arrive as a diagonal, so the bearing
+    frame is what separates the two edges.
+
+    This is smaller than the cropped raster: ``crop_to_cutout`` bounds the rectangle
+    with a CRS-axis-aligned box rounded out to whole pixels, and a rotated rectangle
+    needs a wider box still. The caller pins the model scale to THIS length so the
+    printed rectangle is exactly ``--x-size-mm`` wide.
+    """
+    c1_x, c1_y, c2_x, c2_y = rect_crs_corners(ref_crs, spec)
+    if c1_x is None:
+        return None, None
+    width_m, height_m = rotate_to_bearing_frame(c2_x - c1_x, c2_y - c1_y,
+                                                np.radians(spec.bearing))
+    return abs(width_m), abs(height_m)
 
 
 def cutout_footprint(frame: ModelFrame,
@@ -168,17 +188,15 @@ def cutout_footprint(frame: ModelFrame,
 
     if spec.cutout_type == "rectangular":
         bearing_rad = np.radians(spec.bearing)
-        c1_x, c1_y, c2_x, c2_y = rect_crs_corners(frame, spec)
+        c1_x, c1_y, c2_x, c2_y = rect_crs_corners(frame.ref_crs, spec)
+        width_m, height_m = rect_extent_m(frame.ref_crs, spec)
 
-        AB_length_m, AD_length_m = rotate_to_bearing_frame(c2_x - c1_x, c2_y - c1_y,
-                                                           bearing_rad)
-        AB_length_m = abs(AB_length_m)
-        AD_length_m = abs(AD_length_m)
-
-        terrain_width_m = abs(frame.ref_transform.a) * (cols - 1)
+        # Same scale as the circular branch above. The caller has pinned x_size_mm to
+        # the cutout, so this is the final print scale.
+        terrain_width_m = (cols - 1) * frame.px_size_x
         dem_scale = frame.x_size_mm / terrain_width_m
-        half_w = AB_length_m * dem_scale / 2.0
-        half_h = AD_length_m * dem_scale / 2.0
+        half_w = width_m * dem_scale / 2.0
+        half_h = height_m * dem_scale / 2.0
 
         center_x_mm, center_y_mm = frame.point_to_mm((c1_x + c2_x) / 2.0,
                                                      (c1_y + c2_y) / 2.0)

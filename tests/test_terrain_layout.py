@@ -6,11 +6,13 @@ import shapely
 from rasterio.transform import from_origin
 from shapely.geometry import Polygon as ShapelyPolygon, box, mapping
 
+from bearing_utils import rotate_from_bearing_frame
 from mesh_builder import _compute_model_coordinates
 from model_frame import ModelFrame
 from terrain_classifier import (TERRAIN_FOLIAGE, TERRAIN_GLACIER, TERRAIN_ROCK,
                                 TERRAIN_WATER)
-from terrain_layout import InsertFit, build_terrain_layout, densify_on_grid
+from terrain_layout import (InsertFit, build_terrain_layout, densify_on_grid,
+                            rect_extent_m)
 
 
 ROWS, COLS = 41, 61
@@ -79,6 +81,48 @@ class TestModelFrame:
         )
         assert np.array_equal(frame.grid_xs, X[0, :])
         assert np.array_equal(frame.grid_ys, Y[::-1, 0])
+
+
+class TestRectExtent:
+    """The rectangle's own edge lengths, which is what --x-size-mm sizes.
+
+    They are NOT the cropped raster's width: ``crop_to_cutout`` bounds the rectangle
+    with a CRS-axis-aligned box rounded out to whole pixels, and a rotated rectangle
+    needs a wider box still. Sizing the model from the raster instead of from these is
+    what used to force a post-mesh rescale.
+    """
+
+    # A 400 m x 300 m rectangle at the equator on the prime meridian, so the WGS84
+    # -> Web Mercator conversion the function performs is not itself under test:
+    # only the diagonal -> (width, height) decomposition is.
+    def _spec(self, bearing=0.0):
+        from pyproj import Transformer
+        from terrain_layout import CutoutSpec
+        to_wgs = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+        half_w, half_h = 200.0, 150.0
+        b = np.radians(bearing)
+        # Corner offsets in the bearing frame -> CRS, so the spec's two corners are a
+        # genuine diagonal of the rotated rectangle.
+        de, dn = rotate_from_bearing_frame(-half_w, -half_h, b)
+        lon1, lat1 = to_wgs.transform(de, dn)
+        de, dn = rotate_from_bearing_frame(half_w, half_h, b)
+        lon2, lat2 = to_wgs.transform(de, dn)
+        return CutoutSpec(cutout_type="rectangular", bearing=bearing,
+                          rect_corner1_lat=lat1, rect_corner1_lon=lon1,
+                          rect_corner2_lat=lat2, rect_corner2_lon=lon2)
+
+    @pytest.mark.parametrize("bearing", [0.0, 30.0, 90.0, 217.0])
+    def test_separates_the_two_edges_at_any_bearing(self, bearing):
+        w, h = rect_extent_m("EPSG:3857", self._spec(bearing))
+        assert w == pytest.approx(400.0)
+        assert h == pytest.approx(300.0)
+
+    def test_is_none_for_a_circular_cutout(self):
+        """Only the rectangular branch has a diagonal to decompose."""
+        from terrain_layout import CutoutSpec
+        spec = CutoutSpec(cutout_type="circular", center_lat=0.0, center_lon=0.0,
+                          radius_m=100.0)
+        assert rect_extent_m("EPSG:3857", spec) == (None, None)
 
 
 class TestDensifyOnGrid:

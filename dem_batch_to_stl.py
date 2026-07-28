@@ -345,6 +345,8 @@ def main(argv: Iterable[str]) -> int:
             z_exaggeration = args.z_exaggeration if args.z_exaggeration is not None else 1.0
 
         # Prepare cutout parameters for mesh builder
+        from terrain_layout import CutoutSpec, rect_extent_m
+
         cutout_type_for_mesh = None
         cutout_radius_m = None
         if args.rect_corners:
@@ -353,15 +355,37 @@ def main(argv: Iterable[str]) -> int:
             cutout_type_for_mesh = "circular" if args.diameter else "rectangular"
             if args.diameter:
                 cutout_radius_m = (args.diameter / 2.0) * 1000.0  # Convert km to m
+        cutout = CutoutSpec(
+            cutout_type=cutout_type_for_mesh,
+            center_lat=center_lat,
+            center_lon=center_lon,
+            radius_m=cutout_radius_m,
+            side_length_km=args.side_length,
+            n_gon_sides=args.ngon_sides,
+            bearing=args.bearing,
+            rect_corner1_lat=rect_lat1,
+            rect_corner1_lon=rect_lon1,
+            rect_corner2_lat=rect_lat2,
+            rect_corner2_lon=rect_lon2,
+        )
 
         # Pin the model scale to the cutout so the printed cutout is exactly
-        # --x-size-mm, independent of how crop_to_cutout rounded to whole pixels.
-        # (Circular: the printed diameter == x_size_mm. The mesh derives its scale
-        # from the raster width, so scale x_size up by raster_width/diameter.)
+        # --x-size-mm, independent of how crop_to_cutout rounded to whole pixels (and,
+        # for a rotated rectangle, of how much wider its axis-aligned crop box is).
+        # The mesh derives its scale from the raster width, so scale x_size up by
+        # raster_width / cutout_width: printed diameter (circular) or printed AB edge
+        # (rectangular) == x_size_mm. Without this the model is built at one scale and
+        # would have to be rescaled after meshing, which is what used to happen for
+        # rectangles -- and it rescaled xy only, leaving true-scale relief understated.
         x_size_model = args.x_size_mm
         terrain_w_m = (dem.shape[1] - 1) * px_size_x
+        cutout_w_m = None
         if args.diameter:
-            x_size_model = args.x_size_mm * terrain_w_m / (args.diameter * 1000.0)
+            cutout_w_m = args.diameter * 1000.0
+        elif cutout_type_for_mesh == "rectangular":
+            cutout_w_m, _ = rect_extent_m(ref_crs, cutout)
+        if cutout_w_m:
+            x_size_model = args.x_size_mm * terrain_w_m / cutout_w_m
 
         # True print scale (real terrain metres per printed mm), after cropping and
         # the cutout pin. Feature-size rules are defined in mm, so the satellite-layer
@@ -427,24 +451,10 @@ def main(argv: Iterable[str]) -> int:
 
         if (args.terrain or args.invert_base) and class_geometries is not None:
             from model_frame import ModelFrame
-            from terrain_layout import (CutoutSpec, InsertFit, build_terrain_layout,
-                                        cutout_footprint)
+            from terrain_layout import InsertFit, build_terrain_layout, cutout_footprint
 
             frame = ModelFrame.from_dem(dem.shape, px_size_x, px_size_y,
                                         x_size_model, ref_transform, ref_crs)
-            cutout = CutoutSpec(
-                cutout_type=cutout_type_for_mesh,
-                center_lat=center_lat,
-                center_lon=center_lon,
-                radius_m=cutout_radius_m,
-                side_length_km=args.side_length,
-                n_gon_sides=args.ngon_sides,
-                bearing=args.bearing,
-                rect_corner1_lat=rect_lat1,
-                rect_corner1_lon=rect_lon1,
-                rect_corner2_lat=rect_lat2,
-                rect_corner2_lon=rect_lon2,
-            )
 
             # Stage 1: masks -> final 2D polygons (no elevations involved).
             layout = build_terrain_layout(

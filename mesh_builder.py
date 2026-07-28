@@ -233,19 +233,15 @@ def _build_rect_cutout_mesh(
     AB_length_m = abs(AB_length_m)
     AD_length_m = abs(AD_length_m)
 
-    # DEM mesh scale: mm per CRS meter (grid spans cols-1 pixel spacings,
-    # first to last pixel center)
-    terrain_width_m = abs(ref_transform.a) * (cols - 1)
+    # Model scale: mm per CRS meter (grid spans cols-1 pixel spacings, first to last
+    # pixel center). The caller has pinned x_size_mm to the rectangle, so this single
+    # scale is already the final one -- the rectangle measures the requested print
+    # width here, and nothing rescales the mesh afterwards.
+    terrain_width_m = px_size_x * (cols - 1)
     dem_scale = x_size_mm / terrain_width_m
 
-    # Rectangle dimensions in DEM mesh coordinate space
-    rect_width_mm_dem = AB_length_m * dem_scale
-    rect_height_mm_dem = AD_length_m * dem_scale
-
-    # Final model scale: rectangle width → x_size_mm
-    final_scale = x_size_mm / AB_length_m
-    rect_width_mm_final = x_size_mm
-    rect_height_mm_final = AD_length_m * final_scale
+    rect_width_mm_final = AB_length_m * dem_scale
+    rect_height_mm_final = AD_length_m * dem_scale
 
     # Find center in model mm (exact, no pixel snapping)
     center_x_crs = (c1_x_crs + c2_x_crs) / 2.0
@@ -257,8 +253,8 @@ def _build_rect_cutout_mesh(
     max_terrain_z = float(np.max(z_surface_mm[valid_mask]))
     box_height = max(max_terrain_z * 2, base_thickness_mm * 3)
 
-    half_w = rect_width_mm_dem / 2.0
-    half_h = rect_height_mm_dem / 2.0
+    half_w = rect_width_mm_final / 2.0
+    half_h = rect_height_mm_final / 2.0
 
     box_verts = [
         [-half_w, -half_h, 0], [half_w, -half_h, 0], [half_w, half_h, 0], [-half_w, half_h, 0],
@@ -295,11 +291,6 @@ def _build_rect_cutout_mesh(
     dx = verts[:, 0] - center_x_mm
     dy = verts[:, 1] - center_y_mm
     local_perp, local_along = rotate_to_bearing_frame(dx, dy, bearing_rad)
-
-    # Rescale from DEM mesh scale to final model scale
-    scale_factor = final_scale / dem_scale
-    local_perp *= scale_factor
-    local_along *= scale_factor
 
     # Translate to origin (center at half-width, half-height)
     verts[:, 0] = local_perp + rect_width_mm_final / 2.0
@@ -630,10 +621,13 @@ def _apply_rect_cutout_transform(
     c2_x_crs: float,
     c2_y_crs: float,
 ) -> np.ndarray:
-    """Apply the rectangular cutout rescale and bearing un-rotation to vertices.
+    """Turn the rectangle onto the print axes and move its corner to the origin.
 
-    Transforms vertices from DEM mesh space to final model space
-    (same transform as _build_rect_cutout_mesh post-processing).
+    Rigid motion only. The model is already at the right SCALE: the caller pins
+    ``x_size_mm`` so the raster maps to ``raster_width / rect_width`` times the
+    requested print width, which makes the rectangle itself come out exactly as
+    requested. Rescaling here as well would apply that factor twice -- and because it
+    can only reach xy, it would leave true-scale relief understated by the same ratio.
     """
     rows, cols = dem_shape
     bearing_rad = np.radians(bearing)
@@ -644,12 +638,11 @@ def _apply_rect_cutout_transform(
     AB_length_m = abs(AB_length_m)
     AD_length_m = abs(AD_length_m)
 
-    terrain_width_m = abs(ref_transform.a) * (cols - 1)
+    terrain_width_m = px_size_x * (cols - 1)
     dem_scale = x_size_mm / terrain_width_m
-    final_scale = x_size_mm / AB_length_m
 
-    rect_width_mm_final = x_size_mm
-    rect_height_mm_final = AD_length_m * final_scale
+    rect_width_mm_final = AB_length_m * dem_scale
+    rect_height_mm_final = AD_length_m * dem_scale
 
     center_x_crs = (c1_x_crs + c2_x_crs) / 2.0
     center_y_crs = (c1_y_crs + c2_y_crs) / 2.0
@@ -661,10 +654,6 @@ def _apply_rect_cutout_transform(
     dx = result[:, 0] - center_x_mm
     dy = result[:, 1] - center_y_mm
     local_perp, local_along = rotate_to_bearing_frame(dx, dy, bearing_rad)
-
-    scale_factor = final_scale / dem_scale
-    local_perp *= scale_factor
-    local_along *= scale_factor
 
     result[:, 0] = local_perp + rect_width_mm_final / 2.0
     result[:, 1] = local_along + rect_height_mm_final / 2.0
@@ -1265,7 +1254,7 @@ def build_terrain_meshes(
         use_true_scale=use_true_scale,
     )
 
-    c1_x_crs, c1_y_crs, c2_x_crs, c2_y_crs = rect_crs_corners(frame, cutout)
+    c1_x_crs, c1_y_crs, c2_x_crs, c2_y_crs = rect_crs_corners(frame.ref_crs, cutout)
     bearing = cutout.bearing if cutout is not None else 0.0
 
     # 2D-first setup: ascending model grid + a bilinear DEM sampler (model mm ==
