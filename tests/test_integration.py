@@ -6,6 +6,7 @@ import shutil
 from dem_processing import load_and_merge
 from downloader import download_dem
 from mesh_builder import dem_to_vertices_and_faces, save_stl
+from sources import prepare_dem_files
 
 # Path to test fixtures
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
@@ -29,7 +30,8 @@ def test_slovenian_asc_loads() -> None:
     """Test that Slovenian ASC file loads and processes."""
     assert os.path.exists(SLOVENIA_TEST_FILE), "Slovenian test fixture missing"
 
-    dem, px_size_x, px_size_y, _, _ = load_and_merge([SLOVENIA_TEST_FILE], downsample=1)
+    prepared = prepare_dem_files([SLOVENIA_TEST_FILE])
+    dem, px_size_x, px_size_y, _, _ = load_and_merge(prepared, downsample=1)
 
     assert dem.shape[0] > 0
     assert dem.shape[1] > 0
@@ -75,7 +77,8 @@ def test_slovenian_asc_to_stl() -> None:
     assert os.path.exists(SLOVENIA_TEST_FILE), "Slovenian test fixture missing"
 
     # Use higher downsample for the larger Slovenian file
-    dem, px_size_x, px_size_y, _, _ = load_and_merge([SLOVENIA_TEST_FILE], downsample=8)
+    prepared = prepare_dem_files([SLOVENIA_TEST_FILE])
+    dem, px_size_x, px_size_y, _, _ = load_and_merge(prepared, downsample=8)
 
     vertices, faces, max_z, water_faces = dem_to_vertices_and_faces(
         dem, px_size_x, px_size_y,

@@ -9,10 +9,10 @@ import os
 import sys
 from typing import Iterable, List
 
-from dem_processing import load_and_merge
 from downloader import CACHE_DIR, download_dem, ensure_dir, read_url_list
 import numpy as np
 from mesh_builder import build_terrain_meshes, dem_to_vertices_and_faces, save_stl
+from sources import load_dem, prepare_dem_files
 
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
@@ -302,10 +302,11 @@ def main(argv: Iterable[str]) -> int:
 
     print(f"[INFO] Merging {len(downloaded)} DEM(s)...", flush=True)
     try:
-        dem, px_size_x, px_size_y, ref_crs, ref_transform = load_and_merge(
-            downloaded,
-            args.downsample,
-        )
+        downloaded = prepare_dem_files(downloaded)
+        product = load_dem(downloaded, args.downsample)
+        dem = product.array
+        px_size_x, px_size_y = product.px_size_x, product.px_size_y
+        ref_crs, ref_transform = product.crs, product.transform
         print(
             f"[INFO] Merge complete. DEM shape: {dem.shape[0]} x {dem.shape[1]} "
             f"(downsample={args.downsample}), pixel size (m): {px_size_x:.3f} x {px_size_y:.3f}"

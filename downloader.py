@@ -3,7 +3,6 @@ Helpers for reading URL lists (text, CSV, or Excel) and downloading DEMs with ca
 """
 
 import os
-import shutil
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
@@ -131,47 +130,6 @@ def derive_base_name(url: str, fallback_index: int) -> str:
     return name or f"tile_{fallback_index}"
 
 
-def extract_tandemx_edem_tif(zip_path: str) -> str:
-    """Extract the usable DEM GeoTIFF from a TanDEM-X EDEM zip into the cache.
-
-    TanDEM-X EDEM tiles ship as a zip whose payload is a product directory with
-    two elevation rasters — ellipsoidal WGS84 heights (``_W84.tif``) and
-    geoid/orthometric heights (``_EGM.tif``) — plus auxiliary quality masks
-    under ``EDEM_AUXFILES/``. We pick the EGM raster (metres above sea level)
-    for a physically meaningful relief, falling back to W84, then any GeoTIFF.
-
-    Returns the path to the extracted GeoTIFF (cached, so re-runs skip the work).
-    """
-    with zipfile.ZipFile(zip_path) as zf:
-        tifs = [n for n in zf.namelist() if n.lower().endswith(".tif")]
-        # Prefer the main elevation layers over the auxiliary masks.
-        elevation = [n for n in tifs if "auxfiles" not in n.lower()]
-        pool = elevation or tifs
-        egm = [n for n in pool if n.lower().endswith("_egm.tif")]
-        w84 = [n for n in pool if n.lower().endswith("_w84.tif")]
-        chosen = egm or w84 or pool
-        if not chosen:
-            raise RuntimeError(f"No GeoTIFF found inside archive: {zip_path}")
-        member = chosen[0]
-
-        out_path = os.path.join(CACHE_DIR, os.path.basename(member))
-        if os.path.exists(out_path):
-            return out_path
-
-        # Extract to a temp file and rename on success, mirroring download_dem,
-        # so an interrupted extraction never leaves a truncated cached tif.
-        part_path = out_path + ".part"
-        try:
-            with zf.open(member) as src, open(part_path, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-            os.replace(part_path, out_path)
-        except Exception:
-            if os.path.exists(part_path):
-                os.remove(part_path)
-            raise
-    return out_path
-
-
 def download_dem(url: str, fallback_index: int) -> str:
     """Download DEM file directly to cache."""
     ensure_dir(CACHE_DIR)
@@ -189,8 +147,6 @@ def download_dem(url: str, fallback_index: int) -> str:
     cache_path = os.path.join(CACHE_DIR, file_name)
 
     if os.path.exists(cache_path):
-        if zipfile.is_zipfile(cache_path):
-            return extract_tandemx_edem_tif(cache_path)
         return cache_path
 
     # Download to a temp file and rename on success, so an interrupted
@@ -209,6 +165,4 @@ def download_dem(url: str, fallback_index: int) -> str:
             os.remove(part_path)
         raise RuntimeError(f"Failed to download {url}: {exc}") from exc
 
-    if zipfile.is_zipfile(cache_path):
-        return extract_tandemx_edem_tif(cache_path)
     return cache_path
