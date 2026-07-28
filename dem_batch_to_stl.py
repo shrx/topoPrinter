@@ -451,10 +451,14 @@ def main(argv: Iterable[str]) -> int:
 
         if (args.terrain or args.invert_base) and class_geometries is not None:
             from model_frame import ModelFrame
-            from terrain_layout import InsertFit, build_terrain_layout, cutout_footprint
+            from terrain_layout import (InsertFit, build_terrain_layout,
+                                        cutout_footprint, frame_with_print_motion)
 
             frame = ModelFrame.from_dem(dem.shape, px_size_x, px_size_y,
                                         x_size_model, ref_transform, ref_crs)
+            # The grid -> print motion, so the 2D stage emits the coordinates the STL
+            # will carry and its float32 snap is the last thing to touch them.
+            frame = frame_with_print_motion(frame, cutout)
 
             # Stage 1: masks -> final 2D polygons (no elevations involved).
             layout = build_terrain_layout(
@@ -478,7 +482,6 @@ def main(argv: Iterable[str]) -> int:
                 use_true_scale=use_true_scale,
                 recess_mode=args.terrain_recess_mode,
                 insert_z_clearance_mm=args.insert_z_clearance_mm,
-                cutout=cutout,
             )
             for terrain_name, mesh_data in terrain_meshes.items():
                 if mesh_data is None:

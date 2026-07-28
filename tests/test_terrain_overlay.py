@@ -12,6 +12,8 @@ import shapely
 from shapely.geometry import Polygon as ShapelyPolygon
 from shapely.ops import unary_union
 
+from rasterio.transform import from_origin
+
 from mesh_builder import (
     _assign_pockets,
     _compute_model_coordinates,
@@ -20,21 +22,31 @@ from mesh_builder import (
     _region_top_surface,
     build_region_prism_fast,
 )
+from model_frame import ModelFrame
 from terrain_layout import densify_on_grid
 
 
 def _make_grid(rows=20, cols=20):
-    """A simple DEM plus the ascending model grid the prism builder wants."""
+    """A simple DEM plus the ModelFrame the prism builder works in.
+
+    The frame owns the lattice, so the fixture does not rebuild it from the X/Y
+    meshgrids -- that is the production arrangement, and it is what lets these tests
+    exercise the grid-space mapping rather than a private copy of the grid.
+    """
     dem = np.random.default_rng(42).uniform(100, 200, (rows, cols))
-    X, Y, z_surface_mm, _valid, _lake, model_y_mm = _compute_model_coordinates(
+    frame = ModelFrame.from_dem((rows, cols), 1.0, 1.0, 100.0,
+                                from_origin(0.0, float(rows), 1.0, 1.0), "EPSG:3857")
+    _X, _Y, z_surface_mm, _valid, _lake, _model_y = _compute_model_coordinates(
         dem, px_size_x=1.0, px_size_y=1.0, x_size_mm=100.0,
         max_height_mm=50.0, z_exaggeration=1.0, base_thickness_mm=2.0,
         use_true_scale=False,
     )
-    xs = np.asarray(X[0, :], dtype=float)
-    ys = np.asarray(Y[::-1, 0], dtype=float)
-    sample = _dem_sampler(np.asarray(z_surface_mm[::-1, :], dtype=float), xs, ys)
-    return sample, xs, ys, model_y_mm
+    sample = _dem_sampler(np.asarray(z_surface_mm[::-1, :], dtype=float), frame)
+    return sample, frame
+
+
+def _grid(frame):
+    return frame.grid_xs, frame.grid_ys
 
 
 # The float32 export step at this fixture's scale; grid points nearer than this to
@@ -47,12 +59,12 @@ def _flat(z):
 
 
 def _build(poly, thickness=2.0):
-    sample, xs, ys, _ = _make_grid()
-    zmin = _dem_min_over(poly, sample, xs, ys, RESOLUTION)
+    sample, frame = _make_grid()
+    zmin = _dem_min_over(poly, sample, frame, RESOLUTION)
     if zmin is None:
         return None
     return build_region_prism_fast(poly, sample, _flat(max(zmin - thickness, 0.01)),
-                                   xs, ys, RESOLUTION)
+                                   frame, RESOLUTION)
 
 
 class TestBuildRegionPrism:
@@ -63,7 +75,8 @@ class TestBuildRegionPrism:
         any sub-cell excursion of a large region too, while the pocket it seats in
         was cut exactly -- so insert and seat disagreed by up to a cell.
         """
-        sample, xs, ys, _ = _make_grid()
+        sample, frame = _make_grid()
+        xs, ys = _grid(frame)
         pitch = float(xs[1] - xs[0])
         centre = (float(xs[5]) + 0.5 * pitch, float(ys[5]) + 0.5 * pitch)
         tiny = ShapelyPolygon([
@@ -72,7 +85,7 @@ class TestBuildRegionPrism:
             (centre[0] + 0.1 * pitch, centre[1] + 0.1 * pitch),
             (centre[0] - 0.1 * pitch, centre[1] + 0.1 * pitch),
         ])
-        assert _dem_min_over(tiny, sample, xs, ys, RESOLUTION) is not None
+        assert _dem_min_over(tiny, sample, frame, RESOLUTION) is not None
         result = _build(tiny, thickness=1.0)
         assert result is not None and result.is_watertight
 
@@ -84,7 +97,8 @@ class TestBuildRegionPrism:
         are densified on these very grid lines, so it adds no sample the boundary
         vertices do not already carry.
         """
-        _, xs, ys, _ = _make_grid()
+        _sample, frame = _make_grid()
+        xs, ys = _grid(frame)
         # A rectangle whose left edge is a hair to the right of grid column 4, and
         # whose other edges sit well clear of any grid line.
         eps = 0.25 * RESOLUTION
@@ -92,10 +106,10 @@ class TestBuildRegionPrism:
                                (xs[8] + 0.5, ys[8] - 0.5), (xs[4] - eps, ys[8] - 0.5)])
         # A grid point sits at exactly xs[4]; the polygon's own corners sit at
         # xs[4] - eps, so an exact test tells them apart.
-        loose = _region_top_surface(poly, xs, ys, 0.1 * eps)[0]
+        loose = _region_top_surface(poly, frame, 0.1 * eps)[0]
         assert (loose[:, 0] == xs[4]).sum() > 0, "fixture must include the column"
 
-        xy, faces = _region_top_surface(poly, xs, ys, RESOLUTION)
+        xy, faces = _region_top_surface(poly, frame, RESOLUTION)
         assert (xy[:, 0] == xs[4]).sum() == 0, "the hugging column must be dropped"
         # The area is still exact: dropping a sample does not move the boundary.
         a, b, c = xy[faces[:, 0]], xy[faces[:, 1]], xy[faces[:, 2]]
@@ -105,7 +119,8 @@ class TestBuildRegionPrism:
 
     def test_sub_cell_excursion_of_a_large_region_is_kept(self):
         """Area is preserved exactly, not sampled at the grid corners."""
-        _, xs, ys, _ = _make_grid()
+        _sample, frame = _make_grid()
+        xs, ys = _grid(frame)
         pitch = float(xs[1] - xs[0])
         big = ShapelyPolygon([(xs[3], ys[3]), (xs[9], ys[3]),
                               (xs[9], ys[9]), (xs[3], ys[9])])
@@ -114,14 +129,14 @@ class TestBuildRegionPrism:
             (xs[9] + 0.4 * pitch, ys[5] + 0.6 * pitch), (xs[9], ys[5] + 0.6 * pitch),
         ])
         poly = unary_union([big, bump])
-        xy, faces = _region_top_surface(poly, xs, ys, RESOLUTION)
+        xy, faces = _region_top_surface(poly, frame, RESOLUTION)
         a, b, c = xy[faces[:, 0]], xy[faces[:, 1]], xy[faces[:, 2]]
         area = float(np.abs(0.5 * ((b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1])
                                    - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0]))).sum())
         assert area == pytest.approx(poly.area)
 
     def test_produces_mesh_for_polygon_inside_dem(self):
-        _, _, _, model_y_mm = _make_grid()
+        model_y_mm = _make_grid()[1].model_y_mm
         poly = ShapelyPolygon([(30, model_y_mm * 0.3), (70, model_y_mm * 0.3),
                                (70, model_y_mm * 0.7), (30, model_y_mm * 0.7)])
         result = _build(poly)
@@ -129,7 +144,7 @@ class TestBuildRegionPrism:
         assert len(result.faces) > 0
 
     def test_prism_is_watertight(self):
-        _, _, _, model_y_mm = _make_grid()
+        model_y_mm = _make_grid()[1].model_y_mm
         poly = ShapelyPolygon([(20, model_y_mm * 0.2), (80, model_y_mm * 0.2),
                                (80, model_y_mm * 0.8), (20, model_y_mm * 0.8)])
         result = _build(poly)
@@ -138,13 +153,14 @@ class TestBuildRegionPrism:
 
     def test_flat_bottom_sits_one_thickness_below_the_surface_minimum(self):
         """Flat mode floors the insert at (surface min - thickness), above zero."""
-        sample, xs, ys, model_y_mm = _make_grid()
+        sample, frame = _make_grid()
+        model_y_mm = frame.model_y_mm
         thickness = 1.0
         poly = ShapelyPolygon([(20, model_y_mm * 0.2), (80, model_y_mm * 0.2),
                                (80, model_y_mm * 0.8), (20, model_y_mm * 0.8)])
         result = _build(poly, thickness)
         assert result is not None
-        zmin = _dem_min_over(poly, sample, xs, ys, RESOLUTION)
+        zmin = _dem_min_over(poly, sample, frame, RESOLUTION)
         assert zmin - thickness > 0.01, "fixture must not hit the floor clamp"
         assert float(np.min(result.vertices[:, 2])) == pytest.approx(zmin - thickness)
 
@@ -155,7 +171,7 @@ class TestBuildRegionPrism:
         needed so the walls close -- and those sit beyond the polygon by up to one
         grid pitch. No face references them, so they are not part of the surface.
         """
-        _, _, _, model_y_mm = _make_grid()
+        model_y_mm = _make_grid()[1].model_y_mm
         poly = ShapelyPolygon([(30, model_y_mm * 0.3), (70, model_y_mm * 0.3),
                                (70, model_y_mm * 0.7), (30, model_y_mm * 0.7)])
         result = _build(poly)
@@ -183,7 +199,8 @@ def _exact_assign(cen, pockets):
 class TestAssignPockets:
     """The raster shortcut must agree with the exact query, triangle for triangle."""
 
-    def _pockets(self, xs, ys):
+    def _pockets(self, frame):
+        xs, ys = _grid(frame)
         # Deliberately awkward: a rotated square, a ring with a hole, and a small
         # blob that overlaps the first so precedence is exercised. None of their
         # edges are axis-aligned or grid-aligned.
@@ -198,29 +215,30 @@ class TestAssignPockets:
         blob = ShapelyPolygon([(cx + 1.0, cy + 1.0), (cx + 4.2, cy + 0.6),
                                (cx + 3.8, cy + 3.4), (cx + 0.7, cy + 3.1)])
         # The precondition: the layout densifies every boundary on the grid lines.
-        return [densify_on_grid(p, xs, ys) for p in (rot, ring, blob)]
+        return [densify_on_grid(p, frame) for p in (rot, ring, blob)]
 
     def test_matches_the_exact_query(self):
-        _, xs, ys, _ = _make_grid()
-        pockets = self._pockets(xs, ys)
+        _sample, frame = _make_grid()
+        xs, ys = _grid(frame)
+        pockets = self._pockets(frame)
         rng = np.random.default_rng(7)
         cen = np.column_stack((rng.uniform(xs[0], xs[-1], 20000),
                                rng.uniform(ys[0], ys[-1], 20000)))
-        assert np.array_equal(_assign_pockets(cen, pockets, xs, ys),
+        assert np.array_equal(_assign_pockets(cen, pockets, frame),
                               _exact_assign(cen, pockets))
 
     def test_overlap_goes_to_the_first_pocket(self):
         """TerrainLayout.pockets is ordered and the base solid honours that order."""
-        _, xs, ys, _ = _make_grid()
-        pockets = self._pockets(xs, ys)
+        _sample, frame = _make_grid()
+        pockets = self._pockets(frame)
         overlap = pockets[0].intersection(pockets[2])
         assert not overlap.is_empty, "fixture must actually overlap"
         pt = np.asarray(overlap.representative_point().coords)
-        assert _assign_pockets(pt, pockets, xs, ys)[0] == 0
+        assert _assign_pockets(pt, pockets, frame)[0] == 0
 
     def test_a_point_in_a_hole_belongs_to_no_pocket(self):
-        _, xs, ys, _ = _make_grid()
-        pockets = self._pockets(xs, ys)
+        _sample, frame = _make_grid()
+        pockets = self._pockets(frame)
         hole = ShapelyPolygon(pockets[1].interiors[0])
         pt = np.asarray(hole.representative_point().coords)
-        assert _assign_pockets(pt, pockets, xs, ys)[0] == -1
+        assert _assign_pockets(pt, pockets, frame)[0] == -1

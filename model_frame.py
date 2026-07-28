@@ -22,6 +22,8 @@ from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 import shapely
+
+from bearing_utils import rotate_from_bearing_frame, rotate_to_bearing_frame
 from shapely.geometry import (MultiPolygon, Polygon as ShapelyPolygon,
                               shape as shapely_shape)
 from shapely.ops import unary_union
@@ -39,12 +41,75 @@ class ModelFrame:
     px_size_y: float
     x_size_mm: float
 
+    # The rigid motion from GRID space (above) to PRINT space (below). Identity unless
+    # the printed region is turned relative to the DEM -- today only a rotated
+    # rectangular cutout, whose edges become the print axes.
+    print_bearing: float = 0.0                          # degrees, removed by the motion
+    print_pivot_mm: Tuple[float, float] = (0.0, 0.0)    # rotation centre, grid mm
+    print_origin_mm: Tuple[float, float] = (0.0, 0.0)   # where the pivot lands, print mm
+
     @classmethod
     def from_dem(cls, dem_shape: Tuple[int, int], px_size_x: float, px_size_y: float,
-                 x_size_mm: float, ref_transform, ref_crs) -> "ModelFrame":
+                 x_size_mm: float, ref_transform, ref_crs,
+                 print_bearing: float = 0.0,
+                 print_pivot_mm: Tuple[float, float] = (0.0, 0.0),
+                 print_origin_mm: Tuple[float, float] = (0.0, 0.0)) -> "ModelFrame":
         rows, cols = dem_shape
         return cls(ref_transform, ref_crs, int(rows), int(cols),
-                   float(px_size_x), float(px_size_y), float(x_size_mm))
+                   float(px_size_x), float(px_size_y), float(x_size_mm),
+                   float(print_bearing), tuple(print_pivot_mm), tuple(print_origin_mm))
+
+    # --- grid space <-> print space ---------------------------------------
+    #
+    # GRID space is the plain affine image of the pixel lattice: axis-aligned with the
+    # CRS, spanning (0, 0) - (x_size_mm, model_y_mm). PRINT space is what the STL
+    # carries. Only the 2D stage crosses between them, and it crosses BEFORE the
+    # float32 quantization, so the coordinates that get snapped are the exported ones.
+    #
+    # Everything that indexes the DEM lattice -- the sampler, the interior sample
+    # points, the per-cell pocket classification -- works in grid space, where the
+    # lattice is axis-aligned and a bisection over ``grid_xs``/``grid_ys`` is valid. It
+    # reaches grid space by mapping its inputs back through ``to_grid``, never by
+    # moving a vertex it emits.
+
+    @property
+    def print_is_identity(self) -> bool:
+        """True when print space IS grid space, which is every unrotated build."""
+        return (self.print_bearing == 0.0
+                and tuple(self.print_pivot_mm) == (0.0, 0.0)
+                and tuple(self.print_origin_mm) == (0.0, 0.0))
+
+    def to_print(self, xy) -> np.ndarray:
+        """Grid mm -> print mm, for an (N, 2) array."""
+        arr = np.asarray(xy, dtype=np.float64)
+        if self.print_is_identity:
+            return arr
+        b = np.radians(self.print_bearing)
+        perp, along = rotate_to_bearing_frame(arr[:, 0] - self.print_pivot_mm[0],
+                                              arr[:, 1] - self.print_pivot_mm[1], b)
+        return np.column_stack((perp + self.print_origin_mm[0],
+                                along + self.print_origin_mm[1]))
+
+    def to_grid(self, xy) -> np.ndarray:
+        """Print mm -> grid mm, for an (N, 2) array. The inverse of ``to_print``.
+
+        Returns the input array itself when the motion is the identity, so the
+        unrotated path is not merely equivalent to the old arithmetic but is it.
+        """
+        arr = np.asarray(xy, dtype=np.float64)
+        if self.print_is_identity:
+            return arr
+        b = np.radians(self.print_bearing)
+        de, dn = rotate_from_bearing_frame(arr[:, 0] - self.print_origin_mm[0],
+                                           arr[:, 1] - self.print_origin_mm[1], b)
+        return np.column_stack((de + self.print_pivot_mm[0],
+                                dn + self.print_pivot_mm[1]))
+
+    def geom_to_grid(self, geom):
+        """``to_grid`` over a whole geometry, for the lattice-indexing helpers."""
+        if self.print_is_identity:
+            return geom
+        return shapely.transform(geom, self.to_grid)
 
     # --- derived scalars -------------------------------------------------
 
@@ -85,15 +150,41 @@ class ModelFrame:
         return np.linspace(self.model_y_mm, 0.0, self.rows)[::-1]
 
     @property
+    def print_bounds_mm(self) -> Tuple[float, float, float, float]:
+        """(minx, miny, maxx, maxy) of the grid rectangle, in PRINT mm.
+
+        Equal to ``bounds_mm`` when the motion is the identity. Under a rotation it is
+        the bounding box of the turned rectangle, which is what bounds the exported
+        coordinates -- and therefore what sets ``output_resolution``.
+        """
+        if self.print_is_identity:
+            return self.bounds_mm
+        x0, y0, x1, y1 = self.bounds_mm
+        corners = self.to_print([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+        return (float(corners[:, 0].min()), float(corners[:, 1].min()),
+                float(corners[:, 0].max()), float(corners[:, 1].max()))
+
+    def print_footprint(self) -> ShapelyPolygon:
+        """The grid rectangle as a polygon in print space.
+
+        The DEM's own extent, which the layout clips against. Under a rotation this is
+        a turned rectangle, so it is a polygon rather than the ``print_bounds_mm`` box.
+        """
+        x0, y0, x1, y1 = self.bounds_mm
+        return ShapelyPolygon(self.to_print([(x0, y0), (x1, y0), (x1, y1), (x0, y1)]))
+
+    @property
     def output_resolution(self) -> np.float32:
-        """The float32 ULP at the model's largest coordinate.
+        """The float32 ULP at the model's largest PRINT coordinate.
 
         Binary STL stores vertices as float32, so this is the finest distance the
         export can represent; it is the grid every polygon boundary is snapped to
         before any solid is built. Taken at the largest coordinate because that is
-        where float32's absolute step is coarsest.
+        where float32's absolute step is coarsest -- and in print space, because that
+        is the space the export writes. Measuring it in grid space and then moving the
+        coordinates would leave every snapped value off the grid it was snapped to.
         """
-        return np.spacing(np.float32(max(self.x_size_mm, self.model_y_mm)))
+        return np.spacing(np.float32(max(abs(v) for v in self.print_bounds_mm)))
 
     @property
     def scale_m_per_mm(self) -> float:
@@ -138,7 +229,11 @@ class ModelFrame:
         geom = shapely_shape(geojson_geom)
 
         def _ring(ring):
-            return self.coords_to_mm(np.asarray(ring.coords))
+            # Masks come out in PRINT space: they are what the layout builds on, and
+            # the layout must own every coordinate the export will carry. point_to_mm
+            # and coords_to_mm stay in grid space -- they are the raw georeference, and
+            # the print motion is defined in terms of them.
+            return self.to_print(self.coords_to_mm(np.asarray(ring.coords)))
 
         if geom.geom_type == "Polygon":
             return ShapelyPolygon(_ring(geom.exterior),

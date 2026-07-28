@@ -25,6 +25,20 @@ def _frame(x_size_mm=120.0):
     return ModelFrame.from_dem((ROWS, COLS), PX, PX, x_size_mm, transform, "EPSG:32633")
 
 
+def _grid_frame(cols, rows, x_size_mm, y_size_mm):
+    """A frame whose lattice IS ``linspace(0, x_size_mm, cols)`` by
+    ``linspace(0, y_size_mm, rows)``.
+
+    The pixel aspect is solved for, because the frame derives its Y extent from the
+    DEM's rather than taking it directly. Checked in
+    ``test_the_fixture_frame_reproduces_the_plain_linspace_grids`` rather than assumed.
+    """
+    px = 1.0
+    py = y_size_mm * (cols - 1) / (x_size_mm * (rows - 1))
+    return ModelFrame.from_dem((rows, cols), px, py, x_size_mm,
+                               from_origin(ORIGIN_X, ORIGIN_Y, px, py), "EPSG:32633")
+
+
 def _crs_box(col0, row0, col1, row1):
     """A GeoJSON box given in DEM pixel-centre coordinates."""
     x0 = ORIGIN_X + (col0 + 0.5) * PX
@@ -125,14 +139,113 @@ class TestRectExtent:
         assert rect_extent_m("EPSG:3857", spec) == (None, None)
 
 
+class TestPrintMotion:
+    """The grid -> print motion a rectangular cutout carries.
+
+    This used to be a transform applied to finished vertices, which is why it could
+    rescale as well; pinning the scale upstream leaves a rigid motion, and a rigid
+    motion can be applied in the 2D stage -- ahead of the float32 snap, so the snapped
+    coordinates are the exported ones. The two properties below are what make that
+    safe: the rectangle lands where the print wants it, and no distance changes.
+    """
+
+    # A 400 m x 300 m rectangle inside a 1000 m raster, so the pin is a real factor
+    # (2.5x) rather than 1 and the motion has something to move.
+    RASTER_M = (COLS - 1) * PX
+    RECT_W_M, RECT_H_M = 400.0, 300.0
+    PRINT_W_MM = 120.0
+
+    def _frame_and_spec(self, bearing):
+        from pyproj import Transformer
+        from terrain_layout import CutoutSpec, frame_with_print_motion
+        to_wgs = Transformer.from_crs("EPSG:32633", "EPSG:4326", always_xy=True)
+        cx = ORIGIN_X + self.RASTER_M / 2.0
+        cy = ORIGIN_Y - ((ROWS - 1) * PX) / 2.0
+        b = np.radians(bearing)
+        corners_local = [(-self.RECT_W_M / 2, -self.RECT_H_M / 2),
+                         (self.RECT_W_M / 2, -self.RECT_H_M / 2),
+                         (self.RECT_W_M / 2, self.RECT_H_M / 2),
+                         (-self.RECT_W_M / 2, self.RECT_H_M / 2)]
+        crs_corners = []
+        for perp, along in corners_local:
+            de, dn = rotate_from_bearing_frame(perp, along, b)
+            crs_corners.append((cx + de, cy + dn))
+        lon1, lat1 = to_wgs.transform(*crs_corners[0])
+        lon2, lat2 = to_wgs.transform(*crs_corners[2])
+        spec = CutoutSpec(cutout_type="rectangular", bearing=bearing,
+                          rect_corner1_lat=lat1, rect_corner1_lon=lon1,
+                          rect_corner2_lat=lat2, rect_corner2_lon=lon2)
+        # The scale pin the CLI applies before the frame exists.
+        x_size = self.PRINT_W_MM * self.RASTER_M / self.RECT_W_M
+        frame = frame_with_print_motion(_frame(x_size_mm=x_size), spec)
+        return frame, spec, crs_corners
+
+    @pytest.mark.parametrize("bearing", [0.0, 31.0, 90.0, 206.0])
+    def test_the_rectangle_lands_at_the_origin_at_the_requested_width(self, bearing):
+        frame, _spec, crs_corners = self._frame_and_spec(bearing)
+        grid = [frame.point_to_mm(x, y) for x, y in crs_corners]
+        got = frame.to_print(grid)
+        h_mm = self.PRINT_W_MM * self.RECT_H_M / self.RECT_W_M
+        want = [(0.0, 0.0), (self.PRINT_W_MM, 0.0),
+                (self.PRINT_W_MM, h_mm), (0.0, h_mm)]
+        # 1 nm. The fixture states its corners in CRS metres, and rect_crs_corners
+        # reads them back through WGS84, so a sub-nanometre geodetic round trip is the
+        # noise floor here -- four orders below the 1.5e-5 mm float32 export step.
+        assert got == pytest.approx(np.asarray(want), abs=1e-6)
+
+    @pytest.mark.parametrize("bearing", [0.0, 31.0, 206.0])
+    def test_the_motion_is_rigid(self, bearing):
+        """No scale in it, so nothing the 2D stage already placed changes size."""
+        frame, _spec, _c = self._frame_and_spec(bearing)
+        rng = np.random.default_rng(3)
+        pts = np.column_stack((rng.uniform(0, frame.x_size_mm, 40),
+                               rng.uniform(0, frame.model_y_mm, 40)))
+        out = frame.to_print(pts)
+
+        def pdist(v):
+            d = v[:, None, :] - v[None, :, :]
+            return np.hypot(d[..., 0], d[..., 1])
+
+        assert pdist(out) == pytest.approx(pdist(pts))
+
+    @pytest.mark.parametrize("bearing", [0.0, 31.0, 206.0])
+    def test_to_grid_inverts_to_print(self, bearing):
+        frame, _spec, _c = self._frame_and_spec(bearing)
+        rng = np.random.default_rng(11)
+        pts = np.column_stack((rng.uniform(0, frame.x_size_mm, 40),
+                               rng.uniform(0, frame.model_y_mm, 40)))
+        assert frame.to_grid(frame.to_print(pts)) == pytest.approx(pts)
+
+    def test_a_circular_cutout_keeps_the_identity(self):
+        """A disc is rotation-invariant, so there is nothing to turn."""
+        from terrain_layout import CutoutSpec, frame_with_print_motion
+        spec = CutoutSpec(cutout_type="circular", center_lat=45.0, center_lon=15.0,
+                          radius_m=500.0, bearing=37.0)
+        frame = frame_with_print_motion(_frame(), spec)
+        assert frame.print_is_identity
+        pts = np.array([[1.0, 2.0], [3.0, 4.0]])
+        assert frame.to_print(pts) is pts, "identity must not even copy"
+
+    def test_the_export_resolution_follows_the_print_extent(self):
+        """Snapping to a grid measured in the wrong space leaves values off it."""
+        frame, _spec, _c = self._frame_and_spec(31.0)
+        assert not frame.print_is_identity
+        expected = np.spacing(np.float32(max(abs(v) for v in frame.print_bounds_mm)))
+        assert frame.output_resolution == expected
+        assert frame.print_bounds_mm != frame.bounds_mm
+
+
 class TestDensifyOnGrid:
     """Densification must add vertices without moving the shape."""
 
+    def test_the_fixture_frame_reproduces_the_plain_linspace_grids(self):
+        frame = _grid_frame(7, 5, 3.0, 3.0)
+        assert np.array_equal(frame.grid_xs, np.linspace(0.0, 3.0, 7))
+        assert np.array_equal(frame.grid_ys, np.linspace(0.0, 3.0, 5))
+
     def test_inserts_a_vertex_at_every_crossing(self):
-        xs = np.array([0.0, 1.0, 2.0, 3.0])
-        ys = np.array([0.0, 1.0, 2.0, 3.0])
         poly = ShapelyPolygon([(0.5, 0.5), (2.5, 0.5), (2.5, 2.5), (0.5, 2.5)])
-        dense = densify_on_grid(poly, xs, ys)
+        dense = densify_on_grid(poly, _grid_frame(4, 4, 3.0, 3.0))
 
         assert dense.equals(poly), "densifying must not change the shape"
         assert dense.area == poly.area
@@ -140,31 +253,26 @@ class TestDensifyOnGrid:
         assert len(dense.exterior.coords) - 1 == 12
 
     def test_diagonal_edge_crosses_both_families(self):
-        xs = np.array([0.0, 1.0, 2.0])
-        ys = np.array([0.0, 1.0, 2.0])
         poly = ShapelyPolygon([(0.0, 0.0), (2.0, 2.0), (0.0, 2.0)])
-        dense = densify_on_grid(poly, xs, ys)
+        dense = densify_on_grid(poly, _grid_frame(3, 3, 2.0, 2.0))
         assert dense.equals(poly)
         # The diagonal meets x=1 and y=1 at the same point -- one vertex, not two.
         assert (1.0, 1.0) in list(dense.exterior.coords)
 
     def test_holes_are_densified_too(self):
-        xs = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
-        ys = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
         poly = ShapelyPolygon([(0.5, 0.5), (3.5, 0.5), (3.5, 3.5), (0.5, 3.5)],
                               [[(1.5, 1.5), (1.5, 2.5), (2.5, 2.5), (2.5, 1.5)]])
-        dense = densify_on_grid(poly, xs, ys)
+        dense = densify_on_grid(poly, _grid_frame(5, 5, 4.0, 4.0))
         assert dense.equals(poly)
         assert len(dense.interiors[0].coords) > len(poly.interiors[0].coords)
 
     def test_shared_seam_densifies_identically_from_either_side(self):
         """Two regions meeting on one edge must not diverge along it."""
-        xs = np.array([0.0, 1.0, 2.0, 3.0])
-        ys = np.array([0.0, 1.0, 2.0, 3.0])
+        frame = _grid_frame(4, 4, 3.0, 3.0)
         left = ShapelyPolygon([(0.0, 0.2), (1.5, 0.2), (1.5, 2.8), (0.0, 2.8)])
         right = ShapelyPolygon([(1.5, 0.2), (3.0, 0.2), (3.0, 2.8), (1.5, 2.8)])
-        dl = densify_on_grid(left, xs, ys)
-        dr = densify_on_grid(right, xs, ys)
+        dl = densify_on_grid(left, frame)
+        dr = densify_on_grid(right, frame)
 
         # As a set: the rings run along the seam in opposite directions, and one of
         # them closes on it, so the coordinate LISTS legitimately differ.
@@ -179,20 +287,81 @@ class TestDensifyOnGrid:
         A seam whose two copies differ by an ULP is the hairline cell the base
         solid drapes to full DEM height as a razor fin, so approx is not enough.
         """
-        xs = np.linspace(0.0, 3.0, 7)
-        ys = np.linspace(0.0, 3.0, 5)
+        frame = _grid_frame(7, 5, 3.0, 3.0)
         a, b = (0.3, 0.4), (2.7, 2.6)
         left = ShapelyPolygon([a, b, (0.0, 3.0)])
         right = ShapelyPolygon([b, a, (3.0, 0.0)])     # same seam, walked backwards
 
-        cl = np.asarray(densify_on_grid(left, xs, ys).exterior.coords)
-        cr = np.asarray(densify_on_grid(right, xs, ys).exterior.coords)
+        cl = np.asarray(densify_on_grid(left, frame).exterior.coords)
+        cr = np.asarray(densify_on_grid(right, frame).exterior.coords)
         seam_l = cl[:np.flatnonzero((cl == b).all(axis=1))[0] + 1]
         i = np.flatnonzero((cr == a).all(axis=1))[0]
         seam_r = cr[:i + 1][::-1]
 
         assert len(seam_l) > 2, "the seam should have picked up crossings"
         assert np.array_equal(seam_l, seam_r)
+
+    # --- the same guarantees, with the grid TURNED relative to print space ---------
+    #
+    # A rotated rectangular cutout makes print space differ from the space the grid
+    # lines live in, so densification has to cross between the two. That crossing is
+    # where a round trip would creep in: mapping a whole ring to grid space and back
+    # returns every ORIGINAL vertex perturbed in the low bits, and two rings sharing a
+    # seam would each perturb it their own way -- the razor-fin condition. Only the new
+    # crossings may be mapped; the vertices the ring already had must be copied.
+
+    def _turned(self):
+        """A frame whose grid is turned 31 degrees out of print space."""
+        from dataclasses import replace
+        f = _grid_frame(7, 5, 3.0, 3.0)
+        return replace(f, print_bearing=31.0, print_pivot_mm=(1.5, 1.5),
+                       print_origin_mm=(1.5, 1.5))
+
+    def test_a_turned_frame_still_only_inserts_vertices(self):
+        frame = self._turned()
+        assert not frame.print_is_identity, "fixture must actually turn the grid"
+        poly = ShapelyPolygon([(0.3, 0.4), (2.7, 0.5), (2.6, 2.6), (0.4, 2.5)])
+        dense = densify_on_grid(poly, frame)
+
+        # Every original vertex survives to the LAST BIT, not approximately.
+        orig = np.asarray(poly.exterior.coords)
+        got = np.asarray(dense.exterior.coords)
+        for v in orig:
+            assert (got == v).all(axis=1).any(), f"{v} was moved, not preserved"
+        assert len(got) > len(orig), "and crossings were still found"
+
+    def test_a_turned_seam_is_bit_identical_from_either_side(self):
+        """The razor-fin guarantee, under the motion that made it non-trivial."""
+        frame = self._turned()
+        a, b = (0.3, 0.4), (2.7, 2.6)
+        left = ShapelyPolygon([a, b, (0.2, 2.8)])
+        right = ShapelyPolygon([b, a, (2.8, 0.2)])      # same seam, walked backwards
+
+        cl = np.asarray(densify_on_grid(left, frame).exterior.coords)
+        cr = np.asarray(densify_on_grid(right, frame).exterior.coords)
+        seam_l = cl[:np.flatnonzero((cl == b).all(axis=1))[0] + 1]
+        i = np.flatnonzero((cr == a).all(axis=1))[0]
+        seam_r = cr[:i + 1][::-1]
+
+        assert len(seam_l) > 2, "the seam should have picked up crossings"
+        assert np.array_equal(seam_l, seam_r)
+
+    def test_a_turned_frame_does_not_move_the_shape(self):
+        """A crossing sits within one ULP of the boundary, turned or not.
+
+        Exactly ON it is not achievable in doubles for a generic segment -- the
+        interpolated coordinates round -- so the identity frame sets the bar and
+        the turned frame must not be any worse.
+        """
+        poly = ShapelyPolygon([(0.3, 0.4), (2.7, 0.5), (2.6, 2.6), (0.4, 2.5)])
+        boundary = poly.exterior
+        ulp = np.spacing(3.0)               # one ULP at the frame's 3 mm extent
+        for frame in (_grid_frame(7, 5, 3.0, 3.0), self._turned()):
+            dense = densify_on_grid(poly, frame)
+            assert dense.area == pytest.approx(poly.area, rel=0, abs=1e-12)
+            worst = max(boundary.distance(shapely.Point(p))
+                        for p in dense.exterior.coords)
+            assert worst <= ulp
 
 
 class TestBuildTerrainLayout:

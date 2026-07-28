@@ -29,7 +29,7 @@ Model mm are print mm, so the printable-feature rules (``MIN_THICKNESS_MM``,
 ``MIN_BLOB_MM``) apply directly and ``scale_m_per_mm`` is 1.0 throughout.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -156,9 +156,38 @@ def rect_extent_m(ref_crs, spec: CutoutSpec):
     return abs(width_m), abs(height_m)
 
 
+def frame_with_print_motion(frame: ModelFrame,
+                            spec: Optional[CutoutSpec]) -> ModelFrame:
+    """``frame`` carrying the grid -> print motion this cutout needs.
+
+    Only a rectangular cutout needs one: its edges become the print axes, so the model
+    is turned by -bearing about the rectangle's centre and shifted until the
+    rectangle's corner is the origin. A disc is rotation-invariant and a whole-raster
+    model is already axis-aligned, so both keep the identity.
+
+    No scale: the caller has already pinned ``x_size_mm`` to the cutout, which is what
+    makes this a rigid motion and therefore safe to apply in the 2D stage. A rescale
+    would have to wait until the mesh existed, and by then the float32 quantization has
+    happened and moving the coordinates invalidates it.
+    """
+    if spec is None or spec.cutout_type != "rectangular":
+        return frame
+    c1_x, c1_y, c2_x, c2_y = rect_crs_corners(frame.ref_crs, spec)
+    if c1_x is None:
+        return frame
+    width_m, height_m = rect_extent_m(frame.ref_crs, spec)
+    scale = frame.x_size_mm / ((frame.cols - 1) * frame.px_size_x)
+    return replace(
+        frame,
+        print_bearing=float(spec.bearing),
+        print_pivot_mm=frame.point_to_mm((c1_x + c2_x) / 2.0, (c1_y + c2_y) / 2.0),
+        print_origin_mm=(width_m * scale / 2.0, height_m * scale / 2.0),
+    )
+
+
 def cutout_footprint(frame: ModelFrame,
                      spec: Optional[CutoutSpec]) -> Optional[ShapelyPolygon]:
-    """The cutout's 2D outline in model mm, or None when there is no cutout.
+    """The cutout's 2D outline in PRINT mm, or None when there is no cutout.
 
     Overlay polygons are clipped to this in 2D so the cutout boundary becomes
     ordinary prism walls (one vertical segment) instead of a solid-vs-solid boolean
@@ -184,7 +213,7 @@ def cutout_footprint(frame: ModelFrame,
         angles = np.linspace(0, 2 * np.pi, spec.n_gon_sides, endpoint=False)
         ngon_x = center_x_mm + radius_mm * np.cos(angles)
         ngon_y = center_y_mm + radius_mm * np.sin(angles)
-        return ShapelyPolygon(zip(ngon_x, ngon_y))
+        return ShapelyPolygon(frame.to_print(np.column_stack((ngon_x, ngon_y))))
 
     if spec.cutout_type == "rectangular":
         bearing_rad = np.radians(spec.bearing)
@@ -206,7 +235,10 @@ def cutout_footprint(frame: ModelFrame,
         for vx, vy in corners_local:
             de, dn = rotate_from_bearing_frame(vx, vy, bearing_rad)
             corners.append((de + center_x_mm, dn + center_y_mm))
-        return ShapelyPolygon(corners)
+        # Through the frame's own motion rather than straight to (0, 0, W, H): the rim
+        # is a seam shared with every insert clipped against it, so its coordinates
+        # must come out of the same arithmetic as theirs, to the bit.
+        return ShapelyPolygon(frame.to_print(corners))
 
     return None
 
@@ -366,7 +398,7 @@ def _quantize_to_f32(polygon_mm, output_resolution):
     return shapely.set_precision(quantized, 0.0)
 
 
-def densify_on_grid(geom, xs, ys):
+def densify_on_grid(geom, frame):
     """Insert a boundary vertex wherever a segment crosses a DEM grid line.
 
     Pure vertex insertion: every ring passes through exactly the points it did
@@ -386,29 +418,41 @@ def densify_on_grid(geom, xs, ys):
     ``y1 + (1 - t) * (y0 - y1)`` differ in the last bits, and a seam whose two
     copies sit an ULP apart is precisely the hairline cell the base solid drapes to
     full DEM height as a razor fin. Each segment is therefore oriented canonically
-    (lexicographically smaller endpoint first) before its crossings are computed,
-    and the crossed coordinate is taken as the grid value itself rather than
-    interpolated, so a crossing sits exactly on its grid line.
+    (lexicographically smaller endpoint first) before its crossings are computed.
+
+    ``geom`` is print-space, and the crossings are computed on those rotated
+    coordinates: each vertex's grid coordinates are read off only to find which grid
+    lines the segment spans and the crossing fraction along it; the crossing point
+    itself is built on the print-space segment, so it sits within the intersection
+    arithmetic's own rounding of the boundary -- the same as on an unrotated frame.
+    Building it in grid space and mapping it back would stack the motion's rounding
+    on top. Either way the residual is ~1e-16, far below the float32 snap that
+    follows; the vertices the ring already had are copied through untouched.
     """
+    xs, ys = frame.grid_xs, frame.grid_ys
+
     def ring(coords):
         c = np.asarray(coords, float)
+        g = frame.to_grid(c)
         out = []
         for k in range(len(c) - 1):
-            p0, p1 = c[k], c[k + 1]
-            flip = (p1[0], p1[1]) < (p0[0], p0[1])
-            (x0, y0), (x1, y1) = (p1, p0) if flip else (p0, p1)
+            p0 = c[k]
+            flip = (c[k + 1][0], c[k + 1][1]) < (p0[0], p0[1])
+            i0, i1 = (k + 1, k) if flip else (k, k + 1)
+            (x0, y0), (x1, y1) = c[i0], c[i1]
+            (u0, v0), (u1, v1) = g[i0], g[i1]
             cx = np.empty(0)
             cy = np.empty(0)
-            if x1 != x0:
-                lo, hi = (x0, x1) if x0 < x1 else (x1, x0)
-                gx = xs[(xs > lo) & (xs < hi)]
-                cx = np.concatenate((cx, gx))
-                cy = np.concatenate((cy, y0 + (gx - x0) / (x1 - x0) * (y1 - y0)))
-            if y1 != y0:
-                lo, hi = (y0, y1) if y0 < y1 else (y1, y0)
-                gy = ys[(ys > lo) & (ys < hi)]
-                cx = np.concatenate((cx, x0 + (gy - y0) / (y1 - y0) * (x1 - x0)))
-                cy = np.concatenate((cy, gy))
+            if u1 != u0:
+                lo, hi = (u0, u1) if u0 < u1 else (u1, u0)
+                t = (xs[(xs > lo) & (xs < hi)] - u0) / (u1 - u0)
+                cx = np.concatenate((cx, x0 + t * (x1 - x0)))
+                cy = np.concatenate((cy, y0 + t * (y1 - y0)))
+            if v1 != v0:
+                lo, hi = (v0, v1) if v0 < v1 else (v1, v0)
+                t = (ys[(ys > lo) & (ys < hi)] - v0) / (v1 - v0)
+                cx = np.concatenate((cx, x0 + t * (x1 - x0)))
+                cy = np.concatenate((cy, y0 + t * (y1 - y0)))
             if len(cx):
                 # Order along the canonical direction, then drop the duplicate a
                 # segment through a grid NODE produces (it crosses one line of each
@@ -581,14 +625,14 @@ def build_terrain_layout(
     # it was handed (dem_processing.py:261-264), so a cutout larger than the supplied
     # DEM coverage passes through silently. Clipped only when it actually overhangs, so
     # the ordinary case keeps the outline's own coordinates untouched.
-    dem_extent = box(*frame.bounds_mm)
+    dem_extent = frame.print_footprint()
     if outline is not None and not dem_extent.covers(outline):
         outline = outline.intersection(dem_extent)
 
     # Resolve masks -> mutually-exclusive inserts + base plate. Model mm is print mm,
     # so scale_m_per_mm=1.0. The oversized domain leaves inserts unclipped (the cutout
     # trims later); the complement it carves is clipped there too.
-    minx, miny, maxx, maxy = frame.bounds_mm
+    minx, miny, maxx, maxy = frame.print_bounds_mm
     margin = maxx - minx
     domain = box(minx - margin, miny - margin, maxx + margin, maxy + margin)
     masks = {tc: class_polys_mm[tc] for tc in TERRAIN_PRECEDENCE
@@ -625,11 +669,10 @@ def build_terrain_layout(
 
     # Downsample polygons to the float32 STL output resolution before 2D->3D.
     output_resolution = frame.output_resolution
-    grid_xs, grid_ys = frame.grid_xs, frame.grid_ys
     base_outline = outline if outline is not None else dem_extent
     # Densify BEFORE quantizing, so the f32 snap absorbs any inserted vertex that
     # lands within a ULP of a corner instead of leaving a sub-resolution sliver.
-    base_outline = densify_on_grid(base_outline, grid_xs, grid_ys)
+    base_outline = densify_on_grid(base_outline, frame)
     # The pockets cut from this outline are snapped to the f32 output grid (as one
     # arrangement, in node_and_snap); the outline they share their rim edge with must
     # live on the same grid, or the rim exists in two near-coincident copies and the
@@ -671,7 +714,7 @@ def build_terrain_layout(
             if pocket_poly is not None and pocket_poly.area > 0:
                 # Corner-relief arcs and the inset are new curves, not clipped from
                 # anything already densified, so they need their own crossings.
-                pockets.append((tc, densify_on_grid(pocket_poly, grid_xs, grid_ys)))
+                pockets.append((tc, densify_on_grid(pocket_poly, frame)))
 
             # Printed insert footprint: inset by the clearance + reflex corner relief.
             if fit.xy_clearance_mm > 0 or insert_cut is not None:
@@ -684,7 +727,7 @@ def build_terrain_layout(
                         continue
             else:
                 insert_poly = insert_src
-            insert_poly = densify_on_grid(insert_poly, grid_xs, grid_ys)
+            insert_poly = densify_on_grid(insert_poly, frame)
             insert_poly = _quantize_to_f32(insert_poly, output_resolution)
             if insert_poly is None:
                 continue
