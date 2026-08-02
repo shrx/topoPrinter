@@ -1187,10 +1187,10 @@ def build_terrain_meshes(
     """Extrude a finished 2D terrain layout into the base plate + insert meshes.
 
     Pure assembly: every polygon in ``layout`` is final. Nothing here moves a
-    boundary, and nothing may -- the layout's shared seams are already snapped to
-    the float32 export grid as one arrangement, and any further 2D op would
-    snap-round them apart again (see ``terrain_layout.node_and_snap``). This stage
-    only adds Z: the DEM surface on top, and a recess floor underneath.
+    boundary, and nothing may -- the layout's shared seams are already noded and
+    rounded to the float32 export grid as one arrangement, and any further 2D op
+    would part the copies again (see ``terrain_layout.snap_arrangement``). This
+    stage only adds Z: the DEM surface on top, and a recess floor underneath.
 
     Args:
         layout: the finished 2D geometry (``terrain_layout.build_terrain_layout``).

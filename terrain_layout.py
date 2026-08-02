@@ -19,11 +19,14 @@ point of this module:
   3. the cutout rim frets sub-printable bits off the partition; each is handed to a
      neighbour rather than dropped, so the partition stays exact;
   4. per component: clip to the rim, drop rim runts, apply insert fit clearances;
-  5. the base outline and every pocket boundary are snapped to the float32 export
-     grid as ONE arrangement (``node_and_snap``). Snapping polygon-by-polygon
-     diverges the two copies of every shared seam by up to a pixel, and the base
-     solid then drapes the hairline cell between them to the full DEM height -- a
-     zero-width, full-height razor fin.
+  5. the base outline and every pocket boundary are noded into ONE arrangement and
+     rounded onto the float32 export grid in one pass (``snap_arrangement``), and
+     the pockets are then rebuilt as unions of that arrangement's cells. Every
+     shared seam (pocket/pocket and pocket/rim) is therefore ONE vertex list before
+     anything is rounded; quantizing the copies separately lets a vertex one copy
+     has and the other lacks come off the shared line, and the base solid drapes
+     the hairline cell between the copies to the full DEM height -- a zero-width,
+     full-height razor fin.
 
 Model mm are print mm, so the printable-feature rules (``MIN_THICKNESS_MM``,
 ``MIN_BLOB_MM``) apply directly and ``scale_m_per_mm`` is 1.0 throughout.
@@ -35,9 +38,10 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import shapely
 from pyproj import Transformer
-from shapely.geometry import (MultiPolygon, Point, Polygon as ShapelyPolygon, box)
+from shapely.geometry import (LineString, MultiPolygon, Point,
+                              Polygon as ShapelyPolygon, box)
 from shapely.geometry.polygon import orient
-from shapely.ops import unary_union
+from shapely.ops import polygonize, unary_union
 
 from bearing_utils import rotate_from_bearing_frame, rotate_to_bearing_frame
 from model_frame import ModelFrame
@@ -91,9 +95,10 @@ class TerrainLayout:
     the precedence and must not be rearranged.
 
     ``noded_boundaries`` is the constraint set the base plate is triangulated
-    against -- the outline and every pocket boundary as one snapped arrangement.
-    It is built here, from exactly the pockets in ``pockets``, so the constraint
-    edges and the draped regions can never describe different sets.
+    against -- the outline and every pocket boundary noded and rounded as one
+    arrangement (``snap_arrangement``). The outline and every pocket are unions of
+    that arrangement's cells, so the constraint edges and the draped regions can
+    never describe different line work.
     """
 
     base_class: int
@@ -374,6 +379,27 @@ def _drop_small_rim_bits(polygon_mm, rim, min_area_mm2: float):
     return keep[0] if len(keep) == 1 else unary_union(keep)
 
 
+def _round_lines(lines, output_resolution):
+    """Round every vertex of a line arrangement onto the output grid.
+
+    A per-vertex round is a pure function of the coordinate -- no GEOS hot pixels,
+    no dependence on which geometry a point sits in -- so it is safe to apply to
+    the single shared copy of every seam that ``snap_arrangement`` maintains.
+    Vertices brought together by the round are dropped, as is any line left with
+    fewer than two distinct points. Returns a list of LineStrings.
+    """
+    out = []
+    for ls in (lines.geoms if hasattr(lines, "geoms") else [lines]):
+        c = np.asarray(ls.coords, float)
+        c = np.round(c / output_resolution) * output_resolution
+        keep = np.ones(len(c), bool)
+        keep[1:] = np.any(c[1:] != c[:-1], axis=1)
+        c = c[keep]
+        if len(c) >= 2:
+            out.append(LineString(c))
+    return out
+
+
 def _quantize_to_f32(polygon_mm, output_resolution):
     """Quantize polygon coordinates to float32 precision, before 2D->3D.
 
@@ -482,30 +508,43 @@ def densify_on_grid(geom, frame):
     return one(geom)
 
 
-def node_and_snap(base_outline, pockets, output_resolution):
-    """Node the base outline + pocket boundaries into ONE snapped arrangement.
+def snap_arrangement(base_outline, pocket_polys, output_resolution):
+    """Node the outline + pocket boundaries into ONE on-grid arrangement.
 
-    The result is the constraint set the base plate is triangulated against. Every
-    boundary is snapped together, in a single ``set_precision`` call: a global
-    snap-round collapses every near-coincident copy of a shared seam onto the same
-    grid points, whereas snapping each polygon separately snap-rounds it against its
-    own hot pixels and diverges the two copies of every shared seam (pocket/pocket
-    and pocket/rim) by up to a pixel. The noded arrangement then keeps both copies
-    and the base solid drapes the degenerate ribbon cell between them to the DEM: a
-    zero-width, full-height razor fin.
+    This is the single quantization of all the shared 2D line work, and the order
+    inside it is the point. ``unary_union`` runs first, while the coordinates are
+    still doubles: it dissolves the two copies of every shared seam (pocket/pocket
+    and pocket/rim) into one polyline carrying the union of their vertices, and
+    nodes every genuine crossing. Only THEN is anything rounded -- and by a plain
+    per-vertex round, not ``set_precision``: rounding is position-independent, so
+    with one copy of each seam in existence there is nothing left to diverge,
+    whereas snap-rounding works against each geometry's own hot pixels and cannot
+    promise that. Rounding the copies separately is exactly what built razor fins:
+    a vertex present in one copy and absent from the other comes off the shared
+    straight line by a fraction of a grid step, and the base solid drapes the
+    sliver between the copies to the full DEM height.
 
-    ``unary_union`` afterwards dissolves the now-duplicate segments so each seam is
-    exactly one constraint edge, and ``set_precision(_, 0.0)`` clears the persistent
-    precision model (see ``_quantize_to_f32``).
+    Rounding can slide a segment across a nearby vertex, un-noding the arrangement,
+    so the round + re-node pair repeats until a pass leaves every coordinate on the
+    grid (re-noding on-grid input inserts no new vertices, so that pass is the
+    fixpoint; each round only moves the crossings the previous union created, and
+    in practice one or two passes suffice). Spikes that collapse onto themselves
+    dissolve in the union; ``polygonize`` then never sees a cell there.
 
-    ``pockets`` must be the pockets that will actually be built, so the constraints
-    and the draped regions agree.
+    The result is both the constraint set the base plate is triangulated against
+    and the source the pockets are rebuilt from, so the constraint edges and the
+    draped regions can never describe different line work.
     """
-    boundaries = [base_outline.boundary] + [pk.boundary for pk in pockets]
-    noded = unary_union(boundaries)
-    noded = shapely.set_precision(noded, output_resolution)
-    noded = shapely.set_precision(noded, 0.0)
-    return unary_union(noded)
+    noded = unary_union([base_outline.boundary]
+                        + [pk.boundary for pk in pocket_polys])
+    for _ in range(100):
+        noded = unary_union(_round_lines(noded, output_resolution))
+        coords = shapely.get_coordinates(noded)
+        if np.array_equal(coords,
+                          np.round(coords / output_resolution) * output_resolution):
+            return noded
+    raise RuntimeError(
+        "snap_arrangement did not reach an on-grid noded fixpoint")
 
 
 # --------------------------------------------------------------------------
@@ -673,17 +712,17 @@ def build_terrain_layout(
     # Densify BEFORE quantizing, so the f32 snap absorbs any inserted vertex that
     # lands within a ULP of a corner instead of leaving a sub-resolution sliver.
     base_outline = densify_on_grid(base_outline, frame)
-    # The pockets cut from this outline are snapped to the f32 output grid (as one
-    # arrangement, in node_and_snap); the outline they share their rim edge with must
-    # live on the same grid, or the rim exists in two near-coincident copies and the
-    # base solid drapes the hairline cell between them to the full DEM -- a
-    # zero-width, full-height razor fin along the rim.
+    # On the grid already here, because every clip below is computed against it and
+    # the arrangement round is idempotent on on-grid coordinates: when the outline
+    # joins the shared arrangement (snap_arrangement below), none of its vertices
+    # move, so the clips stay exact.
     base_outline = _quantize_to_f32(base_outline, output_resolution)
 
     # Per insert component: the pocket carved in the base (component + convex corner
     # relief) and the printed insert footprint (inset + reflex relief), both clipped
-    # to the cutout.
-    pockets: List[Tuple[int, object]] = []
+    # to the cutout. Pockets are only COLLECTED here; their final geometry comes out
+    # of the one shared arrangement below.
+    pocket_records: List[Tuple[int, object, bool]] = []   # (class, polygon, share)
     insert_parts: Dict[int, List[ShapelyPolygon]] = {tc: [] for tc in all_overlay_classes}
     for tc in all_overlay_classes:
         union_poly = class_polys_mm[tc]
@@ -697,7 +736,6 @@ def build_terrain_layout(
                 insert_src, base_outline.boundary, MIN_BLOB_MM ** 2)
             if insert_src is None:
                 continue
-
             # Corner relief comes off the cleaned, clipped footprint -- not the raw
             # component -- so a convex corner that lies outside the cutout cannot drop
             # a relief disc that floats just inside the rim as an orphan pocket blob.
@@ -706,27 +744,36 @@ def build_terrain_layout(
                 fit.corner_min_angle_deg)
 
             # Pocket = the cleaned footprint (the seat) + convex corner relief. NOT
-            # quantized here: the whole arrangement is snapped in one call later (see
-            # node_and_snap).
-            pocket_component = (unary_union([insert_src, pocket_extra])
-                                if pocket_extra is not None else insert_src)
-            pocket_poly = _clip_to_footprint(pocket_component, base_outline)
+            # quantized here: every pocket boundary joins one global arrangement,
+            # rounded onto the export grid in a single pass, and the pocket is then
+            # rebuilt FROM that arrangement (see snap_arrangement below).
+            if pocket_extra is None:
+                # Already clipped and rim-cleaned above; clipping again is another
+                # overlay op on coordinates that are final, and every such op can
+                # move them. Only the relief arcs can reach past the rim.
+                pocket_poly = insert_src
+            else:
+                pocket_poly = _clip_to_footprint(
+                    unary_union([insert_src, pocket_extra]), base_outline)
+            share = fit.xy_clearance_mm <= 0 and insert_cut is None
             if pocket_poly is not None and pocket_poly.area > 0:
-                # Corner-relief arcs and the inset are new curves, not clipped from
-                # anything already densified, so they need their own crossings.
-                pockets.append((tc, densify_on_grid(pocket_poly, frame)))
+                pocket_records.append(
+                    (tc, densify_on_grid(pocket_poly, frame), share))
 
             # Printed insert footprint: inset by the clearance + reflex corner relief.
-            if fit.xy_clearance_mm > 0 or insert_cut is not None:
-                insert_poly = _inset_polygon(insert_src, fit.xy_clearance_mm)
-                if insert_poly is None:
+            if share:
+                # Touching fit (one-piece multimaterial): the insert IS the pocket,
+                # so it takes the pocket's rebuilt pieces verbatim, below. Deriving
+                # the same curve twice is what must never happen: two copies of a
+                # seam that must be identical can part by up to a grid step.
+                continue
+            insert_poly = _inset_polygon(insert_src, fit.xy_clearance_mm)
+            if insert_poly is None:
+                continue
+            if insert_cut is not None:
+                insert_poly = insert_poly.difference(insert_cut).buffer(0)
+                if insert_poly.is_empty:
                     continue
-                if insert_cut is not None:
-                    insert_poly = insert_poly.difference(insert_cut).buffer(0)
-                    if insert_poly.is_empty:
-                        continue
-            else:
-                insert_poly = insert_src
             insert_poly = densify_on_grid(insert_poly, frame)
             insert_poly = _quantize_to_f32(insert_poly, output_resolution)
             if insert_poly is None:
@@ -736,12 +783,47 @@ def build_terrain_layout(
             insert_parts[tc].extend(p for p in iter_polygon_components(insert_poly)
                                     if p.area > 0)
 
+    # One arrangement, one quantization, THEN the split into pockets. The pockets
+    # come back as unions of the arrangement's own cells, so a pocket boundary IS a
+    # set of constraint edges the base is triangulated against -- sharing by
+    # construction, not by reconciling copies afterwards.
+    noded_boundaries = snap_arrangement(
+        base_outline, [poly for _tc, poly, _s in pocket_records], output_resolution)
+    cells = [c for c in polygonize(noded_boundaries) if c.area > 0]
+    pockets: List[Tuple[int, object]] = []
+    for tc, raw, share in pocket_records:
+        shapely.prepare(raw)
+        mine = [c for c in cells if raw.contains(c.representative_point())]
+        if not mine:
+            continue
+        # coverage_union of cells sharing exact edges: dissolves the interior
+        # edges, moves no vertex. Pockets may overlap (a convex corner-relief disc
+        # bulges across a neighbour), so a cell can belong to several records --
+        # the mesh resolves that by pocket order, unchanged.
+        rebuilt = shapely.coverage_union_all(mine)
+        # One entry per CONNECTED piece. A component is connected in the unclipped
+        # plane, but its arms may join only through terrain outside the print, so
+        # the cutout clip hands back several pieces. The mesh stage floors a whole
+        # entry at one Z, taken over everything in it -- so a rim arm high on the
+        # mountain would be sunk to the floor of the lowest piece anywhere in the
+        # print, and the insert seated in it would hang that far above its seat.
+        pieces = [p for p in iter_polygon_components(rebuilt) if p.area > 0]
+        pockets.extend((tc, p) for p in pieces)
+        if share:
+            insert_parts[tc].extend(pieces)
+
+    # The rim gains a vertex (rounded with everything else) wherever a pocket seam
+    # meets it; rebuild the outline from the same cells, so the rim the mesh walls
+    # follow is the arrangement's own, not a stale pre-noding copy.
+    covered = shapely.coverage_union_all(cells)
+    if not covered.is_empty:
+        base_outline = covered
+
     return TerrainLayout(
         base_class=base_class,
         overlay_classes=all_overlay_classes,
         base_outline=base_outline,
         pockets=pockets,
         insert_parts=insert_parts,
-        noded_boundaries=node_and_snap(base_outline, [pk for _tc, pk in pockets],
-                                       output_resolution),
+        noded_boundaries=noded_boundaries,
     )
