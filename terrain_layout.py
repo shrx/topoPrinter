@@ -16,9 +16,19 @@ point of this module:
      differences are the last thing to touch shared boundaries, so the cutout stays
      exactly partitioned. Simplifying afterwards would move each layer's chords
      independently and open overlaps and orphan slivers along every shared seam;
-  3. the cutout rim frets sub-printable bits off the partition; each is handed to a
-     neighbour rather than dropped, so the partition stays exact;
-  4. per component: clip to the rim, drop rim runts, apply insert fit clearances;
+  3. the cutout rim -- densified and quantized onto the export grid at birth, the
+     ONLY copy of that curve in the pipeline (a second raw copy disagrees with it
+     by a few um, and clipping one against the other writes that disagreement into
+     the boundary as micro-kinks sharp enough to fire corner reliefs) -- frets
+     sub-printable bits off the partition; each is handed to a neighbour rather
+     than dropped, so the partition stays exact;
+  4. per component: clip to the rim, drop small rim bits, apply insert fit
+     clearances -- measured to in-print neighbours only, so inserts sit flush at
+     the rim, and corner reliefs never fire on clip-manufactured rim vertices. A
+     bit the fit itself severs is dropped at footprint level too (its zone
+     removed, the fit redone), never after the inset -- a region returned to the
+     base behind the inset stands at full height with no clearance computed
+     against it;
   5. the base outline and every pocket boundary are noded into ONE arrangement and
      rounded onto the float32 export grid in one pass (``snap_arrangement``), and
      the pockets are then rebuilt as unions of that arrangement's cells. Every
@@ -265,24 +275,39 @@ def iter_polygon_components(geom: shapely.Geometry):
         yield from geom.geoms
 
 
-def _inset_polygon(polygon_mm, distance_mm: float):
-    """Shrink a polygon inward by ``distance_mm`` on every side.
+def _inset_polygon(polygon_mm, distance_mm: float, outline=None):
+    """Drop every point of the polygon within ``distance_mm`` of its neighbours.
 
-    Gives a separately-printed insert horizontal clearance from its pocket.
-    ``buffer(-d)`` may return a (Multi)Polygon or empty geometry when a feature is
-    narrower than 2*distance; both are handled downstream. Returns the original
-    polygon when distance is non-positive, or None if the inset erases it entirely.
+    Gives a separately-printed insert horizontal clearance from its pocket. With
+    ``outline`` given, the neighbours are the IN-PRINT complement
+    (``outline - polygon``) only: outside the cutout rim nothing exists, so the
+    insert keeps its rim edge and the print's perimeter stays a full circle --
+    a plain ``buffer(-d)`` would also retreat from the rim, recessing the whole
+    perimeter by a clearance-wide slit. Along real walls the two are identical.
+
+    The result may be a (Multi)Polygon (a neck thinner than 2*distance severs);
+    both are handled downstream. Returns the original polygon when distance is
+    non-positive, or None if the clearance erases it entirely.
     """
     if distance_mm <= 0:
         return polygon_mm
-    inset = polygon_mm.buffer(-distance_mm)
+    if outline is None:
+        inset = polygon_mm.buffer(-distance_mm)
+    else:
+        # Only neighbours within reach matter: collar the complement to a band
+        # around the polygon so the buffer runs on it, not on the whole print.
+        # Material beyond the collar is farther than the distance already and
+        # could at most touch the polygon tangentially.
+        collar = outline.intersection(polygon_mm.buffer(distance_mm))
+        neighbours = collar.difference(polygon_mm)
+        inset = polygon_mm.difference(neighbours.buffer(distance_mm)).buffer(0)
     if inset.is_empty:
         return None
     return inset
 
 
 def _corner_reliefs(component, clearance_mm: float, relief_mm: float,
-                    min_turn_deg: float):
+                    min_turn_deg: float, within=None, solid=None):
     """Corner-relief geometry for a separately-printed insert.
 
     FDM over-extrudes reentrant (inside) corners, so a sharp corner seats tighter
@@ -301,12 +326,34 @@ def _corner_reliefs(component, clearance_mm: float, relief_mm: float,
     flat clearance. The signed turn angle classifies convex vs reflex and catches
     needle-sharp corners (turn near 180 deg) that a sine test would miss.
 
+    ``component`` is the PRE-clip footprint. Clipping to the cutout manufactures
+    vertices ON the rim (wherever a mask edge meets the rim arc); a disc fired
+    there bites a dent into the print's perimeter and relieves nothing -- the
+    corner is open to the outside, there is no material to seat past. Those
+    vertices do not exist before the clip, so taking the corners pre-clip
+    excludes them without any "is this vertex on the rim" tolerance. Two vertex
+    filters keep the rest sane: ``within`` (the cutout footprint) drops corners
+    on or beyond the rim, and ``solid`` (the cleaned, clipped footprint) drops
+    corners whose piece the clip or the rim-bit cleanup removed -- either kind
+    of disc would otherwise carve a pocket where no insert exists.
+
+    Vertex tests alone do not protect the perimeter, for two reasons: the rim
+    fret welds bit boundaries into the pre-clip polygons, whose junction corners
+    sit ON the rim but register as "strictly inside" (a GEOS crossing point lands
+    within a few ULP of either curve), and a genuine reflex corner a fraction of
+    the disc radius inside the rim fires a disc that reaches through to it. So
+    the perimeter rule is enforced on the discs themselves: any disc that would
+    cross the rim is dropped whole. The print's perimeter stays a full circle,
+    tight corner or not -- a locked corner can be sanded, a notched rim cannot
+    be filled.
+
     Returns (pocket_extra, insert_cut): the union of convex discs to add to the
     pocket (or None) and the union of reflex discs to subtract from the insert.
     """
     if relief_mm <= 0:
         return None, None
     r = clearance_mm + relief_mm
+    rim = within.boundary if within is not None else None
     convex, reflex = [], []
     polys = component.geoms if component.geom_type == "MultiPolygon" else [component]
     rings = []
@@ -329,13 +376,22 @@ def _corner_reliefs(component, clearance_mm: float, relief_mm: float,
             turn = np.degrees(np.arctan2(cross, float(u @ w)))   # signed, -180..180
             if abs(turn) < min_turn_deg:
                 continue
+            vertex = Point(V)
+            if within is not None and not within.contains(vertex):
+                continue                 # on or past the rim: open corner, no seat
+            if solid is not None and not solid.covers(vertex):
+                continue                 # its piece was clipped or dropped away
             if turn > 0.0:                                       # convex -> relieve pocket
                 nu = np.array([-u[1], u[0]]); nw = np.array([-w[1], w[0]])  # inward normals
                 denom = max(1.0 + float(nu @ nw), 0.1)           # cap miter length at needles
                 P = V + clearance_mm * (nu + nw) / denom
-                convex.append(Point(P).buffer(r))
+                disc = Point(P).buffer(r)
+                if rim is None or not disc.intersects(rim):
+                    convex.append(disc)
             else:                                                # reflex -> relieve insert
-                reflex.append(Point(V).buffer(r))
+                disc = Point(V).buffer(r)
+                if rim is None or not disc.intersects(rim):
+                    reflex.append(disc)
     pocket_extra = unary_union(convex) if convex else None
     insert_cut = unary_union(reflex) if reflex else None
     return pocket_extra, insert_cut
@@ -373,7 +429,7 @@ def _drop_small_rim_bits(polygon_mm, rim, min_area_mm2: float):
     empty recessed notch in the perimeter. The dropped area sits in no pocket, so it
     stays ordinary base terrain (base = cutout - pockets). Interior components are
     untouched (resolve_layers already enforced min_blob on whole components); only
-    rim-touching runts go. Returns the cleaned geometry, or None if nothing remains.
+    rim-touching bits go. Returns the cleaned geometry, or None if nothing remains.
     """
     if polygon_mm is None or polygon_mm.is_empty:
         return None
@@ -673,6 +729,21 @@ def build_terrain_layout(
     if outline is not None and not dem_extent.covers(outline):
         outline = outline.intersection(dem_extent)
 
+    # THE one copy of the cutout rim, final from birth: densified (BEFORE
+    # quantizing, so the f32 snap absorbs any inserted vertex that lands within a
+    # ULP of a corner instead of leaving a sub-resolution sliver), then rounded
+    # onto the export grid. Every consumer below -- the rim fret, the clips, the
+    # clearance inset, snap_arrangement -- reads this object, so no coordinate of
+    # the rim ever exists in two versions. The raw cutout is deleted: clipping
+    # against one copy what was cut against another writes their disagreement (a
+    # few um) into the boundary as micro-kinks sharp enough to fire corner
+    # reliefs, each disc a visible dent in the print's perimeter.
+    output_resolution = frame.output_resolution
+    has_cutout = outline is not None
+    base_outline = densify_on_grid(outline if has_cutout else dem_extent, frame)
+    base_outline = _quantize_to_f32(base_outline, output_resolution)
+    del outline
+
     # Resolve masks -> mutually-exclusive inserts + base plate. Model mm is print mm,
     # so scale_m_per_mm=1.0. The oversized domain leaves inserts unclipped (the cutout
     # trims later); the complement it carves is clipped there too.
@@ -695,13 +766,13 @@ def build_terrain_layout(
     # footprint (so the rim is a real edge) but removed from / added to the full
     # (pre-cutout) polygons, so kept components keep their true outline and insert
     # inset/relief still seat flush against the rim.
-    if outline is not None:
+    if has_cutout:
         full = {base_class: base_poly_mm}
         for tc in all_overlay_classes:
             if class_polys_mm.get(tc) is not None:
                 full[tc] = class_polys_mm[tc]
-        clipped = {k: g.intersection(outline).buffer(0) for k, g in full.items()}
-        moves = fretted_bit_moves(clipped, outline.boundary, MIN_BLOB_MM,
+        clipped = {k: g.intersection(base_outline).buffer(0) for k, g in full.items()}
+        moves = fretted_bit_moves(clipped, base_outline.boundary, MIN_BLOB_MM,
                                   scale_m_per_mm=1.0)
         for frm, to, bit in moves:
             full[frm] = full[frm].difference(bit).buffer(0)
@@ -711,25 +782,15 @@ def build_terrain_layout(
             g = full.get(tc)
             class_polys_mm[tc] = g if g is not None and not g.is_empty else None
 
-    # Downsample polygons to the float32 STL output resolution before 2D->3D.
-    output_resolution = frame.output_resolution
-    base_outline = outline if outline is not None else dem_extent
-    # Densify BEFORE quantizing, so the f32 snap absorbs any inserted vertex that
-    # lands within a ULP of a corner instead of leaving a sub-resolution sliver.
-    base_outline = densify_on_grid(base_outline, frame)
-    # On the grid already here, because every clip below is computed against it and
-    # the arrangement round is idempotent on on-grid coordinates: when the outline
-    # joins the shared arrangement (snap_arrangement below), none of its vertices
-    # move, so the clips stay exact.
-    base_outline = _quantize_to_f32(base_outline, output_resolution)
-
     # Per insert component: the pocket carved in the base (component + convex corner
     # relief) and the printed insert footprint (inset + reflex relief), both clipped
     # to the cutout. Pockets are only COLLECTED here; their final geometry comes out
     # of the one shared arrangement below.
     pocket_records: List[Tuple[int, object, bool, Optional[ShapelyPolygon]]] = []
     # (class, polygon, share, floor-setting insert part or None)
+    part_records: List[Tuple[int, ShapelyPolygon]] = []
     insert_parts: Dict[int, List[ShapelyPolygon]] = {tc: [] for tc in all_overlay_classes}
+    rim = base_outline.boundary
     for tc in all_overlay_classes:
         union_poly = class_polys_mm[tc]
         if union_poly is None:
@@ -738,16 +799,72 @@ def build_terrain_layout(
             # Clip to the cutout, then drop small rim bits BEFORE the inset clearance
             # step, so the insert and its pocket are built from one cleaned footprint.
             insert_src = _clip_to_footprint(component, base_outline)
-            insert_src = _drop_small_rim_bits(
-                insert_src, base_outline.boundary, MIN_BLOB_MM ** 2)
+            insert_src = _drop_small_rim_bits(insert_src, rim, MIN_BLOB_MM ** 2)
             if insert_src is None:
                 continue
-            # Corner relief comes off the cleaned, clipped footprint -- not the raw
-            # component -- so a convex corner that lies outside the cutout cannot drop
-            # a relief disc that floats just inside the rim as an orphan pocket blob.
-            pocket_extra, insert_cut = _corner_reliefs(
-                insert_src, fit.xy_clearance_mm, fit.corner_relief_mm,
-                fit.corner_min_angle_deg)
+            # Fit loop: corner reliefs + clearance inset, redone whenever the fit
+            # severs a small rim bit off the footprint. The rule is the same as
+            # _drop_small_rim_bits, per severed PART: dropping the part but
+            # keeping its hole is exactly the "small bit removed, hole left in
+            # the polygon" perimeter dent. And the drop must happen at FOOTPRINT
+            # level, before the fit -- a part dropped after the inset returns
+            # its region to the base at full height with no clearance ever
+            # computed against it, and the neighbouring insert jams. So each
+            # bit's zone (the region of the footprint it can reach without
+            # crossing another part -- the per-part hole rule, applied to the
+            # footprint) is removed and the fit is rebuilt from the cleaned
+            # footprint; removing a zone moves the inset, which can sever a new
+            # bit, hence the loop. Every pass strictly shrinks the footprint.
+            for _ in range(100):
+                # Corner relief comes off the PRE-clip component: clipping
+                # manufactures vertices on the rim, and a disc fired there is a
+                # dent in the print's perimeter (see _corner_reliefs). The
+                # filters drop corners on or past the rim and corners on
+                # clipped/dropped pieces, so no disc can carve a pocket where no
+                # insert exists.
+                pocket_extra, insert_cut = _corner_reliefs(
+                    component, fit.xy_clearance_mm, fit.corner_relief_mm,
+                    fit.corner_min_angle_deg, within=base_outline,
+                    solid=insert_src)
+
+                # Printed insert footprint: inset by the clearance (flush at the
+                # rim: the clearance comes from in-print neighbours only) +
+                # reflex corner relief. The inset (a neck thinner than twice the
+                # clearance) and the reflex discs can sever it, so one footprint
+                # can yield several parts.
+                parts_local: List[ShapelyPolygon] = []
+                insert_poly = _inset_polygon(insert_src, fit.xy_clearance_mm,
+                                             outline=base_outline)
+                if insert_poly is not None and insert_cut is not None:
+                    insert_poly = insert_poly.difference(insert_cut).buffer(0)
+                if insert_poly is not None and not insert_poly.is_empty:
+                    # A part with no area yields no triangles and would be
+                    # silently skipped downstream -- i.e. the mesh stage
+                    # dropping a region.
+                    parts_local = [p for p in iter_polygon_components(
+                                       densify_on_grid(insert_poly, frame))
+                                   if p.area > 0]
+                rim_bits = [p for p in parts_local
+                            if p.area < MIN_BLOB_MM ** 2 and p.intersects(rim)]
+                if not rim_bits:
+                    break
+                zones = []
+                for p in rim_bits:
+                    cut = insert_src.difference(unary_union(
+                        [q for q in parts_local if q is not p])).buffer(0)
+                    rep = p.representative_point()
+                    zones.append(next(c for c in iter_polygon_components(cut)
+                                      if c.contains(rep)))
+                insert_src = insert_src.difference(
+                    unary_union(zones)).buffer(0)
+                if insert_src.is_empty:
+                    insert_src = None
+                    break
+            else:
+                raise RuntimeError(
+                    "rim-bit removal did not reach a bit-free fit")
+            if insert_src is None:
+                continue
 
             # Pocket = the cleaned footprint (the seat) + convex corner relief. NOT
             # quantized here: every pocket boundary joins one global arrangement,
@@ -774,22 +891,14 @@ def build_terrain_layout(
                         (tc, densify_on_grid(pocket_poly, frame), True, None))
                 continue
 
-            # Printed insert footprint: inset by the clearance + reflex corner
-            # relief. The inset (a neck thinner than twice the clearance) and the
-            # reflex discs can sever it, so one footprint can yield several parts.
-            parts_local: List[ShapelyPolygon] = []
-            insert_poly = _inset_polygon(insert_src, fit.xy_clearance_mm)
-            if insert_poly is not None and insert_cut is not None:
-                insert_poly = insert_poly.difference(insert_cut).buffer(0)
-            if insert_poly is not None and not insert_poly.is_empty:
-                insert_poly = densify_on_grid(insert_poly, frame)
-                insert_poly = _quantize_to_f32(insert_poly, output_resolution)
-                if insert_poly is not None:
-                    # A part with no area yields no triangles and would be silently
-                    # skipped downstream -- i.e. the mesh stage dropping a region.
-                    parts_local = [p for p in iter_polygon_components(insert_poly)
-                                   if p.area > 0]
-            insert_parts[tc].extend(parts_local)
+            # Parts are NOT quantized here, for the same reason the pockets are
+            # not: their boundaries join the one shared arrangement and the
+            # printed parts are rebuilt from its cells below. Quantizing a flush
+            # part now would move the densify-inserted vertices off the rim
+            # chords -- a um-different second copy of the rim that reaches the
+            # arrangement through the hole cuts and leaves unclaimed razor cells
+            # on the rim, which the base drapes as zero-width double walls.
+            part_records.extend((tc, p) for p in parts_local)
             if pocket_poly is None:
                 continue
 
@@ -832,17 +941,42 @@ def build_terrain_layout(
                     pocket_records.append(
                         (tc, densify_on_grid(c, frame), False, None))
 
-    # One arrangement, one quantization, THEN the split into pockets. The pockets
-    # come back as unions of the arrangement's own cells, so a pocket boundary IS a
-    # set of constraint edges the base is triangulated against -- sharing by
-    # construction, not by reconciling copies afterwards.
+    # One arrangement, one quantization, THEN the split into pockets and parts.
+    # Both come back as unions of the arrangement's own cells, so a pocket
+    # boundary IS a set of constraint edges the base is triangulated against, and
+    # the printed part, its seat and the rim are the same on-grid polyline --
+    # sharing by construction, not by reconciling copies afterwards.
     noded_boundaries = snap_arrangement(
-        base_outline, [poly for _tc, poly, _s, _r in pocket_records],
+        base_outline,
+        [poly for _tc, poly, _s, _r in pocket_records]
+        + [poly for _tc, poly in part_records],
         output_resolution)
     cells = [c for c in polygonize(noded_boundaries) if c.area > 0]
+
+    # Printed insert parts: the arrangement round above IS their export
+    # quantization. ``rebuilt_part`` maps each pre-arrangement part (the hole
+    # records' floor refs) to its rebuilt self.
+    rebuilt_part: Dict[int, ShapelyPolygon] = {}
+    for tc, raw in part_records:
+        shapely.prepare(raw)
+        mine = [c for c in cells if raw.contains(c.representative_point())]
+        if not mine:
+            continue
+        rebuilt = shapely.coverage_union_all(mine)
+        pieces = [p for p in iter_polygon_components(rebuilt) if p.area > 0]
+        insert_parts[tc].extend(pieces)
+        rep = raw.representative_point()
+        for p in pieces:
+            if p.contains(rep):
+                rebuilt_part[id(raw)] = p
+
     pockets: List[Tuple[int, object]] = []
     pocket_floor_refs: List[Optional[ShapelyPolygon]] = []
     for tc, raw, share, ref in pocket_records:
+        if ref is not None:
+            # The floor ref must be the PRINTED part (its rebuilt self), or None
+            # when the part did not survive the rebuild.
+            ref = rebuilt_part.get(id(ref))
         shapely.prepare(raw)
         mine = [c for c in cells if raw.contains(c.representative_point())]
         if not mine:

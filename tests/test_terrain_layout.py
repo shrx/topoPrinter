@@ -11,8 +11,8 @@ from mesh_builder import _compute_model_coordinates
 from model_frame import ModelFrame
 from masks import (TERRAIN_FOLIAGE, TERRAIN_GLACIER, TERRAIN_ROCK,
                    TERRAIN_WATER)
-from terrain_layout import (InsertFit, build_terrain_layout, densify_on_grid,
-                            rect_extent_m)
+from terrain_layout import (InsertFit, _corner_reliefs, build_terrain_layout,
+                            densify_on_grid, rect_extent_m)
 
 
 ROWS, COLS = 41, 61
@@ -46,6 +46,17 @@ def _crs_box(col0, row0, col1, row1):
     y0 = ORIGIN_Y - (row1 + 0.5) * PX
     y1 = ORIGIN_Y - (row0 + 0.5) * PX
     return mapping(box(x0, y0, x1, y1))
+
+
+def _crs_geom(geom_mm, x_size_mm=120.0):
+    """A GeoJSON geometry given in model mm (``_frame()``'s print space)."""
+    scale = (COLS - 1) * PX / x_size_mm
+    y_mm = (ROWS - 1) * PX / scale
+    return mapping(shapely.transform(
+        geom_mm,
+        lambda pts: np.column_stack([
+            ORIGIN_X + 0.5 * PX + pts[:, 0] * scale,
+            ORIGIN_Y - 0.5 * PX - (y_mm - pts[:, 1]) * scale])))
 
 
 class TestModelFrame:
@@ -438,3 +449,80 @@ class TestBuildTerrainLayout:
             frame, {TERRAIN_GLACIER: [_crs_box(10, 8, 30, 24)]}, outline=outline)
         insert = shapely.union_all(layout.insert_parts[TERRAIN_GLACIER])
         assert layout.base_outline.buffer(1e-9).contains(insert)
+
+    def test_insert_is_flush_at_the_rim(self):
+        """The clearance is measured to in-print neighbours only: where a mask
+        meets the cutout rim the insert reaches the rim, not clearance short of
+        it -- a plain buffer(-c) would recess the whole perimeter by a slit."""
+        frame = _frame()
+        outline = box(10.0, 10.0, 60.0, 50.0)
+        layout = build_terrain_layout(
+            frame, {TERRAIN_GLACIER: [_crs_geom(box(30.0, 20.0, 70.0, 40.0))]},
+            outline=outline, fit=InsertFit(xy_clearance_mm=0.5))
+        rim = layout.base_outline.boundary
+        part = max(layout.insert_parts[TERRAIN_GLACIER], key=lambda p: p.area)
+        assert part.intersects(rim), "the insert must reach the rim"
+        assert part.bounds[2] == pytest.approx(60.0, abs=1e-4)
+        # and it still clears the pocket walls that are not on the rim
+        pocket = max((pk for _tc, pk in layout.pockets), key=lambda p: p.area)
+        off_rim = pocket.exterior.difference(rim.buffer(1e-6))
+        assert part.distance(off_rim) >= 0.5 - 1e-3
+
+    def test_a_rim_bit_severed_by_the_fit_returns_to_the_base(self):
+        """A small bit the clearance inset severs at the rim is dropped at
+        FOOTPRINT level and the fit is redone. Neither half-measure is
+        acceptable: dropping just the part leaves its hole as a perimeter dent,
+        and returning the region to the base after the inset leaves full-height
+        base standing closer than the clearance to the kept insert."""
+        frame = _frame()
+        outline = box(10.0, 10.0, 60.0, 50.0)
+        mask = shapely.union_all([
+            box(20.0, 18.0, 40.0, 42.0),     # the real insert
+            box(40.0, 28.0, 57.0, 30.0),     # neck: thinner than 2*clearance
+            box(57.0, 27.0, 62.0, 30.6),     # sub-MIN_BLOB pad pinched at the rim
+        ])
+        layout = build_terrain_layout(
+            frame, {TERRAIN_GLACIER: [_crs_geom(mask)]}, outline=outline,
+            fit=InsertFit(xy_clearance_mm=1.5))
+        rim = layout.base_outline.boundary
+        parts = layout.insert_parts[TERRAIN_GLACIER]
+        assert len(parts) == 1, "only the blob insert survives"
+        assert parts[0].distance(rim) > 1.0, "no insert remains at the rim"
+        # no hole is left behind: the pad and the neck are base again, and no
+        # pocket reaches the rim at all
+        pockets = shapely.union_all([pk for _tc, pk in layout.pockets])
+        assert not pockets.covers(shapely.Point(59.0, 29.0))    # pad region
+        assert not pockets.covers(shapely.Point(50.0, 29.0))    # neck region
+        assert pockets.distance(rim) > 1.0
+        # the kept insert clears every wall of its (re-fitted) seat, up to the
+        # arc-chord sagitta of the offset-curve discretization
+        assert pockets.covers(parts[0])
+        assert parts[0].distance(pockets.exterior) >= 1.5 - 0.01
+
+
+class TestCornerReliefRimRule:
+    """No relief disc may break the print's perimeter (see _corner_reliefs)."""
+
+    def test_clip_manufactured_rim_corners_fire_nothing(self):
+        """Corners come from the PRE-clip component, so the junction vertices the
+        clip creates on the rim do not exist and fire no discs."""
+        within = box(0.0, 0.0, 20.0, 20.0)
+        component = box(5.0, 5.0, 25.0, 15.0)         # sticks out through the rim
+        solid = component.intersection(within)         # has 90-deg rim junctions
+        pocket_extra, insert_cut = _corner_reliefs(
+            component, 0.06, 0.25, 45.0, within=within, solid=solid)
+        assert insert_cut is None
+        assert pocket_extra is not None, "the two interior corners are relieved"
+        assert not pocket_extra.intersects(within.boundary)
+        assert pocket_extra.bounds[2] < 6.0, "discs only at the x=5 corners"
+
+    def test_a_disc_that_would_cross_the_rim_is_dropped_whole(self):
+        """A genuine corner a fraction of the disc radius inside the rim fires a
+        disc that reaches the perimeter: dropped, tight corner or not."""
+        within = box(0.0, 0.0, 20.0, 20.0)
+        component = box(5.0, 5.0, 19.9, 15.0)          # corners 0.1 inside the rim
+        pocket_extra, _ = _corner_reliefs(
+            component, 0.06, 0.25, 45.0, within=within, solid=component)
+        assert pocket_extra is not None
+        assert not pocket_extra.intersects(within.boundary)
+        assert pocket_extra.bounds[2] < 6.0, "the near-rim discs are gone"
