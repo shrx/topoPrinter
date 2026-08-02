@@ -1248,28 +1248,46 @@ def build_terrain_meshes(
 
     # --- Pocket floors. Every pocket the layout emitted is built: it owns the 2D
     # geometry, including which pieces are viable, so nothing is filtered here.
+    # The floor comes off the insert part seated in the pocket when the layout
+    # named one (pocket_floor_refs): floor = dem_min(part) - thickness, so the
+    # seating gap is exactly the z clearance. A recess with no insert floors off
+    # its own ground.
     raw_pockets = [pocket_poly for _tc, pocket_poly in layout.pockets]
+    floor_refs = list(layout.pocket_floor_refs)
+    if len(floor_refs) != len(raw_pockets):     # layouts predating floor refs
+        floor_refs = [None] * len(raw_pockets)
     pocket_top_fns = []
-    for pocket_poly in raw_pockets:
+    floors = []
+    for pocket_poly, ref in zip(raw_pockets, floor_refs):
         if recess_mode == "uniform":
             pocket_top_fns.append(lambda xy: sample_dem(xy) - overlay_thickness_mm)
             continue
-        tmin = _dem_min_over(pocket_poly, sample_dem, frame, resolution)
+        tmin = _dem_min_over(ref if ref is not None else pocket_poly,
+                             sample_dem, frame, resolution)
         if tmin is None:
             raise ValueError(
                 "pocket has no top surface; the layout must not emit a degenerate "
                 "region, and the mesh stage must not drop one")
-        pocket_top_fns.append(_flat(max(tmin - overlay_thickness_mm, 0.01)))
+        floors.append(max(tmin - overlay_thickness_mm, 0.01))
+        pocket_top_fns.append(_flat(floors[-1]))
+    # Where pockets overlap (per-part holes share their connector web, relief
+    # discs bulge across a neighbour), the overlap gets the LOWER floor.
+    # build_base_solid takes the first containing pocket, so hand it the pockets
+    # ordered deepest-first. Uniform mode floors all follow the terrain, so there
+    # is nothing to order.
+    if recess_mode != "uniform" and floors:
+        order = np.argsort(np.asarray(floors), kind="stable")
+        raw_pockets = [raw_pockets[k] for k in order]
+        pocket_top_fns = [pocket_top_fns[k] for k in order]
 
     # --- Base plate: base-class terrain at the DEM everywhere an insert doesn't seat,
     # plus each pocket recess floor -- one watertight, manifold terraced solid.
     # build_base_solid triangulates the whole cutout ONCE with every region border as a
     # constraint (so shared edges are bit-identical, no cracks) and drapes/floors each
-    # triangle by the highest-priority pocket holding its centroid, else the DEM. Pockets
-    # may overlap (convex corner-relief discs bulge across the glacier/rock snow line,
-    # plus a tiny resolve_layers leftover); the centroid-priority assignment resolves the
-    # overlap, and pockets only floor the recess (insert seating is built from
-    # layout.insert_parts) so a relief overlap never touches the insert fit.
+    # triangle by the first pocket holding its centroid, else the DEM. The pockets
+    # arrive ordered deepest-first (above), so where they overlap the lower floor
+    # wins, and pockets only floor the recess (insert seating is built from
+    # layout.insert_parts) so an overlap never touches the insert fit.
     base_mesh = build_base_solid(layout.base_outline, [layout.noded_boundaries],
                                  raw_pockets,
                                  pocket_top_fns, sample_dem, frame, resolution)

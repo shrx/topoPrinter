@@ -89,10 +89,14 @@ class TerrainLayout:
     and snapped into one arrangement, already quantized to the export's float32
     resolution, and already free of degenerate pieces.
 
-    ``pockets`` is ORDERED: where two pockets overlap (a convex corner-relief disc
-    can bulge across a neighbouring layer), the base solid resolves the overlap by
-    the first pocket whose region holds the triangle centroid, so this order is
-    the precedence and must not be rearranged.
+    Pockets may OVERLAP: per-part holes cut from one connected recess share their
+    connector web, and a convex corner-relief disc can bulge across a neighbouring
+    layer. The mesh floors an overlap at the LOWER of the overlapping floors.
+
+    ``pocket_floor_refs`` runs parallel to ``pockets``: the insert part whose
+    ground sets the pocket's flat floor (``dem_min(part) - thickness``, making the
+    seating gap exactly the z clearance), or None for a recess with no insert,
+    which floors off its own ground.
 
     ``noded_boundaries`` is the constraint set the base plate is triangulated
     against -- the outline and every pocket boundary noded and rounded as one
@@ -106,6 +110,7 @@ class TerrainLayout:
     base_outline: ShapelyPolygon
     pockets: List[Tuple[int, Union[ShapelyPolygon, MultiPolygon]]] = field(default_factory=list)
     insert_parts: Dict[int, List[ShapelyPolygon]] = field(default_factory=dict)
+    pocket_floor_refs: List[Optional[ShapelyPolygon]] = field(default_factory=list)
     noded_boundaries: object = None
 
     @property
@@ -722,7 +727,8 @@ def build_terrain_layout(
     # relief) and the printed insert footprint (inset + reflex relief), both clipped
     # to the cutout. Pockets are only COLLECTED here; their final geometry comes out
     # of the one shared arrangement below.
-    pocket_records: List[Tuple[int, object, bool]] = []   # (class, polygon, share)
+    pocket_records: List[Tuple[int, object, bool, Optional[ShapelyPolygon]]] = []
+    # (class, polygon, share, floor-setting insert part or None)
     insert_parts: Dict[int, List[ShapelyPolygon]] = {tc: [] for tc in all_overlay_classes}
     for tc in all_overlay_classes:
         union_poly = class_polys_mm[tc]
@@ -756,50 +762,96 @@ def build_terrain_layout(
                 pocket_poly = _clip_to_footprint(
                     unary_union([insert_src, pocket_extra]), base_outline)
             share = fit.xy_clearance_mm <= 0 and insert_cut is None
-            if pocket_poly is not None and pocket_poly.area > 0:
-                pocket_records.append(
-                    (tc, densify_on_grid(pocket_poly, frame), share))
-
-            # Printed insert footprint: inset by the clearance + reflex corner relief.
+            if pocket_poly is not None and pocket_poly.area <= 0:
+                pocket_poly = None
             if share:
                 # Touching fit (one-piece multimaterial): the insert IS the pocket,
                 # so it takes the pocket's rebuilt pieces verbatim, below. Deriving
                 # the same curve twice is what must never happen: two copies of a
                 # seam that must be identical can part by up to a grid step.
+                if pocket_poly is not None:
+                    pocket_records.append(
+                        (tc, densify_on_grid(pocket_poly, frame), True, None))
                 continue
+
+            # Printed insert footprint: inset by the clearance + reflex corner
+            # relief. The inset (a neck thinner than twice the clearance) and the
+            # reflex discs can sever it, so one footprint can yield several parts.
+            parts_local: List[ShapelyPolygon] = []
             insert_poly = _inset_polygon(insert_src, fit.xy_clearance_mm)
-            if insert_poly is None:
-                continue
-            if insert_cut is not None:
+            if insert_poly is not None and insert_cut is not None:
                 insert_poly = insert_poly.difference(insert_cut).buffer(0)
-                if insert_poly.is_empty:
-                    continue
-            insert_poly = densify_on_grid(insert_poly, frame)
-            insert_poly = _quantize_to_f32(insert_poly, output_resolution)
-            if insert_poly is None:
+            if insert_poly is not None and not insert_poly.is_empty:
+                insert_poly = densify_on_grid(insert_poly, frame)
+                insert_poly = _quantize_to_f32(insert_poly, output_resolution)
+                if insert_poly is not None:
+                    # A part with no area yields no triangles and would be silently
+                    # skipped downstream -- i.e. the mesh stage dropping a region.
+                    parts_local = [p for p in iter_polygon_components(insert_poly)
+                                   if p.area > 0]
+            insert_parts[tc].extend(parts_local)
+            if pocket_poly is None:
                 continue
-            # A part with no area yields no triangles and would be silently skipped
-            # downstream -- i.e. the mesh stage dropping a region. Drop it here.
-            insert_parts[tc].extend(p for p in iter_polygon_components(insert_poly)
-                                    if p.area > 0)
+
+            if len(parts_local) <= 1:
+                # One insert (or none) in this recess: the whole recess is its
+                # hole. The part sets the floor; with no insert (the inset erased
+                # it entirely) the recess floors off its own ground.
+                pocket_records.append(
+                    (tc, densify_on_grid(pocket_poly, frame), False,
+                     parts_local[0] if parts_local else None))
+                continue
+
+            # Several inserts in one connected recess: hole and insert must be
+            # 1:1, each hole flat at its own part's floor. hole_i is the connected
+            # region of the recess the part can reach without crossing another
+            # part -- built purely from curves that already exist (the recess
+            # outline and the other parts' outlines), so no re-derived curve can
+            # run near-parallel to an existing one. Holes OVERLAP on the shared
+            # connector web; the mesh gives an overlap the lower floor.
+            claimed = []
+            for part in parts_local:
+                cut = pocket_poly.difference(
+                    unary_union([q for q in parts_local if q is not part])).buffer(0)
+                rep = part.representative_point()
+                hole = next((c for c in iter_polygon_components(cut)
+                             if c.contains(rep)), None)
+                if hole is None:
+                    raise ValueError(
+                        "insert part lies in no component of its own recess; the "
+                        "layout must not emit an insert without a hole")
+                pocket_records.append(
+                    (tc, densify_on_grid(hole, frame), False, part))
+                claimed.append(hole)
+            # Web pieces no part can reach (sealed off behind other parts) still
+            # belong to the recess; they hold no insert and floor off their own
+            # ground, like a recess whose insert vanished.
+            leftover = pocket_poly.difference(unary_union(claimed)).buffer(0)
+            for c in iter_polygon_components(leftover):
+                if c.area > 0:
+                    pocket_records.append(
+                        (tc, densify_on_grid(c, frame), False, None))
 
     # One arrangement, one quantization, THEN the split into pockets. The pockets
     # come back as unions of the arrangement's own cells, so a pocket boundary IS a
     # set of constraint edges the base is triangulated against -- sharing by
     # construction, not by reconciling copies afterwards.
     noded_boundaries = snap_arrangement(
-        base_outline, [poly for _tc, poly, _s in pocket_records], output_resolution)
+        base_outline, [poly for _tc, poly, _s, _r in pocket_records],
+        output_resolution)
     cells = [c for c in polygonize(noded_boundaries) if c.area > 0]
     pockets: List[Tuple[int, object]] = []
-    for tc, raw, share in pocket_records:
+    pocket_floor_refs: List[Optional[ShapelyPolygon]] = []
+    for tc, raw, share, ref in pocket_records:
         shapely.prepare(raw)
         mine = [c for c in cells if raw.contains(c.representative_point())]
         if not mine:
             continue
         # coverage_union of cells sharing exact edges: dissolves the interior
-        # edges, moves no vertex. Pockets may overlap (a convex corner-relief disc
-        # bulges across a neighbour), so a cell can belong to several records --
-        # the mesh resolves that by pocket order, unchanged.
+        # edges, moves no vertex. Pockets may overlap (per-part holes share their
+        # connector web, and a convex corner-relief disc bulges across a
+        # neighbour), so a cell can belong to several records -- the mesh floors
+        # an overlap at the lower of the overlapping floors.
         rebuilt = shapely.coverage_union_all(mine)
         # One entry per CONNECTED piece. A component is connected in the unclipped
         # plane, but its arms may join only through terrain outside the print, so
@@ -808,7 +860,11 @@ def build_terrain_layout(
         # mountain would be sunk to the floor of the lowest piece anywhere in the
         # print, and the insert seated in it would hang that far above its seat.
         pieces = [p for p in iter_polygon_components(rebuilt) if p.area > 0]
-        pockets.extend((tc, p) for p in pieces)
+        rep = ref.representative_point() if ref is not None else None
+        for p in pieces:
+            pockets.append((tc, p))
+            pocket_floor_refs.append(
+                ref if rep is not None and p.contains(rep) else None)
         if share:
             insert_parts[tc].extend(pieces)
 
@@ -825,5 +881,6 @@ def build_terrain_layout(
         base_outline=base_outline,
         pockets=pockets,
         insert_parts=insert_parts,
+        pocket_floor_refs=pocket_floor_refs,
         noded_boundaries=noded_boundaries,
     )
