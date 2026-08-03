@@ -15,8 +15,7 @@ from rasterio.transform import from_origin
 from shapely.geometry import (LineString, MultiLineString, Point,
                               Polygon as ShapelyPolygon, box)
 
-from mesh_builder import (_cells_crossed_by, _constraint_segments,
-                          _crs_point_to_model_xy, _dem_sampler,
+from mesh_builder import (_cells_crossed_by, _constraint_segments, _dem_sampler,
                           _interior_grid_points, _nodes_near_segments)
 from model_frame import ModelFrame
 from terrain_layout import densify_on_grid
@@ -52,51 +51,42 @@ class TestGridFrameFixture:
         assert np.array_equal(frame.grid_ys, np.linspace(0.0, 8.0, 9))
 
 
-class TestCrsPointToModelXy:
-    """Byte-for-byte the same mapping as ModelFrame.point_to_mm.
+class TestCrsPointToModelMm:
+    """The CRS -> model-mm mapping every stage now shares (ModelFrame.point_to_mm).
 
-    The two are independent copies of the same four lines, in the module that meshes
-    and the module that lays out polygons. If they ever drift, inserts stop matching
-    the pockets they seat into -- and the drift would be a fraction of a millimetre,
-    far too small to notice in a render. So equality is asserted to the last bit.
+    The mesh module used to carry its own copy of these four lines; it went with the
+    plain raster path, so there is one mapping left and these pin its convention.
     """
-
-    def _pairs(self):
-        rng = np.random.default_rng(11)
-        return np.column_stack((
-            rng.uniform(ORIGIN_X, ORIGIN_X + COLS * PX, 200),
-            rng.uniform(ORIGIN_Y - ROWS * PX, ORIGIN_Y, 200),
-        ))
-
-    def test_matches_model_frame_exactly(self):
-        frame = _frame()
-        for x, y in self._pairs():
-            mine = _crs_point_to_model_xy(x, y, frame.ref_transform, ROWS, COLS,
-                                          X_SIZE_MM, frame.model_y_mm)
-            assert mine == frame.point_to_mm(x, y)
 
     def test_pixel_centres_land_on_the_model_corners(self):
         """Vertex (i, j) is the CENTRE of pixel (i, j), so the half-pixel comes off."""
         frame = _frame()
-        first = _crs_point_to_model_xy(ORIGIN_X + 0.5 * PX, ORIGIN_Y - 0.5 * PX,
-                                       frame.ref_transform, ROWS, COLS, X_SIZE_MM,
-                                       frame.model_y_mm)
-        last = _crs_point_to_model_xy(ORIGIN_X + (COLS - 0.5) * PX,
-                                      ORIGIN_Y - (ROWS - 0.5) * PX,
-                                      frame.ref_transform, ROWS, COLS, X_SIZE_MM,
-                                      frame.model_y_mm)
+        first = frame.point_to_mm(ORIGIN_X + 0.5 * PX, ORIGIN_Y - 0.5 * PX)
+        last = frame.point_to_mm(ORIGIN_X + (COLS - 0.5) * PX,
+                                 ORIGIN_Y - (ROWS - 0.5) * PX)
         assert first == pytest.approx((0.0, frame.model_y_mm))
         assert last == pytest.approx((X_SIZE_MM, 0.0))
 
     def test_northing_is_flipped_but_easting_is_not(self):
         """Row 0 is the TOP of the DEM, so Y descends while X ascends."""
         frame = _frame()
-        args = (frame.ref_transform, ROWS, COLS, X_SIZE_MM, frame.model_y_mm)
-        west = _crs_point_to_model_xy(ORIGIN_X + 100.0, ORIGIN_Y - 100.0, *args)
-        east = _crs_point_to_model_xy(ORIGIN_X + 200.0, ORIGIN_Y - 100.0, *args)
-        south = _crs_point_to_model_xy(ORIGIN_X + 100.0, ORIGIN_Y - 200.0, *args)
+        west = frame.point_to_mm(ORIGIN_X + 100.0, ORIGIN_Y - 100.0)
+        east = frame.point_to_mm(ORIGIN_X + 200.0, ORIGIN_Y - 100.0)
+        south = frame.point_to_mm(ORIGIN_X + 100.0, ORIGIN_Y - 200.0)
         assert east[0] > west[0], "more Easting -> more model X"
         assert south[1] < west[1], "less Northing -> less model Y"
+
+    def test_vectorized_matches_the_scalar_mapping(self):
+        """coords_to_mm is the ring-at-a-time copy; it must not drift from point_to_mm."""
+        frame = _frame()
+        rng = np.random.default_rng(11)
+        pts = np.column_stack((
+            rng.uniform(ORIGIN_X, ORIGIN_X + COLS * PX, 200),
+            rng.uniform(ORIGIN_Y - ROWS * PX, ORIGIN_Y, 200),
+        ))
+        bulk = frame.coords_to_mm(pts)
+        for (x, y), got in zip(pts, bulk):
+            assert tuple(got) == frame.point_to_mm(x, y)
 
 
 class TestDemSampler:

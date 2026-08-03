@@ -1,418 +1,22 @@
 """Mesh generation and STL export.
 
-Two entry points:
-
-  * ``dem_to_vertices_and_faces`` -- the plain single-body relief block (no terrain
-    classes), with its own cutout mesh builders;
-  * ``build_terrain_meshes`` -- extrudes a finished ``terrain_layout.TerrainLayout``
-    into the base plate + insert bodies. That path does no polygon work at all: the
-    layout's boundaries are final and already snapped to the float32 export grid, so
-    anything here that moved one would break the shared seams.
+One entry point: ``build_terrain_meshes`` extrudes a finished
+``terrain_layout.TerrainLayout`` into the base plate + insert bodies. It does no
+polygon work at all -- the layout's boundaries are final and already snapped to the
+float32 export grid, so anything here that moved one would break the shared seams.
+A print with no mask providers reaches it too: the layout resolves to a single base
+layer covering the cutout, and this stage drapes it over the DEM.
 """
 
 from typing import Tuple, Optional
 
 import numpy as np
-from pyproj import Transformer
 from rasterio.features import rasterize
 from rasterio.transform import from_origin
 import trimesh
 
-from shapely.geometry import Polygon as ShapelyPolygon
-from shapely.ops import unary_union
 import shapely
-
-from bearing_utils import rotate_to_bearing_frame, rotate_from_bearing_frame
-
-
-def _build_rectangular_mesh(
-    rows: int,
-    cols: int,
-    X: np.ndarray,
-    Y: np.ndarray,
-    z_surface_mm: np.ndarray,
-    valid_mask: np.ndarray,
-    z_base: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build rectangular watertight mesh from DEM grid.
-
-    Fully vectorized (NumPy) construction of the top surface, flat/draped base,
-    and perimeter walls. Produces the same indexed mesh as the previous
-    per-cell Python loops, but at C speed and with much lower peak memory.
-
-    Returns:
-        Tuple of (vertices, faces, vertex_map)
-    """
-    # A cell is valid if all 4 corners have valid data
-    cell_is_valid = (
-        valid_mask[:-1, :-1] &
-        valid_mask[1:, :-1] &
-        valid_mask[1:, 1:] &
-        valid_mask[:-1, 1:]
-    )
-
-    # A vertex is "used" if any of the (up to 4) cells incident to it is valid.
-    # Scatter each valid cell onto its four corner vertices via shifted ORs.
-    vertex_used = np.zeros((rows, cols), dtype=bool)
-    vertex_used[:-1, :-1] |= cell_is_valid   # corner (i,   j)
-    vertex_used[1:, :-1] |= cell_is_valid    # corner (i+1, j)
-    vertex_used[1:, 1:] |= cell_is_valid     # corner (i+1, j+1)
-    vertex_used[:-1, 1:] |= cell_is_valid    # corner (i,   j+1)
-    vertex_used &= valid_mask
-
-    # Assign sequential vertex indices in row-major order (matches np.where).
-    n_used = int(vertex_used.sum())
-    vertex_map = np.full((rows, cols), -1, dtype=np.int32)
-    vertex_map[vertex_used] = np.arange(n_used, dtype=np.int32)
-
-    if n_used == 0:
-        return (
-            np.zeros((0, 3), dtype=np.float32),
-            np.zeros((0, 3), dtype=np.int64),
-            vertex_map,
-        )
-
-    # Vertices: top surface block followed by base block (row-major order).
-    ii, jj = np.where(vertex_used)
-    xv, yv = X[ii, jj], Y[ii, jj]
-    z_b = z_base[ii, jj] if z_base is not None else np.zeros(n_used, dtype=X.dtype)
-    vertices = np.empty((2 * n_used, 3), dtype=np.float32)
-    vertices[:n_used, 0] = xv
-    vertices[:n_used, 1] = yv
-    vertices[:n_used, 2] = z_surface_mm[ii, jj]
-    vertices[n_used:, 0] = xv
-    vertices[n_used:, 1] = yv
-    vertices[n_used:, 2] = z_b
-    base_offset = n_used
-
-    # Corner vertex indices for every valid cell (all guaranteed >= 0).
-    ci, cj = np.where(cell_is_valid)
-    v00 = vertex_map[ci, cj]
-    v10 = vertex_map[ci + 1, cj]
-    v11 = vertex_map[ci + 1, cj + 1]
-    v01 = vertex_map[ci, cj + 1]
-    b00, b10, b11, b01 = (
-        v00 + base_offset, v10 + base_offset,
-        v11 + base_offset, v01 + base_offset,
-    )
-
-    def _interleave(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """Interleave two (N,3) arrays into (2N,3): a[0], b[0], a[1], b[1], ..."""
-        out = np.empty((a.shape[0] * 2, 3), dtype=np.int64)
-        out[0::2] = a
-        out[1::2] = b
-        return out
-
-    # Top surface: two triangles per valid cell.
-    top_faces = _interleave(
-        np.column_stack((v00, v10, v11)),
-        np.column_stack((v00, v11, v01)),
-    )
-    # Base surface (reversed winding).
-    base_faces = _interleave(
-        np.column_stack((b00, b11, b10)),
-        np.column_stack((b00, b01, b11)),
-    )
-
-    # Perimeter walls: an edge gets walls unless the adjacent cell is also
-    # valid. Neighbor lookups use a 2-cell zero-padded mask so out-of-bounds
-    # neighbors read as invalid (reproducing the original boundary behavior).
-    P = np.zeros((rows + 4, cols + 4), dtype=bool)
-    P[2:2 + rows, 2:2 + cols] = valid_mask
-
-    def _V(di: int, dj: int) -> np.ndarray:
-        return P[ci + 2 + di, cj + 2 + dj]
-
-    add_left = ~(_V(0, -1) & _V(1, -1))
-    add_right = ~(_V(0, 2) & _V(1, 2))
-    add_top = ~(_V(-1, 0) & _V(-1, 1))
-    add_bottom = ~(_V(2, 0) & _V(2, 1))
-
-    wall_blocks = []
-    if add_left.any():
-        m = add_left
-        wall_blocks.append(_interleave(
-            np.column_stack((v00[m], b00[m], v10[m])),
-            np.column_stack((v10[m], b00[m], b10[m])),
-        ))
-    if add_right.any():
-        m = add_right
-        wall_blocks.append(_interleave(
-            np.column_stack((v01[m], v11[m], b01[m])),
-            np.column_stack((v11[m], b11[m], b01[m])),
-        ))
-    if add_top.any():
-        m = add_top
-        wall_blocks.append(_interleave(
-            np.column_stack((v00[m], v01[m], b00[m])),
-            np.column_stack((v01[m], b01[m], b00[m])),
-        ))
-    if add_bottom.any():
-        m = add_bottom
-        wall_blocks.append(_interleave(
-            np.column_stack((v10[m], b10[m], v11[m])),
-            np.column_stack((v11[m], b10[m], b11[m])),
-        ))
-
-    faces = np.concatenate([top_faces, base_faces, *wall_blocks], axis=0)
-    return vertices, faces, vertex_map
-
-
-def _crs_point_to_model_xy(
-    x_crs: float,
-    y_crs: float,
-    ref_transform,
-    rows: int,
-    cols: int,
-    x_size_mm: float,
-    model_y_mm: float,
-) -> Tuple[float, float]:
-    """Map one CRS point to model mm exactly (pixel-center convention).
-
-    Grid vertex (i, j) carries the DEM sample of pixel (i, j), whose CRS
-    location is the pixel CENTER (col + 0.5, row + 0.5 in pixel space), so the
-    CRS->model mapping must subtract that half-pixel before scaling:
-    model_x = ((x - c)/a - 0.5) / (cols-1) * x_size_mm
-    model_y = model_y_mm * (1 - ((y - f)/e - 0.5) / (rows-1))
-    """
-    col_frac = (x_crs - ref_transform.c) / ref_transform.a - 0.5
-    row_frac = (y_crs - ref_transform.f) / ref_transform.e - 0.5
-    model_x = col_frac / (cols - 1) * x_size_mm
-    model_y = model_y_mm * (1 - row_frac / (rows - 1))
-    return model_x, model_y
-
-
-def _build_rect_cutout_mesh(
-    dem: np.ndarray,
-    px_size_x: float,
-    px_size_y: float,
-    x_size_mm: float,
-    model_y_mm: float,
-    z_surface_mm: np.ndarray,
-    valid_mask: np.ndarray,
-    X: np.ndarray,
-    Y: np.ndarray,
-    c1_x_crs: float,
-    c1_y_crs: float,
-    c2_x_crs: float,
-    c2_y_crs: float,
-    bearing: float,
-    ref_transform: object,
-    base_thickness_mm: float,
-) -> Tuple[np.ndarray, np.ndarray, float]:
-    """
-    Build mesh with exact rectangular bounds using boolean intersection.
-
-    Args:
-        dem: DEM array
-        px_size_x, px_size_y: Pixel sizes in meters
-        x_size_mm, model_y_mm: Model dimensions in mm
-        z_surface_mm: Surface elevations in mm (rows x cols)
-        valid_mask: Valid data mask (rows x cols)
-        X, Y: Meshgrid of model coordinates (rows x cols)
-        c1_x_crs, c1_y_crs: First corner in CRS coordinates (corner A)
-        c2_x_crs, c2_y_crs: Second corner in CRS coordinates (corner C, opposite to A)
-        bearing: Bearing in degrees (direction of AD edge)
-        ref_transform: Rasterio affine transform
-        base_thickness_mm: Base thickness
-
-    Returns:
-        Tuple of (vertices, faces, max_z)
-    """
-    rows, cols = dem.shape
-
-    # Build rectangular DEM mesh for boolean intersection
-    vertices_dem, faces_dem, _ = _build_rectangular_mesh(rows, cols, X, Y, z_surface_mm, valid_mask)
-    dem_mesh = trimesh.Trimesh(vertices=vertices_dem, faces=faces_dem, process=False)
-
-    # Decompose diagonal into width (perpendicular to bearing) and height (along bearing)
-    dx_crs = c2_x_crs - c1_x_crs
-    dy_crs = c2_y_crs - c1_y_crs
-    bearing_rad = np.radians(bearing)
-    AB_length_m, AD_length_m = rotate_to_bearing_frame(dx_crs, dy_crs, bearing_rad)
-    AB_length_m = abs(AB_length_m)
-    AD_length_m = abs(AD_length_m)
-
-    # Model scale: mm per CRS meter (grid spans cols-1 pixel spacings, first to last
-    # pixel center). The caller has pinned x_size_mm to the rectangle, so this single
-    # scale is already the final one -- the rectangle measures the requested print
-    # width here, and nothing rescales the mesh afterwards.
-    terrain_width_m = px_size_x * (cols - 1)
-    dem_scale = x_size_mm / terrain_width_m
-
-    rect_width_mm_final = AB_length_m * dem_scale
-    rect_height_mm_final = AD_length_m * dem_scale
-
-    # Find center in model mm (exact, no pixel snapping)
-    center_x_crs = (c1_x_crs + c2_x_crs) / 2.0
-    center_y_crs = (c1_y_crs + c2_y_crs) / 2.0
-    center_x_mm, center_y_mm = _crs_point_to_model_xy(
-        center_x_crs, center_y_crs, ref_transform, rows, cols, x_size_mm, model_y_mm)
-
-    # Create box for intersection
-    max_terrain_z = float(np.max(z_surface_mm[valid_mask]))
-    box_height = max(max_terrain_z * 2, base_thickness_mm * 3)
-
-    half_w = rect_width_mm_final / 2.0
-    half_h = rect_height_mm_final / 2.0
-
-    box_verts = [
-        [-half_w, -half_h, 0], [half_w, -half_h, 0], [half_w, half_h, 0], [-half_w, half_h, 0],
-        [-half_w, -half_h, box_height], [half_w, -half_h, box_height],
-        [half_w, half_h, box_height], [-half_w, half_h, box_height],
-    ]
-
-    # Rotate box from bearing-local frame to CRS-aligned model space and translate to center
-    box_verts_rot = []
-    for vx, vy, vz in box_verts:
-        de, dn = rotate_from_bearing_frame(vx, vy, bearing_rad)
-        box_verts_rot.append([de + center_x_mm, dn + center_y_mm, vz])
-
-    box_faces = [
-        [0, 1, 2], [0, 2, 3],  # bottom
-        [4, 6, 5], [4, 7, 6],  # top
-        [0, 4, 1], [1, 4, 5],  # sides
-        [1, 5, 2], [2, 5, 6],
-        [2, 6, 3], [3, 6, 7],
-        [3, 7, 0], [0, 7, 4],
-    ]
-
-    box_mesh = trimesh.Trimesh(vertices=box_verts_rot, faces=box_faces, process=False)
-    box_mesh.fix_normals()
-
-    # Boolean intersection
-    if not dem_mesh.is_volume or not box_mesh.is_volume:
-        raise ValueError("Meshes are not volumes for boolean intersection")
-
-    result_mesh = dem_mesh.intersection(box_mesh)
-
-    # Undo bearing rotation: project model offsets onto bearing-local frame
-    verts = result_mesh.vertices.copy()
-    dx = verts[:, 0] - center_x_mm
-    dy = verts[:, 1] - center_y_mm
-    local_perp, local_along = rotate_to_bearing_frame(dx, dy, bearing_rad)
-
-    # Translate to origin (center at half-width, half-height)
-    verts[:, 0] = local_perp + rect_width_mm_final / 2.0
-    verts[:, 1] = local_along + rect_height_mm_final / 2.0
-
-    vertices = verts.astype(np.float32)
-    faces = result_mesh.faces.astype(np.int64)
-    max_z = float(np.max(vertices[:, 2]))
-
-    return vertices, faces, max_z
-
-
-def _build_circular_cutout_mesh(
-    dem: np.ndarray,
-    px_size_x: float,
-    px_size_y: float,
-    x_size_mm: float,
-    model_y_mm: float,
-    z_surface_mm: np.ndarray,
-    valid_mask: np.ndarray,
-    X: np.ndarray,
-    Y: np.ndarray,
-    center_lat: float,
-    center_lon: float,
-    radius_m: float,
-    ref_transform: object,
-    ref_crs: object,
-    n_gon_sides: int,
-    base_thickness_mm: float,
-) -> Tuple[np.ndarray, np.ndarray, float, Optional[np.ndarray]]:
-    """
-    Build mesh with smooth n-gon perimeter using boolean intersection.
-
-    Builds a watertight rectangular DEM mesh, creates an n-gon cylinder at
-    the exact radius, then uses boolean intersection to cut the DEM precisely.
-
-    Args:
-        dem: DEM array
-        px_size_x, px_size_y: Pixel sizes in meters
-        x_size_mm, model_y_mm: Model dimensions in mm
-        z_surface_mm: Surface elevations in mm (rows x cols)
-        valid_mask: Valid data mask (rows x cols)
-        X, Y: Meshgrid of model coordinates (rows x cols)
-        center_lat, center_lon: Center coordinates (WGS84)
-        radius_m: Exact radius in meters
-        ref_transform: Rasterio affine transform
-        ref_crs: DEM's CRS
-        n_gon_sides: Number of polygon sides
-        base_thickness_mm: Base thickness
-
-    Returns:
-        Tuple of (vertices, faces, max_z, None)
-    """
-    rows, cols = dem.shape
-
-    # Convert center to model mm coordinates (exact, no pixel snapping)
-    transformer = Transformer.from_crs("EPSG:4326", ref_crs, always_xy=True)
-    center_x_crs, center_y_crs = transformer.transform(center_lon, center_lat)
-    center_x_mm, center_y_mm = _crs_point_to_model_xy(
-        center_x_crs, center_y_crs, ref_transform, rows, cols, x_size_mm, model_y_mm)
-
-    # Convert radius to model mm (grid spans cols-1 pixel spacings)
-    terrain_width_m = (cols - 1) * px_size_x
-    scale = x_size_mm / terrain_width_m  # mm per meter
-    radius_mm = radius_m * scale
-
-    # Generate n-gon vertices at exact radius
-    angles = np.linspace(0, 2 * np.pi, n_gon_sides, endpoint=False)
-    ngon_x = center_x_mm + radius_mm * np.cos(angles)
-    ngon_y = center_y_mm + radius_mm * np.sin(angles)
-
-    # Build rectangular DEM mesh for boolean intersection
-    vertices_dem, faces_dem, _ = _build_rectangular_mesh(rows, cols, X, Y, z_surface_mm, valid_mask)
-
-    # Boolean intersection with n-gon cylinder for smooth walls
-    dem_mesh = trimesh.Trimesh(vertices=vertices_dem, faces=faces_dem, process=False)
-
-    # Create n-gon cylinder (from base to well above terrain)
-    max_terrain_z = float(np.max(z_surface_mm[valid_mask]))
-    cylinder_height = max(max_terrain_z * 2, base_thickness_mm * 3)
-
-    # Create n-gon prism vertices
-    cylinder_verts = []
-    # Bottom ring
-    for i in range(n_gon_sides):
-        cylinder_verts.append([ngon_x[i], ngon_y[i], 0.0])
-    # Top ring
-    for i in range(n_gon_sides):
-        cylinder_verts.append([ngon_x[i], ngon_y[i], cylinder_height])
-
-    # Create n-gon prism faces with consistent outward-facing normals
-    cylinder_faces = []
-    # Side walls (outward-facing)
-    for i in range(n_gon_sides):
-        next_i = (i + 1) % n_gon_sides
-        # Two triangles per side, winding for outward normals
-        cylinder_faces.append([i, n_gon_sides + i, next_i])
-        cylinder_faces.append([next_i, n_gon_sides + i, n_gon_sides + next_i])
-
-    # Bottom cap (downward-facing: clockwise when viewed from below)
-    for i in range(1, n_gon_sides - 1):
-        cylinder_faces.append([0, i + 1, i])
-
-    # Top cap (upward-facing: counter-clockwise when viewed from above)
-    for i in range(1, n_gon_sides - 1):
-        cylinder_faces.append([n_gon_sides, n_gon_sides + i, n_gon_sides + i + 1])
-
-    cylinder_mesh = trimesh.Trimesh(vertices=cylinder_verts, faces=cylinder_faces, process=False)
-
-    # Fix normals to ensure consistent orientation
-    cylinder_mesh.fix_normals()
-
-    # Boolean intersection
-    if not dem_mesh.is_volume or not cylinder_mesh.is_volume:
-        raise ValueError("Not all meshes are volumes!")
-
-    result_mesh = dem_mesh.intersection(cylinder_mesh)
-
-    vertices = result_mesh.vertices.astype(np.float32)
-    faces_array = result_mesh.faces.astype(np.int64)
-    max_z = float(np.max(vertices[:, 2]))
-    return vertices, faces_array, max_z, None
+from shapely.ops import unary_union
 
 
 def _compute_model_coordinates(
@@ -423,14 +27,12 @@ def _compute_model_coordinates(
     max_height_mm: float,
     z_exaggeration: float,
     base_thickness_mm: float,
-    lake_range_percent: float = 0.0,
-    lake_lowering_mm: float = 0.0,
     use_true_scale: bool = False,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], float]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     """Compute model-space coordinates from DEM data.
 
     Returns:
-        (X, Y, z_surface_mm, valid_mask, lake_mask, model_y_mm)
+        (X, Y, z_surface_mm, valid_mask, model_y_mm)
     """
     rows, cols = dem.shape
     # The mesh spans first-to-last pixel centers: cols-1 / rows-1 spacings.
@@ -461,150 +63,11 @@ def _compute_model_coordinates(
         z_relief_mm = normalized * relief_mm * z_exaggeration
         z_surface_mm = base_thickness_mm + z_relief_mm
 
-    lake_mask = None
-    if lake_lowering_mm > 0 and lake_range_percent > 0:
-        threshold = min_elev + height_range * (lake_range_percent / 100.0)
-        lake_mask = dem <= threshold
-        if lake_mask.any():
-            lake_min_mm = float(np.min(z_surface_mm[lake_mask]))
-            target_lake_mm = max(lake_min_mm - lake_lowering_mm, 0.0)
-            z_surface_mm = np.where(lake_mask, target_lake_mm, z_surface_mm)
-
     xs = np.linspace(0, x_size_mm, cols)
     ys = np.linspace(model_y_mm, 0, rows)
     X, Y = np.meshgrid(xs, ys)
 
-    return X, Y, z_surface_mm, valid_mask, lake_mask, model_y_mm
-
-
-def dem_to_vertices_and_faces(
-    dem: np.ndarray,
-    px_size_x: float,
-    px_size_y: float,
-    x_size_mm: float,
-    max_height_mm: float,
-    z_exaggeration: float,
-    base_thickness_mm: float,
-    lake_range_percent: float = 0.0,
-    lake_lowering_mm: float = 0.0,
-    use_true_scale: bool = False,
-    cutout_type: Optional[str] = None,
-    cutout_center_lat: Optional[float] = None,
-    cutout_center_lon: Optional[float] = None,
-    cutout_radius_m: Optional[float] = None,
-    cutout_side_length_km: Optional[float] = None,
-    ref_transform: Optional[object] = None,
-    ref_crs: Optional[object] = None,
-    n_gon_sides: int = 64,
-    bearing: float = 0.0,
-    rect_corner1_lat: Optional[float] = None,
-    rect_corner1_lon: Optional[float] = None,
-    rect_corner2_lat: Optional[float] = None,
-    rect_corner2_lon: Optional[float] = None,
-) -> Tuple[np.ndarray, np.ndarray, float, Optional[np.ndarray]]:
-    """
-    Convert DEM grid into watertight mesh vertices/faces.
-
-    Cutout cropping is handled by boolean intersection for all cutout types.
-    """
-    X, Y, z_surface_mm, valid_mask, lake_mask, model_y_mm = _compute_model_coordinates(
-        dem, px_size_x, px_size_y, x_size_mm, max_height_mm,
-        z_exaggeration, base_thickness_mm, lake_range_percent,
-        lake_lowering_mm, use_true_scale,
-    )
-    rows, cols = dem.shape
-
-    # Handle circular cutout with smooth n-gon perimeter
-    if cutout_type == "circular" and cutout_center_lat is not None and cutout_radius_m is not None:
-        return _build_circular_cutout_mesh(
-            dem, px_size_x, px_size_y, x_size_mm, model_y_mm,
-            z_surface_mm, valid_mask, X, Y,
-            cutout_center_lat, cutout_center_lon, cutout_radius_m,
-            ref_transform, ref_crs, n_gon_sides, base_thickness_mm
-        )
-
-    # Handle all rectangular cutouts via boolean intersection
-    if cutout_type == "rectangular":
-        transformer = Transformer.from_crs("EPSG:4326", ref_crs, always_xy=True)
-        bearing_rad = np.radians(bearing)
-
-        if rect_corner1_lat is not None:
-            # rect-corners mode: convert lat/lon to CRS
-            c1_x, c1_y = transformer.transform(rect_corner1_lon, rect_corner1_lat)
-            c2_x, c2_y = transformer.transform(rect_corner2_lon, rect_corner2_lat)
-        else:
-            # center + side-length mode: compute CRS corners
-            cx, cy = transformer.transform(cutout_center_lon, cutout_center_lat)
-            half = cutout_side_length_km * 1000.0 / 2.0
-            de1, dn1 = rotate_from_bearing_frame(-half, -half, bearing_rad)
-            c1_x, c1_y = cx + de1, cy + dn1
-            de2, dn2 = rotate_from_bearing_frame(half, half, bearing_rad)
-            c2_x, c2_y = cx + de2, cy + dn2
-
-        vertices, faces_array, max_z = _build_rect_cutout_mesh(
-            dem, px_size_x, px_size_y, x_size_mm, model_y_mm,
-            z_surface_mm, valid_mask, X, Y,
-            c1_x, c1_y, c2_x, c2_y,
-            bearing, ref_transform, base_thickness_mm
-        )
-        return vertices, faces_array, max_z, None
-
-    # Build rectangular mesh (no cutout)
-    vertices, faces_array, vertex_map = _build_rectangular_mesh(rows, cols, X, Y, z_surface_mm, valid_mask)
-    base_offset = len(vertices) // 2
-
-    water_faces_array: Optional[np.ndarray] = None
-    if lake_mask is not None and lake_mask.any():
-        cell_mask = lake_mask[:-1, :-1] & lake_mask[1:, :-1] & lake_mask[:-1, 1:] & lake_mask[1:, 1:]
-        ci, cj = np.where(cell_mask)
-        if ci.size:
-            v00 = vertex_map[ci, cj].astype(np.int64)
-            v10 = vertex_map[ci + 1, cj].astype(np.int64)
-            v11 = vertex_map[ci + 1, cj + 1].astype(np.int64)
-            v01 = vertex_map[ci, cj + 1].astype(np.int64)
-            b00, b10, b11, b01 = (
-                v00 + base_offset, v10 + base_offset,
-                v11 + base_offset, v01 + base_offset,
-            )
-
-            blocks = [
-                # Top and base surface of every lake cell
-                np.column_stack((v00, v10, v11)),
-                np.column_stack((v00, v11, v01)),
-                np.column_stack((b00, b11, b10)),
-                np.column_stack((b00, b01, b11)),
-            ]
-
-            # Walls where the neighboring cell is not a lake cell; the 1-cell
-            # zero-padded mask reads out-of-bounds neighbors as non-lake.
-            P = np.zeros((rows + 1, cols + 1), dtype=bool)
-            P[1:rows, 1:cols] = cell_mask
-            wall_north = ~P[ci, cj + 1]
-            wall_south = ~P[ci + 2, cj + 1]
-            wall_west = ~P[ci + 1, cj]
-            wall_east = ~P[ci + 1, cj + 2]
-
-            if wall_north.any():
-                m = wall_north
-                blocks.append(np.column_stack((v00[m], v01[m], b00[m])))
-                blocks.append(np.column_stack((v01[m], b01[m], b00[m])))
-            if wall_south.any():
-                m = wall_south
-                blocks.append(np.column_stack((v10[m], v11[m], b11[m])))
-                blocks.append(np.column_stack((v10[m], b11[m], b10[m])))
-            if wall_west.any():
-                m = wall_west
-                blocks.append(np.column_stack((v00[m], v10[m], b00[m])))
-                blocks.append(np.column_stack((v10[m], b10[m], b00[m])))
-            if wall_east.any():
-                m = wall_east
-                blocks.append(np.column_stack((v01[m], b01[m], v11[m])))
-                blocks.append(np.column_stack((v11[m], b01[m], b11[m])))
-
-            water_faces_array = np.concatenate(blocks, axis=0)
-
-    max_z = float(np.max(z_surface_mm[valid_mask]))
-    return vertices.astype(np.float32), faces_array, max_z, water_faces_array
+    return X, Y, z_surface_mm, valid_mask, model_y_mm
 
 
 def _dem_sampler(z_grid_asc: np.ndarray, frame):
@@ -1183,6 +646,7 @@ def build_terrain_meshes(
     use_true_scale: bool = False,
     recess_mode: str = "flat",
     insert_z_clearance_mm: float = 0.0,
+    water_lowering_mm: float = 0.0,
 ) -> dict:
     """Extrude a finished 2D terrain layout into the base plate + insert meshes.
 
@@ -1206,19 +670,26 @@ def build_terrain_meshes(
             minimum over the footprint, so the insert has a flat underside);
             "uniform" drapes the floor at DEM - thickness for a constant-thickness
             insert.
+        water_lowering_mm: how far the WATER class sinks below the ground it sits
+            in, so a lake reads as a pool instead of a flush plug. It moves the
+            whole water column -- surface, insert underside and pocket floor --
+            by the same amount, leaving the seating fit untouched. A lowered water
+            body is also FLAT-topped in either recess mode (its surface is one Z,
+            the lowest ground under it minus the drop): a water surface draped over
+            terrain is not water. 0 leaves water an ordinary insert, drawn at the
+            DEM like every other class.
 
     Returns:
         dict mapping terrain name to (vertices, faces, max_z) or None.
     """
-    from masks import TERRAIN_NAMES
+    from masks import TERRAIN_NAMES, TERRAIN_WATER
 
     # Model coordinates + surface heights. The horizontal half of this duplicates
     # `frame`; the Z half (exaggeration, base thickness, true scale) is what is
     # actually wanted here.
-    X, Y, z_surface_mm, valid_mask, _, model_y_mm = _compute_model_coordinates(
+    X, Y, z_surface_mm, valid_mask, model_y_mm = _compute_model_coordinates(
         dem, frame.px_size_x, frame.px_size_y, frame.x_size_mm, max_height_mm,
         z_exaggeration, base_thickness_mm,
-        lake_range_percent=0.0, lake_lowering_mm=0.0,
         use_true_scale=use_true_scale,
     )
 
@@ -1253,14 +724,17 @@ def build_terrain_meshes(
     # seating gap is exactly the z clearance. A recess with no insert floors off
     # its own ground.
     raw_pockets = [pocket_poly for _tc, pocket_poly in layout.pockets]
+    pocket_classes = [tc for tc, _pocket_poly in layout.pockets]
     floor_refs = list(layout.pocket_floor_refs)
     if len(floor_refs) != len(raw_pockets):     # layouts predating floor refs
         floor_refs = [None] * len(raw_pockets)
     pocket_top_fns = []
     floors = []
-    for pocket_poly, ref in zip(raw_pockets, floor_refs):
-        if recess_mode == "uniform":
+    for tc, pocket_poly, ref in zip(pocket_classes, raw_pockets, floor_refs):
+        drop = water_lowering_mm if tc == TERRAIN_WATER else 0.0
+        if recess_mode == "uniform" and drop == 0.0:
             pocket_top_fns.append(lambda xy: sample_dem(xy) - overlay_thickness_mm)
+            floors.append(np.inf)               # drapes; nothing to order it by
             continue
         tmin = _dem_min_over(ref if ref is not None else pocket_poly,
                              sample_dem, frame, resolution)
@@ -1268,14 +742,14 @@ def build_terrain_meshes(
             raise ValueError(
                 "pocket has no top surface; the layout must not emit a degenerate "
                 "region, and the mesh stage must not drop one")
-        floors.append(max(tmin - overlay_thickness_mm, 0.01))
+        floors.append(max(tmin - drop - overlay_thickness_mm, 0.01))
         pocket_top_fns.append(_flat(floors[-1]))
     # Where pockets overlap (per-part holes share their connector web, relief
     # discs bulge across a neighbour), the overlap gets the LOWER floor.
     # build_base_solid takes the first containing pocket, so hand it the pockets
-    # ordered deepest-first. Uniform mode floors all follow the terrain, so there
-    # is nothing to order.
-    if recess_mode != "uniform" and floors:
+    # ordered deepest-first. Draped floors sort last (+inf): they follow the terrain
+    # and have no single Z to compare, so a flat floor overlapping one wins.
+    if floors:
         order = np.argsort(np.asarray(floors), kind="stable")
         raw_pockets = [raw_pockets[k] for k in order]
         pocket_top_fns = [pocket_top_fns[k] for k in order]
@@ -1299,11 +773,16 @@ def build_terrain_meshes(
     # --- Inserts: each part a DEM-topped prism with a flat bottom (flat mode) or a
     # DEM-(thickness-clearance) bottom (uniform), concatenated as multiple bodies.
     # The layout's inset/relief/clip already gave the seating clearance; no boolean here.
+    # A lowered water part is the one exception to the DEM top: it is a flat slab,
+    # sunk by the drop its pocket floor was sunk by, so it seats exactly as before.
     for tc in layout.overlay_classes:
         name = TERRAIN_NAMES[tc]
+        drop = water_lowering_mm if tc == TERRAIN_WATER else 0.0
         bodies = []
+        clamped = False
         for part in layout.insert_parts.get(tc, []):
-            if recess_mode == "uniform":
+            top_fn = sample_dem
+            if recess_mode == "uniform" and drop == 0.0:
                 bottom_fn = (lambda xy: sample_dem(xy)
                              - (overlay_thickness_mm - insert_z_clearance_mm))
             else:
@@ -1312,9 +791,25 @@ def build_terrain_meshes(
                     raise ValueError(
                         "insert part has no top surface; the layout must not emit a "
                         "degenerate region, and the mesh stage must not drop one")
-                bottom_fn = _flat(
-                    max(pmin - (overlay_thickness_mm - insert_z_clearance_mm), 0.01))
-            m = build_region_prism_fast(part, sample_dem, bottom_fn, frame,
+                want = pmin - drop - (overlay_thickness_mm - insert_z_clearance_mm)
+                bottom_z = max(want, 0.01)
+                if drop > 0.0:
+                    if pmin - drop <= bottom_z:
+                        raise ValueError(
+                            f"water lowered by {drop} mm leaves no body above the "
+                            f"model floor (surface would sit at {pmin - drop:.2f} mm); "
+                            "reduce --lake-lowering-mm or raise --base-thickness-mm")
+                    if want < bottom_z and not clamped:
+                        clamped = True
+                        print(f"[WARN] the lowered water body reaches the model floor: "
+                              f"it is {bottom_z:.2f} mm thick instead of "
+                              f"{overlay_thickness_mm - insert_z_clearance_mm:.2f} mm "
+                              f"and seats with no z clearance. Raise "
+                              f"--base-thickness-mm or lower --lake-lowering-mm.",
+                              flush=True)
+                    top_fn = _flat(pmin - drop)
+                bottom_fn = _flat(bottom_z)
+            m = build_region_prism_fast(part, top_fn, bottom_fn, frame,
                                         resolution)
             if m is not None and len(m.faces) > 0:
                 bodies.append(m)

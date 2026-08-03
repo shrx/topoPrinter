@@ -36,7 +36,7 @@ def _make_grid(rows=20, cols=20):
     dem = np.random.default_rng(42).uniform(100, 200, (rows, cols))
     frame = ModelFrame.from_dem((rows, cols), 1.0, 1.0, 100.0,
                                 from_origin(0.0, float(rows), 1.0, 1.0), "EPSG:3857")
-    _X, _Y, z_surface_mm, _valid, _lake, _model_y = _compute_model_coordinates(
+    _X, _Y, z_surface_mm, _valid, _model_y = _compute_model_coordinates(
         dem, px_size_x=1.0, px_size_y=1.0, x_size_mm=100.0,
         max_height_mm=50.0, z_exaggeration=1.0, base_thickness_mm=2.0,
         use_true_scale=False,

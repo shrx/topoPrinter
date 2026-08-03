@@ -68,7 +68,7 @@ class TestModelFrame:
         """
         frame = _frame()
         dem = np.zeros((ROWS, COLS))
-        X, Y, _z, _v, _l, model_y_mm = _compute_model_coordinates(
+        X, Y, _z, _v, model_y_mm = _compute_model_coordinates(
             dem, PX, PX, frame.x_size_mm, max_height_mm=30.0, z_exaggeration=1.0,
             base_thickness_mm=2.0, use_true_scale=False,
         )

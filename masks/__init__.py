@@ -9,7 +9,8 @@ scale off ``frame.scale_m_per_mm`` to apply feature-size rules stated in mm.
 
 Providers: ``masks.osm.OsmMasks`` (Overpass query + rasterizable polygons),
 ``masks.sentinel2.SnowMasks`` / ``masks.sentinel2.FoliageMasks`` (satellite
-GeoJSON layers, cleaned by despeckle + APCSF).
+GeoJSON layers, cleaned by despeckle + APCSF), ``masks.lake.LakeMasks`` (low
+ground thresholded straight off the DEM).
 
 This package also owns the terrain-class vocabulary the providers key their
 results by, shared by every downstream stage.

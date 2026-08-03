@@ -44,9 +44,9 @@ python dem_batch_to_stl.py --url-list urls.txt \
     --max-height-mm 40 \
     --z-exaggeration 1.5 \
     --downsample 2 \
-    --base-thickness-mm 2 \
+    --base-thickness-mm 4 \
     --lake-range-percent 2 \
-    --lake-lowering-mm 100
+    --lake-lowering-mm 1.5
 ```
 
 ## Install
@@ -112,7 +112,7 @@ Example of what a finished print can look like:
 ## Outputs
 
 - A single STL named after the URL list file and first tile, with `_mosaic` if more than one DEM is used.
-- A `_water.stl` is also written when lake lowering is enabled and any lake faces are detected.
+- When the print resolves into separate bodies (water, glacier, foliage inserts and the base plate they seat into), each is written with its terrain class appended: `_rock.stl`, `_water.stl` and so on.
 - Temporary downloads are kept in `output-dir/tmp_dem`.
 - A persistent cache lives in `cache/` next to the scripts. Delete its contents to force re-downloads.
 
@@ -125,9 +125,10 @@ Output naming example for `urls.txt` and a first tile of `N46E008_1m.tif`:
 1. **Download and cache**: Each URL is fetched to `output-dir/tmp_dem` and also cached in `cache/`. Existing cache entries are reused. File format (GeoTIFF `.tif` or ASCII Grid `.asc`) is auto-detected from the URL.
 2. **Merge and fill**: DEMs are mosaicked with `rasterio.merge`. Nodata cells are replaced with the minimum valid elevation so masked water does not float above surrounding terrain. Optional downsampling happens after merge.
 3. **Scale and normalize**: The model X dimension is set to `--x-size-mm`. Y is derived from pixel aspect ratio. Elevations are normalized into `--max-height-mm` with a flat base thickness and optional `--z-exaggeration`.
-4. **Lake lowering (optional)**: Cells within `--lake-range-percent` above the minimum elevation are treated as lakes and lowered by `--lake-lowering-mm`.
-5. **Mesh build**: A watertight mesh is generated with top surface, base, and side walls. X is flipped for a viewer-friendly orientation.
-6. **Export STL**: The result is saved as a binary STL. If lake lowering is active, a second STL is exported for the lake volumes.
+4. **Terrain masks (optional)**: Each mask provider contributes polygons for its terrain class -- OSM (`--terrain`), satellite snow/foliage GeoJSON, and ground below `--lake-range-percent` of the relief read straight off the DEM as water. With no provider the print is one class covering everything.
+5. **2D layout**: Masks are resolved into mutually exclusive, printable regions in model millimetres: one base plate, the pockets cut into it, and the insert footprints that seat in them with their clearances. Every xy coordinate the STL will carry is decided here, including the cutout.
+6. **Mesh build**: Those regions are extruded over the DEM -- the only stage that adds Z. The base plate is one watertight terraced solid; each insert is a prism, dropped by `--lake-lowering-mm` for water.
+7. **Export STL**: Each body is saved as a binary STL.
 
 The tool skips failed downloads but continues if at least one DEM succeeds. It exits non-zero if no STL is produced.
 
@@ -140,8 +141,8 @@ The tool skips failed downloads but continues if at least one DEM succeeds. It e
 - `--z-exaggeration` (default 1.0): vertical exaggeration factor applied to relief.
 - `--downsample` (default 1): integer factor to thin the DEM grid, must be `>= 1`.
 - `--base-thickness-mm` (default 2): flat base thickness; should be `<= max-height-mm`.
-- `--lake-range-percent` (default 0): percent above min elevation treated as lake; set `> 0` to enable lake lowering.
-- `--lake-lowering-mm` (default 0): millimeters to lower lake surfaces; set `> 0` to enable lake lowering.
+- `--lake-range-percent` (default 0): percent of the relief above the minimum elevation read as water; set `> 0` to print that ground as a separate water body.
+- `--lake-lowering-mm` (default 0): millimetres to sink the water body below the ground it seats in, flat-topped; `0` leaves it flush and draped at the DEM.
 
 ## Notes and assumptions
 

@@ -10,8 +10,7 @@ import sys
 from typing import Iterable, List
 
 from downloader import CACHE_DIR, download_dem, ensure_dir, read_url_list
-import numpy as np
-from mesh_builder import build_terrain_meshes, dem_to_vertices_and_faces, save_stl
+from mesh_builder import build_terrain_meshes, save_stl
 from sources import load_dem, prepare_dem_files
 
 
@@ -48,13 +47,15 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         "--lake-range-percent",
         type=float,
         default=0.0,
-        help="Treat cells within this percent above min elevation as lakes (0 disables lake lowering).",
+        help="Read ground within this percent above the DEM minimum as water, printed "
+             "as a water insert (0 disables the DEM lake mask).",
     )
     parser.add_argument(
         "--lake-lowering-mm",
         type=float,
         default=0.0,
-        help="Lower identified lake cells by this many millimeters (0 disables lake lowering).",
+        help="Sink the water class this many millimeters below the ground it seats in, "
+             "flat-topped (0 leaves water flush, drawn at the DEM).",
     )
     # Cutout region specification - mutually exclusive modes
     region_group = parser.add_mutually_exclusive_group()
@@ -128,7 +129,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         default=None,
         help="Path to a satellite-derived snow polygon (e.g. from Sentinel-2 NDSI). "
              "Its polygons are cleaned for printability and added to the glacier "
-             "terrain class (unioned with any OSM glacier). Requires --terrain.",
+             "terrain class (unioned with any OSM glacier).",
     )
     parser.add_argument(
         "--snow-iterations",
@@ -313,7 +314,7 @@ def main(argv: Iterable[str]) -> int:
         )
         # Crop the raster to the cutout region so --x-size-mm is the cutout's output
         # size (not the whole tile) and only the cutout neighbourhood is meshed. The
-        # final shape is still trimmed by the mesh boolean cutout.
+        # final shape is still trimmed to the exact cutout by the 2D stage.
         if args.center or args.rect_corners:
             from dem_processing import crop_to_cutout
             _crop_radius_m = (args.diameter / 2.0 * 1000.0) if args.diameter else None
@@ -388,50 +389,50 @@ def main(argv: Iterable[str]) -> int:
         if cutout_w_m:
             x_size_model = args.x_size_mm * terrain_w_m / cutout_w_m
 
-        # Terrain classification / composition
-        class_geometries = None
-        base_class = None
-        terrain_type_list = None
-        frame = None
-        if args.terrain or args.invert_base:
-            from masks import TERRAIN_FOLIAGE, TERRAIN_ROCK, merge_masks
-            from model_frame import ModelFrame
-            from terrain_layout import frame_with_print_motion
+        # Terrain classification / composition. Every print goes through this
+        # stage: with no mask provider at all it resolves to a single base layer
+        # covering the whole cutout, which is the plain relief block.
+        from masks import (TERRAIN_FOLIAGE, TERRAIN_NAMES, TERRAIN_ROCK,
+                           merge_masks)
+        from model_frame import ModelFrame
+        from terrain_layout import frame_with_print_motion
 
-            frame = ModelFrame.from_dem(dem.shape, px_size_x, px_size_y,
-                                        x_size_model, ref_transform, ref_crs)
-            # The grid -> print motion, so the 2D stage emits the coordinates the STL
-            # will carry and its float32 snap is the last thing to touch them.
-            frame = frame_with_print_motion(frame, cutout)
+        frame = ModelFrame.from_dem(dem.shape, px_size_x, px_size_y,
+                                    x_size_model, ref_transform, ref_crs)
+        # The grid -> print motion, so the 2D stage emits the coordinates the STL
+        # will carry and its float32 snap is the last thing to touch them.
+        frame = frame_with_print_motion(frame, cutout)
 
-            terrain_type_list = args.terrain_types.split(",") if args.terrain_types else None
+        terrain_type_list = args.terrain_types.split(",") if args.terrain_types else None
 
-            # Masks come from whichever data sources are given, independent of the
-            # bottom-layer mapping. Providers clean in CRS metres, applying mm
-            # feature-size rules at the frame's true print scale.
-            providers = []
-            if args.terrain:
-                from masks.osm import OsmMasks
-                if args.lake_range_percent > 0 and args.lake_lowering_mm > 0:
-                    print("[WARN] --terrain ignores --lake-range-percent / "
-                          "--lake-lowering-mm (OSM water is used instead).", flush=True)
-                providers.append(OsmMasks())
-            if args.snow_geojson:
-                from masks.sentinel2 import SnowMasks
-                providers.append(SnowMasks(
-                    args.snow_geojson, iterations=args.snow_iterations,
-                    dt=args.snow_dt, min_feature_m2=args.snow_min_feature_m2))
-            if args.foliage_geojson:
-                from masks.sentinel2 import FoliageMasks
-                providers.append(FoliageMasks(
-                    args.foliage_geojson, iterations=args.foliage_iterations))
-            class_geometries = merge_masks(frame, providers)
+        # Masks come from whichever data sources are given, independent of the
+        # bottom-layer mapping. Providers clean in CRS metres, applying mm
+        # feature-size rules at the frame's true print scale.
+        providers = []
+        if args.terrain:
+            from masks.osm import OsmMasks
+            providers.append(OsmMasks())
+        if args.lake_range_percent > 0:
+            # DEM-thresholded lakes are just another water source; where OSM water
+            # is queried too, the two merge into one class.
+            from masks.lake import LakeMasks
+            providers.append(LakeMasks(dem, args.lake_range_percent))
+        if args.snow_geojson:
+            from masks.sentinel2 import SnowMasks
+            providers.append(SnowMasks(
+                args.snow_geojson, iterations=args.snow_iterations,
+                dt=args.snow_dt, min_feature_m2=args.snow_min_feature_m2))
+        if args.foliage_geojson:
+            from masks.sentinel2 import FoliageMasks
+            providers.append(FoliageMasks(
+                args.foliage_geojson, iterations=args.foliage_iterations))
+        class_geometries = merge_masks(frame, providers)
 
-            # The only thing --invert-base changes: which terrain type is the bottom.
-            base_class = TERRAIN_FOLIAGE if args.invert_base else TERRAIN_ROCK
-            if args.invert_base and not class_geometries.get(TERRAIN_FOLIAGE):
-                raise SystemExit("--invert-base makes foliage the base plate; supply "
-                                 "a foliage mask with --foliage-geojson.")
+        # The only thing --invert-base changes: which terrain type is the bottom.
+        base_class = TERRAIN_FOLIAGE if args.invert_base else TERRAIN_ROCK
+        if args.invert_base and not class_geometries.get(TERRAIN_FOLIAGE):
+            raise SystemExit("--invert-base makes foliage the base plate; supply "
+                             "a foliage mask with --foliage-geojson.")
 
         # Build meshes
         input_stub = os.path.splitext(os.path.basename(args.url_list))[0]
@@ -440,109 +441,62 @@ def main(argv: Iterable[str]) -> int:
         if len(downloaded) > 1:
             base_name = f"{base_name}_mosaic"
 
-        if (args.terrain or args.invert_base) and class_geometries is not None:
-            from terrain_layout import (InsertFit, build_terrain_layout,
-                                        cutout_footprint)
+        from terrain_layout import (InsertFit, build_terrain_layout,
+                                    cutout_footprint)
 
-            # Stage 1: masks -> final 2D polygons (no elevations involved).
-            layout = build_terrain_layout(
-                frame, class_geometries,
-                outline=cutout_footprint(frame, cutout),
-                base_class=base_class,
-                terrain_types=terrain_type_list,
-                fit=InsertFit(
-                    xy_clearance_mm=args.insert_xy_clearance_mm,
-                    z_clearance_mm=args.insert_z_clearance_mm,
-                    corner_relief_mm=args.insert_corner_relief_mm,
-                    corner_min_angle_deg=args.insert_corner_min_angle_deg,
-                ),
-            )
+        # Stage 1: masks -> final 2D polygons (no elevations involved).
+        layout = build_terrain_layout(
+            frame, class_geometries,
+            outline=cutout_footprint(frame, cutout),
+            base_class=base_class,
+            terrain_types=terrain_type_list,
+            fit=InsertFit(
+                xy_clearance_mm=args.insert_xy_clearance_mm,
+                z_clearance_mm=args.insert_z_clearance_mm,
+                corner_relief_mm=args.insert_corner_relief_mm,
+                corner_min_angle_deg=args.insert_corner_min_angle_deg,
+            ),
+        )
 
-            # Stage 2: extrude that layout over the DEM.
-            terrain_meshes = build_terrain_meshes(
-                layout, frame, dem,
-                max_height_mm, z_exaggeration,
-                args.base_thickness_mm, args.terrain_thickness_mm,
-                use_true_scale=use_true_scale,
-                recess_mode=args.terrain_recess_mode,
-                insert_z_clearance_mm=args.insert_z_clearance_mm,
-            )
-            for terrain_name, mesh_data in terrain_meshes.items():
-                if mesh_data is None:
-                    continue
-                verts, fcs, mz = mesh_data
-                stl_path = os.path.join(args.output_dir, f"{base_name}_{terrain_name}.stl")
-                print(f"[INFO] Saving {terrain_name} STL ({fcs.shape[0]} faces) to {stl_path}...", flush=True)
-                save_stl(verts, fcs, stl_path)
+        # Stage 2: extrude that layout over the DEM.
+        terrain_meshes = build_terrain_meshes(
+            layout, frame, dem,
+            max_height_mm, z_exaggeration,
+            args.base_thickness_mm, args.terrain_thickness_mm,
+            use_true_scale=use_true_scale,
+            recess_mode=args.terrain_recess_mode,
+            insert_z_clearance_mm=args.insert_z_clearance_mm,
+            water_lowering_mm=args.lake_lowering_mm,
+        )
 
-            rows, cols = dem.shape
-            from masks import TERRAIN_NAMES as _TN
-            base_name_out = _TN[base_class] if base_class is not None else "rock"
-            base_data = terrain_meshes[base_name_out]
-            # Report the actual printed bounding box (the base plate = the cutout,
-            # after the boolean trim), not the raster grid extent.
-            bv = base_data[0]
-            model_x = float(bv[:, 0].max() - bv[:, 0].min())
-            model_y = float(bv[:, 1].max() - bv[:, 1].min())
-            max_z = base_data[2]
-            print(
-                f"[OK] Merged {len(downloaded)} DEM(s): {rows} x {cols} samples -> "
-                f"model {model_x:.2f} mm x {model_y:.2f} mm x {max_z:.2f} mm\n"
-                f"     Terrain STLs saved to {args.output_dir}\n"
-                f"Cached DEM files at: {os.path.abspath(CACHE_DIR)}"
-            )
+        # A print with no insert is one body, and it keeps the plain output name:
+        # calling it "_rock" would name a terrain class the layout never resolved.
+        base_name_out = TERRAIN_NAMES[base_class]
+        built = {name: data for name, data in terrain_meshes.items()
+                 if data is not None}
+        if len(built) == 1 and base_name_out in built:
+            paths = {base_name_out: os.path.join(args.output_dir, f"{base_name}.stl")}
         else:
-            if (args.lake_range_percent > 0 and args.lake_lowering_mm > 0
-                    and cutout_type_for_mesh is not None):
-                print("[WARN] Lake lowering is applied to the surface, but a separate "
-                      "water STL is not produced when a cutout is used.", flush=True)
-            vertices, faces, max_z, water_faces = dem_to_vertices_and_faces(
-                dem,
-                px_size_x,
-                px_size_y,
-                x_size_model,
-                max_height_mm,
-                z_exaggeration,
-                args.base_thickness_mm,
-                args.lake_range_percent,
-                args.lake_lowering_mm,
-                use_true_scale=use_true_scale,
-                cutout_type=cutout_type_for_mesh,
-                cutout_center_lat=center_lat,
-                cutout_center_lon=center_lon,
-                cutout_radius_m=cutout_radius_m,
-                cutout_side_length_km=args.side_length,
-                ref_transform=ref_transform,
-                ref_crs=ref_crs,
-                n_gon_sides=args.ngon_sides,
-                bearing=args.bearing,
-                rect_corner1_lat=rect_lat1,
-                rect_corner1_lon=rect_lon1,
-                rect_corner2_lat=rect_lat2,
-                rect_corner2_lon=rect_lon2,
-            )
-            water_info = f", water faces: {water_faces.shape[0]}" if water_faces is not None else ""
-            print(f"[INFO] Mesh built: {faces.shape[0]} faces, {vertices.shape[0]} vertices{water_info}.")
+            paths = {name: os.path.join(args.output_dir, f"{base_name}_{name}.stl")
+                     for name in built}
+        for name, data in built.items():
+            verts, fcs, _mz = data
+            print(f"[INFO] Saving {name} STL ({fcs.shape[0]} faces) to "
+                  f"{paths[name]}...", flush=True)
+            save_stl(verts, fcs, paths[name])
 
-            stl_path = os.path.join(args.output_dir, f"{base_name}.stl")
-            print(f"[INFO] Saving STL to {stl_path}...", flush=True)
-            save_stl(vertices, faces, stl_path)
-
-            if water_faces is not None and len(water_faces) > 0 and args.lake_range_percent > 0 and args.lake_lowering_mm > 0:
-                water_path = os.path.join(args.output_dir, f"{base_name}_water.stl")
-                print(f"[INFO] Saving water STL to {water_path}...", flush=True)
-                save_stl(vertices, water_faces, water_path)
-
-            rows, cols = dem.shape
-            # Report the actual printed bounding box (after any boolean cutout trim).
-            model_x = float(vertices[:, 0].max() - vertices[:, 0].min())
-            model_y = float(vertices[:, 1].max() - vertices[:, 1].min())
-            print(
-                f"[OK] Merged {len(downloaded)} DEM(s): {rows} x {cols} samples -> "
-                f"model {model_x:.2f} mm x {model_y:.2f} mm x {max_z:.2f} mm\n"
-                f"     -> {stl_path}\n"
-                f"Cached DEM files at: {os.path.abspath(CACHE_DIR)}"
-            )
+        rows, cols = dem.shape
+        # Report the actual printed bounding box (the base plate = the cutout,
+        # trimmed in 2D), not the raster grid extent.
+        bv, _bf, max_z = built[base_name_out]
+        model_x = float(bv[:, 0].max() - bv[:, 0].min())
+        model_y = float(bv[:, 1].max() - bv[:, 1].min())
+        print(
+            f"[OK] Merged {len(downloaded)} DEM(s): {rows} x {cols} samples -> "
+            f"model {model_x:.2f} mm x {model_y:.2f} mm x {max_z:.2f} mm\n"
+            f"     -> {', '.join(paths.values())}\n"
+            f"Cached DEM files at: {os.path.abspath(CACHE_DIR)}"
+        )
 
     except Exception as exc:  # noqa: BLE001
         print(f"[ERROR] Processing failed: {exc}", file=sys.stderr)
