@@ -31,6 +31,7 @@ from masks.sentinel2 import despeckle, SCALE_M_PER_MM
 # Printable-feature rules, by feature shape (at 1:133k, 0.4 mm nozzle):
 MIN_THICKNESS_MM = 1.0  # ELONGATED features must be >= this wide (thin ridges/slivers)
 MIN_BLOB_MM = 2.0       # COMPACT features must be >= this across (small islands)
+MIN_WALL_MM = 0.6       # narrowest free-standing wall the nozzle lays down cleanly
 
 
 def open_min_width(geom, min_width_m):

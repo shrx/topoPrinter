@@ -222,6 +222,26 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         help="Minimum boundary turn angle for a corner to get relief (default 45). "
              "Near-straight vertices are skipped so the flat clearance is preserved.",
     )
+    parser.add_argument(
+        "--insert-body-relief-max-mm",
+        type=float,
+        default=0.0,
+        help="Extra per-side inset of an insert's body below its collar band, on "
+             "top of --insert-xy-clearance-mm, so only the collar touches the "
+             "pocket wall. Ramps with the part's boundary length (none for the "
+             "smallest parts, this maximum from ~150 mm up) and is width-gated so "
+             "no wall thins below what the nozzle can print. 0 = full-footprint "
+             "inserts (default). ~0.25 mm suits a 0.4 mm nozzle.",
+    )
+    parser.add_argument(
+        "--insert-collar-depth-mm",
+        type=float,
+        default=1.0,
+        help="How far below its top surface an insert keeps the designed fit; "
+             "the relieved body starts below this band. Only used when "
+             "--insert-body-relief-max-mm is set; must stay below "
+             "--terrain-thickness-mm minus --insert-z-clearance-mm. Default 1.0.",
+    )
 
     return parser.parse_args(argv)
 
@@ -455,6 +475,7 @@ def main(argv: Iterable[str]) -> int:
                 z_clearance_mm=args.insert_z_clearance_mm,
                 corner_relief_mm=args.insert_corner_relief_mm,
                 corner_min_angle_deg=args.insert_corner_min_angle_deg,
+                body_relief_max_mm=args.insert_body_relief_max_mm,
             ),
         )
 
@@ -467,6 +488,7 @@ def main(argv: Iterable[str]) -> int:
             recess_mode=args.terrain_recess_mode,
             insert_z_clearance_mm=args.insert_z_clearance_mm,
             water_lowering_mm=args.lake_lowering_mm,
+            insert_collar_depth_mm=args.insert_collar_depth_mm,
         )
 
         # A print with no insert is one body, and it keeps the plain output name:

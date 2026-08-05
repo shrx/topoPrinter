@@ -647,6 +647,7 @@ def build_terrain_meshes(
     recess_mode: str = "flat",
     insert_z_clearance_mm: float = 0.0,
     water_lowering_mm: float = 0.0,
+    insert_collar_depth_mm: float = 0.0,
 ) -> dict:
     """Extrude a finished 2D terrain layout into the base plate + insert meshes.
 
@@ -678,11 +679,33 @@ def build_terrain_meshes(
             the lowest ground under it minus the drop): a water surface draped over
             terrain is not water. 0 leaves water an ordinary insert, drawn at the
             DEM like every other class.
+        insert_collar_depth_mm: how far below its top surface an insert keeps the
+            layout's designed fit. A part the layout gave a relieved body
+            (``layout.insert_bodies``) is built as two stacked prisms: the collar,
+            the part footprint from the DEM down this depth, and the body, the
+            relieved footprint from there to the floor. Only the collar can touch
+            the pocket wall; parts without a body are one prism as ever.
 
     Returns:
         dict mapping terrain name to (vertices, faces, max_z) or None.
     """
     from masks import TERRAIN_NAMES, TERRAIN_WATER
+
+    has_bodies = any(b is not None
+                     for bs in getattr(layout, "insert_bodies", {}).values()
+                     for b in bs)
+    if has_bodies:
+        if insert_collar_depth_mm <= 0:
+            raise ValueError(
+                "the layout carries relieved insert bodies but no collar depth "
+                "was given; pass insert_collar_depth_mm > 0 or build the layout "
+                "without body relief")
+        if insert_collar_depth_mm >= overlay_thickness_mm - insert_z_clearance_mm:
+            raise ValueError(
+                f"insert_collar_depth_mm ({insert_collar_depth_mm}) must be "
+                f"smaller than the insert's minimum wall height (thickness - z "
+                f"clearance = "
+                f"{overlay_thickness_mm - insert_z_clearance_mm:.2f} mm)")
 
     # Model coordinates + surface heights. The horizontal half of this duplicates
     # `frame`; the Z half (exaggeration, base thickness, true scale) is what is
@@ -780,8 +803,13 @@ def build_terrain_meshes(
         drop = water_lowering_mm if tc == TERRAIN_WATER else 0.0
         bodies = []
         clamped = False
-        for part in layout.insert_parts.get(tc, []):
+        parts = layout.insert_parts.get(tc, [])
+        part_bodies = getattr(layout, "insert_bodies", {}).get(tc, [])
+        if len(part_bodies) != len(parts):      # layouts predating body relief
+            part_bodies = [None] * len(parts)
+        for part, relieved in zip(parts, part_bodies):
             top_fn = sample_dem
+            split = relieved is not None
             if recess_mode == "uniform" and drop == 0.0:
                 bottom_fn = (lambda xy: sample_dem(xy)
                              - (overlay_thickness_mm - insert_z_clearance_mm))
@@ -809,10 +837,25 @@ def build_terrain_meshes(
                               flush=True)
                     top_fn = _flat(pmin - drop)
                 bottom_fn = _flat(bottom_z)
-            m = build_region_prism_fast(part, top_fn, bottom_fn, frame,
-                                        resolution)
-            if m is not None and len(m.faces) > 0:
-                bodies.append(m)
+                # A bottom clamped to the model floor can swallow the band;
+                # such a part stays one full-footprint prism.
+                split = split and pmin - drop - insert_collar_depth_mm > bottom_z
+            if split:
+                # Collar: the fit band, on the part's own footprint. Body: the
+                # relieved footprint, from the band down to the floor. Two
+                # separately watertight prisms sharing the DEM-shaped interface.
+                mid_fn = (lambda xy, _top=top_fn:
+                          _top(xy) - insert_collar_depth_mm)
+                built = (build_region_prism_fast(part, top_fn, mid_fn, frame,
+                                                 resolution),
+                         build_region_prism_fast(relieved, mid_fn, bottom_fn,
+                                                 frame, resolution))
+            else:
+                built = (build_region_prism_fast(part, top_fn, bottom_fn, frame,
+                                                 resolution),)
+            for m in built:
+                if m is not None and len(m.faces) > 0:
+                    bodies.append(m)
         if not bodies:
             result[name] = None
             continue

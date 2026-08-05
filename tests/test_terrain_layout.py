@@ -11,7 +11,8 @@ from mesh_builder import _compute_model_coordinates
 from model_frame import ModelFrame
 from masks import (TERRAIN_FOLIAGE, TERRAIN_GLACIER, TERRAIN_ROCK,
                    TERRAIN_WATER)
-from terrain_layout import (InsertFit, _corner_reliefs, build_terrain_layout,
+from terrain_layout import (BODY_RELIEF_P0_MM, BODY_RELIEF_PMAX_MM, InsertFit,
+                            _corner_reliefs, _insert_body, build_terrain_layout,
                             densify_on_grid, rect_extent_m)
 
 
@@ -526,3 +527,92 @@ class TestCornerReliefRimRule:
         assert pocket_extra is not None
         assert not pocket_extra.intersects(within.boundary)
         assert pocket_extra.bounds[2] < 6.0, "the near-rim discs are gone"
+
+
+class TestInsertBodyRelief:
+    """The relieved below-collar footprint of a printed part (_insert_body)."""
+
+    def _body(self, part, relief_max=0.25):
+        frame = _frame()
+        return _insert_body(part, relief_max, frame, frame.output_resolution)
+
+    def _ramp(self, part, relief_max=0.25):
+        t = ((part.length - BODY_RELIEF_P0_MM)
+             / (BODY_RELIEF_PMAX_MM - BODY_RELIEF_P0_MM))
+        return relief_max * min(max(t, 0.0), 1.0)
+
+    def test_a_part_below_the_ramp_gets_no_body(self):
+        assert self._body(box(50.0, 20.0, 51.0, 21.0)) is None
+
+    def test_a_large_part_is_relieved_by_the_full_maximum(self):
+        part = box(10.0, 10.0, 50.0, 50.0)     # P = 160 >= BODY_RELIEF_PMAX_MM
+        body = self._body(part)
+        assert body is not None and body.within(part)
+        assert part.exterior.distance(body) == pytest.approx(0.25, abs=1e-4)
+
+    def test_the_relief_ramps_with_the_perimeter(self):
+        part = box(20.0, 20.0, 40.0, 40.0)     # P = 80, mid-ramp
+        body = self._body(part)
+        assert part.exterior.distance(body) == pytest.approx(
+            self._ramp(part), abs=1e-4)
+
+    def test_corner_tips_are_not_kept_as_thin(self):
+        """A convex corner is not a thin feature: the whole square must be relieved
+        (a disc opening would leave four full-footprint corner slivers)."""
+        part = box(10.0, 10.0, 50.0, 50.0)
+        body = self._body(part)
+        assert part.exterior.distance(body) >= 0.25 - 1e-4
+
+    def test_a_thin_fin_keeps_its_full_width(self):
+        # Dyadic coordinates throughout: _insert_body quantizes the body to the
+        # f32 export grid, and a fin edge that is not f32-representable would
+        # round a hair outside this raw fixture (production parts arrive
+        # already quantized, so the shared boundary rounds onto itself there).
+        bulk = box(10.0, 10.0, 40.0, 40.0)
+        fin = box(40.0, 24.625, 48.0, 25.375)  # 0.75 mm wide: below the gate
+        part = bulk.union(fin)
+        body = self._body(part)
+        assert body is not None and body.within(part.buffer(1e-9))
+        assert body.covers(box(41.0, 24.64, 47.875, 25.36)), \
+            "the fin must keep the part's own footprint"
+        # while the bulk is still inset by the full ramp relief on its far wall
+        assert body.bounds[0] - part.bounds[0] == pytest.approx(
+            self._ramp(part), abs=1e-4)
+
+    def test_a_part_thin_everywhere_gets_no_body(self):
+        strip = box(10.0, 20.0, 90.0, 20.8)    # long enough for full relief
+        assert self._body(strip) is None
+
+    def test_bodies_run_parallel_to_the_parts(self):
+        frame = _frame()
+        layout = build_terrain_layout(
+            frame, {TERRAIN_GLACIER: [_crs_box(10, 8, 30, 24)]},
+            fit=InsertFit(xy_clearance_mm=0.07, body_relief_max_mm=0.25))
+        assert set(layout.insert_bodies) == set(layout.insert_parts)
+        relieved = 0
+        for tc, parts in layout.insert_parts.items():
+            bodies = layout.insert_bodies[tc]
+            assert len(bodies) == len(parts)
+            for part, body in zip(parts, bodies):
+                if body is not None:
+                    relieved += 1
+                    assert body.within(part.buffer(1e-9))
+        assert relieved, "the glacier part is large enough to be relieved"
+
+    def test_body_coordinates_are_quantized_to_the_export_grid(self):
+        frame = _frame()
+        layout = build_terrain_layout(
+            frame, {TERRAIN_GLACIER: [_crs_box(10, 8, 30, 24)]},
+            fit=InsertFit(xy_clearance_mm=0.07, body_relief_max_mm=0.25))
+        body = next(b for bs in layout.insert_bodies.values()
+                    for b in bs if b is not None)
+        coords = np.asarray(body.exterior.coords)
+        assert np.array_equal(coords, coords.astype(np.float32).astype(np.float64))
+
+    def test_no_relief_without_the_flag(self):
+        frame = _frame()
+        layout = build_terrain_layout(
+            frame, {TERRAIN_GLACIER: [_crs_box(10, 8, 30, 24)]},
+            fit=InsertFit(xy_clearance_mm=0.07))
+        assert all(b is None
+                   for bs in layout.insert_bodies.values() for b in bs)

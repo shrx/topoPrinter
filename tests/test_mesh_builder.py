@@ -34,12 +34,12 @@ def _bowl():
     return 100.0 + 40.0 * np.hypot(xx - COLS / 2, yy - ROWS / 2) / (COLS / 2)
 
 
-def _build(class_geometries, **mesh_kwargs):
+def _build(class_geometries, fit=None, **mesh_kwargs):
     frame = _frame()
     layout = build_terrain_layout(
         frame, class_geometries,
-        fit=InsertFit(xy_clearance_mm=0.07, corner_relief_mm=0.25,
-                      corner_min_angle_deg=90.0))
+        fit=fit or InsertFit(xy_clearance_mm=0.07, corner_relief_mm=0.25,
+                             corner_min_angle_deg=90.0))
     meshes = build_terrain_meshes(layout, frame, _bowl(), 30.0, 1.0, BASE_MM,
                                   THICK_MM, insert_z_clearance_mm=Z_CLEAR_MM,
                                   **mesh_kwargs)
@@ -134,3 +134,57 @@ class TestWaterLowering:
     def test_a_drop_below_the_model_floor_is_refused(self):
         with pytest.raises(ValueError, match="lake-lowering"):
             _build(_water_geoms(), water_lowering_mm=BASE_MM)
+
+
+class TestInsertCollarSplit:
+    """Body relief builds an insert as a collar prism + a relieved body prism."""
+
+    FIT = InsertFit(xy_clearance_mm=0.07, corner_relief_mm=0.25,
+                    corner_min_angle_deg=90.0, body_relief_max_mm=0.25)
+
+    def test_a_relieved_insert_is_two_watertight_prisms(self):
+        layout, meshes = _build(_water_geoms(), fit=self.FIT,
+                                insert_collar_depth_mm=1.0)
+        assert all(b is not None for b in layout.insert_bodies[TERRAIN_WATER])
+        comps = _mesh(meshes["water"]).split(only_watertight=True)
+        assert len(comps) == 2
+        for c in comps:
+            assert c.is_watertight
+            assert c.volume > 0
+
+    def test_the_body_is_inset_and_reaches_the_floor(self):
+        layout, meshes = _build(_water_geoms(), fit=self.FIT,
+                                insert_collar_depth_mm=1.0)
+        body, collar = sorted(_mesh(meshes["water"]).split(only_watertight=True),
+                              key=lambda c: c.vertices[:, 2].min())
+        # The collar's wall is the collar depth; the body continues from there to
+        # the flat bottom, (thickness - z clearance) below the part's lowest top.
+        assert (collar.vertices[:, 2].min() - body.vertices[:, 2].min()
+                ) == pytest.approx((THICK_MM - Z_CLEAR_MM) - 1.0, abs=1e-6)
+        # In plan the body sits strictly inside the collar footprint on every
+        # side (the ramped relief for this part is ~0.2 mm).
+        (cx0, cy0, _), (cx1, cy1, _) = collar.bounds
+        (bx0, by0, _), (bx1, by1, _) = body.bounds
+        for gap in (bx0 - cx0, by0 - cy0, cx1 - bx1, cy1 - by1):
+            assert gap > 0.15
+
+    def test_the_base_is_untouched_by_the_split(self):
+        _l1, plain = _build(_water_geoms())
+        _l2, split = _build(_water_geoms(), fit=self.FIT,
+                            insert_collar_depth_mm=1.0)
+        assert np.array_equal(plain["rock"][0], split["rock"][0])
+        assert np.array_equal(plain["rock"][1], split["rock"][1])
+
+    def test_no_relief_keeps_one_prism(self):
+        _layout, meshes = _build(_water_geoms(), insert_collar_depth_mm=1.0)
+        comps = _mesh(meshes["water"]).split(only_watertight=True)
+        assert len(comps) == 1
+
+    def test_a_collar_swallowing_the_wall_is_refused(self):
+        with pytest.raises(ValueError, match="collar"):
+            _build(_water_geoms(), fit=self.FIT,
+                   insert_collar_depth_mm=THICK_MM - Z_CLEAR_MM)
+
+    def test_bodies_without_a_collar_depth_are_refused(self):
+        with pytest.raises(ValueError, match="collar"):
+            _build(_water_geoms(), fit=self.FIT, insert_collar_depth_mm=0.0)

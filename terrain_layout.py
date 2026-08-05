@@ -57,8 +57,8 @@ from bearing_utils import rotate_from_bearing_frame, rotate_to_bearing_frame
 from model_frame import ModelFrame
 from masks import (TERRAIN_NAMES, TERRAIN_PRECEDENCE, TERRAIN_ROCK,
                    overlay_precedence)
-from terrain_compose import (MIN_BLOB_MM, MIN_THICKNESS_MM, fretted_bit_moves,
-                             resolve_layers)
+from terrain_compose import (MIN_BLOB_MM, MIN_THICKNESS_MM, MIN_WALL_MM,
+                             fretted_bit_moves, resolve_layers)
 
 
 @dataclass(frozen=True)
@@ -78,6 +78,17 @@ class CutoutSpec:
     rect_corner2_lon: Optional[float] = None
 
 
+# Body-relief ramp endpoints, in perimeter (boundary length, holes included).
+# Zero relief at the perimeter of the smallest printable compact blob -- parts
+# that small are compliant and keep their full body. Full relief from
+# BODY_RELIEF_PMAX_MM up: on the Ararat test print every insert with >= ~150 mm
+# of boundary already needed real force to seat, and relief past "the body never
+# touches" costs nothing (the width gate keeps every wall printable), so the
+# exact endpoint is uncritical.
+BODY_RELIEF_P0_MM = 4.0 * MIN_BLOB_MM
+BODY_RELIEF_PMAX_MM = 150.0
+
+
 @dataclass(frozen=True)
 class InsertFit:
     """Fit tolerances for separately-printed inserts (see build_terrain_layout)."""
@@ -86,6 +97,7 @@ class InsertFit:
     z_clearance_mm: float = 0.0
     corner_relief_mm: float = 0.0
     corner_min_angle_deg: float = 45.0
+    body_relief_max_mm: float = 0.0
 
 
 @dataclass
@@ -113,6 +125,14 @@ class TerrainLayout:
     arrangement (``snap_arrangement``). The outline and every pocket are unions of
     that arrangement's cells, so the constraint edges and the draped regions can
     never describe different line work.
+
+    ``insert_bodies`` runs parallel to each ``insert_parts`` list: the part's
+    relieved body footprint (everything below the collar band, see
+    ``_insert_body``), or None when the part is printed as one full-footprint
+    prism. Body boundaries are the one line work deliberately OUTSIDE the shared
+    arrangement: they seat against nothing (the relief exists so they never
+    touch), and where the width gate keeps a thin feature they reuse the part's
+    own already-final boundary coordinates rather than deriving a second copy.
     """
 
     base_class: int
@@ -122,6 +142,8 @@ class TerrainLayout:
     insert_parts: Dict[int, List[ShapelyPolygon]] = field(default_factory=dict)
     pocket_floor_refs: List[Optional[ShapelyPolygon]] = field(default_factory=list)
     noded_boundaries: object = None
+    insert_bodies: Dict[int, List[Optional[Union[ShapelyPolygon, MultiPolygon]]]] = \
+        field(default_factory=dict)
 
     @property
     def base_name(self) -> str:
@@ -304,6 +326,62 @@ def _inset_polygon(polygon_mm, distance_mm: float, outline=None):
     if inset.is_empty:
         return None
     return inset
+
+
+def _insert_body(part, relief_max_mm: float, frame, output_resolution):
+    """The relieved body footprint below a printed insert part's collar band.
+
+    Only the collar -- the top band of the insert, at the part's own footprint --
+    needs the designed fit: it alone sets the visible seam. Everything below it is
+    inset by an extra relief so the body never touches the pocket wall, cutting
+    the mating contact to the collar band and giving the insert a lead-in.
+
+    The relief ramps with the part's boundary length (holes included): position
+    error and insertion force both grow with how much wall a part carries, while
+    the smallest parts comply elastically and need none. Width gate: where the
+    local width cannot afford the full relief and still leave a printable wall
+    (``MIN_WALL_MM``), the footprint is kept unchanged -- a thin fin keeps its
+    full width instead of thinning below what the nozzle can lay down.
+
+    Returns the body (Multi)Polygon, densified and quantized like all final line
+    work, or None when the part gets no relief (below the ramp, or thin
+    everywhere) and is printed as one full-footprint prism.
+    """
+    t = ((part.length - BODY_RELIEF_P0_MM)
+         / (BODY_RELIEF_PMAX_MM - BODY_RELIEF_P0_MM))
+    relief = relief_max_mm * min(max(t, 0.0), 1.0)
+    if relief <= 0:
+        return None
+    # The width test is an opening, but with a MITRE dilation, not
+    # ``open_min_width``'s disc: a disc opening rounds every convex corner, so
+    # each sharp corner tip would test "thin" and stay a full-footprint sliver.
+    # The mitre rebuilds corners exactly (up to the default limit -- a spike too
+    # sharp for it really is thin at the tip and belongs in the keep).
+    h = 0.5 * (MIN_WALL_MM + 2.0 * relief)
+    wide = part.buffer(-h).buffer(h, join_style="mitre")
+
+    # A keep is a wall the printer lays down at full width, so a keep piece must
+    # have a MIN_WALL-wide core somewhere; what fails that test is not a thin
+    # feature but junction debris of the difference (hairline quads along the
+    # walls, well above f32 resolution yet armless razor slivers that leave the
+    # prism builder with open shells). Selection is by PIECE, so a surviving
+    # keep's outline stays the part's own reused coordinates.
+    def _has_wall_core(p):
+        return not p.buffer(-0.5 * MIN_WALL_MM).is_empty
+
+    keep = [p for p in iter_polygon_components(part.difference(wide))
+            if _has_wall_core(p)]
+    body = unary_union([part.buffer(-relief), *keep]).buffer(0)
+    # The same rule prunes the union: an eroded remnant narrower than MIN_WALL
+    # everywhere (a region between the gate and vanishing) supports nothing.
+    kept = [p for p in iter_polygon_components(body) if _has_wall_core(p)]
+    if not kept:
+        return None
+    body = kept[0] if len(kept) == 1 else MultiPolygon(kept)
+    if part.area - body.area <= 0:
+        return None
+    body = densify_on_grid(body, frame)
+    return _quantize_to_f32(body, output_resolution)
 
 
 def _corner_reliefs(component, clearance_mm: float, relief_mm: float,
@@ -643,7 +721,9 @@ def build_terrain_layout(
             polygon); ``corner_relief_mm`` adds extra clearance at sharp corners to
             defeat FDM inside-corner over-extrusion. Zero gives a touching fit for
             one-piece multimaterial printing. ``z_clearance_mm`` is applied by the
-            mesh builder, which owns the floors.
+            mesh builder, which owns the floors. ``body_relief_max_mm`` caps the
+            extra inset of each part's below-collar body (``_insert_body``); 0
+            keeps every insert a single full-footprint prism.
     """
     if base_class is None:
         base_class = TERRAIN_ROCK
@@ -1009,6 +1089,18 @@ def build_terrain_layout(
     if not covered.is_empty:
         base_outline = covered
 
+    # Relieved body footprints, one per printed part, from the parts' FINAL
+    # (arrangement-rebuilt) geometry. A touching fit has no separately-printed
+    # walls to relieve, so bodies exist only alongside a real clearance.
+    insert_bodies: Dict[int, List[Optional[ShapelyPolygon]]] = {}
+    for tc in all_overlay_classes:
+        if fit.body_relief_max_mm > 0 and fit.xy_clearance_mm > 0:
+            insert_bodies[tc] = [
+                _insert_body(p, fit.body_relief_max_mm, frame, output_resolution)
+                for p in insert_parts[tc]]
+        else:
+            insert_bodies[tc] = [None] * len(insert_parts[tc])
+
     return TerrainLayout(
         base_class=base_class,
         overlay_classes=all_overlay_classes,
@@ -1017,4 +1109,5 @@ def build_terrain_layout(
         insert_parts=insert_parts,
         pocket_floor_refs=pocket_floor_refs,
         noded_boundaries=noded_boundaries,
+        insert_bodies=insert_bodies,
     )
