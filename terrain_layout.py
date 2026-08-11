@@ -328,13 +328,20 @@ def _inset_polygon(polygon_mm, distance_mm: float, outline=None):
     return inset
 
 
-def _insert_body(part, relief_max_mm: float, frame, output_resolution):
+def _insert_body(part, relief_max_mm: float, frame, output_resolution,
+                 outline=None):
     """The relieved body footprint below a printed insert part's collar band.
 
     Only the collar -- the top band of the insert, at the part's own footprint --
     needs the designed fit: it alone sets the visible seam. Everything below it is
     inset by an extra relief so the body never touches the pocket wall, cutting
     the mating contact to the collar band and giving the insert a lead-in.
+
+    Like the clearance inset, the relief is measured to IN-PRINT neighbours only
+    (``outline`` given): at the cutout rim there is no pocket wall to bind
+    against, so the body keeps the rim edge and the print's silhouette stays a
+    full-height face. A rim-thinned body also loses material from both sides of
+    a rim bit at once -- the 2026-08 fit-test print detached such a bit.
 
     The relief ramps with the part's boundary length (holes included): position
     error and insertion force both grow with how much wall a part carries, while
@@ -371,7 +378,8 @@ def _insert_body(part, relief_max_mm: float, frame, output_resolution):
 
     keep = [p for p in iter_polygon_components(part.difference(wide))
             if _has_wall_core(p)]
-    body = unary_union([part.buffer(-relief), *keep]).buffer(0)
+    eroded = _inset_polygon(part, relief, outline=outline)
+    body = unary_union(([eroded] if eroded is not None else []) + keep).buffer(0)
     # The same rule prunes the union: an eroded remnant narrower than MIN_WALL
     # everywhere (a region between the gate and vanishing) supports nothing.
     kept = [p for p in iter_polygon_components(body) if _has_wall_core(p)]
@@ -1096,7 +1104,8 @@ def build_terrain_layout(
     for tc in all_overlay_classes:
         if fit.body_relief_max_mm > 0 and fit.xy_clearance_mm > 0:
             insert_bodies[tc] = [
-                _insert_body(p, fit.body_relief_max_mm, frame, output_resolution)
+                _insert_body(p, fit.body_relief_max_mm, frame, output_resolution,
+                             outline=base_outline)
                 for p in insert_parts[tc]]
         else:
             insert_bodies[tc] = [None] * len(insert_parts[tc])

@@ -583,6 +583,35 @@ class TestInsertBodyRelief:
         strip = box(10.0, 20.0, 90.0, 20.8)    # long enough for full relief
         assert self._body(strip) is None
 
+    def test_the_body_stays_flush_at_the_rim(self):
+        """The relief is measured to in-print neighbours only: at the cutout rim
+        there is no pocket wall, so the body keeps the rim edge -- a rim-thinned
+        body loses both sides of a rim bit at once (detached in the fit-test
+        print)."""
+        frame = _frame()
+        outline = box(10.0, 10.0, 60.0, 50.0)
+        part = box(20.0, 20.0, 60.0, 40.0)     # flush at the rim x=60
+        body = _insert_body(part, 0.25, frame, frame.output_resolution,
+                            outline=outline)
+        assert body.bounds[2] == pytest.approx(60.0, abs=1e-6)
+        # while every in-print wall still gets the full ramp relief
+        assert body.bounds[0] - part.bounds[0] == pytest.approx(
+            self._ramp(part), abs=1e-4)
+
+    def test_layout_bodies_stay_flush_at_the_rim(self):
+        frame = _frame()
+        outline = box(10.0, 10.0, 60.0, 50.0)
+        layout = build_terrain_layout(
+            frame, {TERRAIN_GLACIER: [_crs_geom(box(30.0, 20.0, 70.0, 40.0))]},
+            outline=outline,
+            fit=InsertFit(xy_clearance_mm=0.5, body_relief_max_mm=0.25))
+        parts = layout.insert_parts[TERRAIN_GLACIER]
+        i = max(range(len(parts)), key=lambda k: parts[k].area)
+        part, body = parts[i], layout.insert_bodies[TERRAIN_GLACIER][i]
+        assert part.bounds[2] == pytest.approx(60.0, abs=1e-4)
+        assert body is not None
+        assert body.bounds[2] == pytest.approx(60.0, abs=1e-4)
+
     def test_bodies_run_parallel_to_the_parts(self):
         frame = _frame()
         layout = build_terrain_layout(
