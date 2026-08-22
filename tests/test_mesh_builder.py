@@ -137,34 +137,50 @@ class TestWaterLowering:
 
 
 class TestInsertCollarSplit:
-    """Body relief builds an insert as a collar prism + a relieved body prism."""
+    """Body relief steps an insert's wall inward below the collar band."""
 
     FIT = InsertFit(xy_clearance_mm=0.07, corner_relief_mm=0.25,
                     corner_min_angle_deg=90.0, body_relief_max_mm=0.25)
 
-    def test_a_relieved_insert_is_two_watertight_prisms(self):
+    def test_a_relieved_insert_is_one_watertight_shell(self):
+        """The step is a wall feature of one solid, not a second body: no
+        internal interface, so slicer object-splitting cannot take the relief
+        off the top surface, and no face exists twice."""
         layout, meshes = _build(_water_geoms(), fit=self.FIT,
                                 insert_collar_depth_mm=1.0)
         assert all(b is not None for b in layout.insert_bodies[TERRAIN_WATER])
-        comps = _mesh(meshes["water"]).split(only_watertight=True)
-        assert len(comps) == 2
-        for c in comps:
-            assert c.is_watertight
-            assert c.volume > 0
+        mesh = _mesh(meshes["water"])
+        comps = mesh.split(only_watertight=True)
+        assert len(comps) == 1
+        assert comps[0].is_watertight
+        assert comps[0].volume > 0
+        _, vid = np.unique(np.asarray(mesh.vertices).round(6), axis=0,
+                           return_inverse=True)
+        tri_key = np.sort(vid[mesh.faces], axis=1)
+        assert len(np.unique(tri_key, axis=0)) == len(tri_key)
 
-    def test_the_body_is_inset_and_reaches_the_floor(self):
+    def test_the_wall_steps_inward_at_the_collar_depth(self):
         layout, meshes = _build(_water_geoms(), fit=self.FIT,
                                 insert_collar_depth_mm=1.0)
-        body, collar = sorted(_mesh(meshes["water"]).split(only_watertight=True),
-                              key=lambda c: c.vertices[:, 2].min())
-        # The collar's wall is the collar depth; the body continues from there to
-        # the flat bottom, (thickness - z clearance) below the part's lowest top.
-        assert (collar.vertices[:, 2].min() - body.vertices[:, 2].min()
-                ) == pytest.approx((THICK_MM - Z_CLEAR_MM) - 1.0, abs=1e-6)
-        # In plan the body sits strictly inside the collar footprint on every
-        # side (the ramped relief for this part is ~0.2 mm).
-        (cx0, cy0, _), (cx1, cy1, _) = collar.bounds
-        (bx0, by0, _), (bx1, by1, _) = body.bounds
+        mesh = _mesh(meshes["water"])
+        verts = np.asarray(mesh.vertices)
+        # A column on the stepped wall carries three vertices: the DEM top, the
+        # band's underside exactly the collar depth below it, and the bottom.
+        _, col, counts = np.unique(verts[:, :2].round(6), axis=0,
+                                   return_inverse=True, return_counts=True)
+        stepped = np.where(counts == 3)[0]
+        assert len(stepped) > 0
+        for ci in stepped:
+            z = np.sort(verts[col == ci, 2])
+            assert z[2] - z[1] == pytest.approx(1.0, abs=1e-6)   # collar depth
+            assert z[1] > z[0]                                   # body wall below
+        # In plan the below-band footprint (the bottom cap) sits strictly inside
+        # the collar footprint (all vertices) on every side; the ramped relief
+        # for this part is ~0.2 mm.
+        bottom = verts[:, 2].min()
+        bot = verts[verts[:, 2] < bottom + 1e-6, :2]
+        (cx0, cy0), (cx1, cy1) = verts[:, :2].min(axis=0), verts[:, :2].max(axis=0)
+        (bx0, by0), (bx1, by1) = bot.min(axis=0), bot.max(axis=0)
         for gap in (bx0 - cx0, by0 - cy0, cx1 - bx1, cy1 - by1):
             assert gap > 0.15
 

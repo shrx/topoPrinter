@@ -430,15 +430,110 @@ def build_region_prism_fast(poly, top_fn, bottom_fn, frame, resolution):
     verts[:n, :2] = xy; verts[:n, 2] = top_fn(xy)
     verts[n:, :2] = xy; verts[n:, 2] = bottom_fn(xy)
 
-    de = np.vstack((top_faces[:, [0, 1]], top_faces[:, [1, 2]], top_faces[:, [2, 0]]))
-    key = np.minimum(de[:, 0], de[:, 1]) * np.int64(2 ** 32) + np.maximum(de[:, 0], de[:, 1])
-    _, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
-    wall_de = de[cnt[inv] == 1]
-    a, b = wall_de[:, 0], wall_de[:, 1]
+    a, b = _once_used_edges(top_faces)
     faces = np.vstack((top_faces, top_faces[:, ::-1] + n,
                        np.column_stack((a, b + n, b)),
                        np.column_stack((a, a + n, b + n))))
     return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+
+def _once_used_edges(faces):
+    """Directed boundary edges of a face set: those used by exactly one triangle.
+
+    For CCW-from-above faces these traverse the region's boundary with the region
+    on the left, so a wall hung from ``(a, b)`` faces outward.
+    """
+    de = np.vstack((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
+    key = np.minimum(de[:, 0], de[:, 1]) * np.int64(2 ** 32) + np.maximum(de[:, 0], de[:, 1])
+    _, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
+    wall_de = de[cnt[inv] == 1]
+    return wall_de[:, 0], wall_de[:, 1]
+
+
+def build_stepped_prism(outer, inner, top_fn, mid_fn, bottom_fn, frame, resolution):
+    """One watertight solid whose wall steps inward at the mid surface.
+
+    ``outer`` is the full footprint, ``inner`` the footprint below the step
+    (``inner`` within ``outer``, flush with it wherever no step exists).  The
+    solid is bounded by ``top_fn`` over ``outer``, a down-facing shoulder at
+    ``mid_fn`` over ``outer`` minus ``inner``, ``bottom_fn`` under ``inner``,
+    an outer wall from top to mid, and an inner wall from mid to bottom.
+
+    Everything comes from ONE constrained Delaunay triangulation whose
+    segments are the noded union of both boundaries, so every seam vertex is
+    shared and the result is a single connected 2-manifold: no internal
+    interface between the tiers, no duplicate faces, no boolean.  Where the
+    boundaries are flush the two wall bands stack on the same columns through
+    a shared mid vertex, so no T-vertex arises at a step's end either.
+    Returns a trimesh.Trimesh, or None if ``outer`` has no area on the grid.
+    """
+    import triangle as _triangle
+
+    lines = unary_union([outer.boundary, inner.boundary])
+    ring_xy = []
+    for ls in ([lines] if lines.geom_type == "LineString"
+               else shapely.get_parts(shapely.line_merge(lines))):
+        c = np.asarray(ls.coords, float)
+        if len(c) >= 2:
+            ring_xy.append(c)
+    if not ring_xy:
+        return None
+    ring_all = np.vstack(ring_xy)
+    grid_xy = _interior_grid_points(outer, lines, frame, resolution)
+    allxy = (np.vstack((ring_all, grid_xy)) if len(grid_xy) else ring_all).astype(float)
+    # f32 interning, exactly as in _region_top_surface: coincident stretches of the
+    # two boundaries (the cutout rim, full-width thin features) collapse to one
+    # vertex/segment set here instead of becoming overlapping constraints.
+    _, first, inv = np.unique(allxy.astype(np.float32), axis=0,
+                              return_index=True, return_inverse=True)
+    V = allxy[first]
+    segs = []
+    off = 0
+    for c in ring_xy:
+        m = len(c)
+        idx = inv[off:off + m]; off += m
+        segs.append(np.column_stack((idx[:-1], idx[1:])))
+    seg = np.vstack(segs)
+    seg = seg[seg[:, 0] != seg[:, 1]]
+    seg = np.unique(np.sort(seg, axis=1), axis=0)
+    if not len(seg):
+        return None
+
+    B = _triangle.triangulate({"vertices": V, "segments": seg}, "pYQ")
+    Vt = B["vertices"]; T = B["triangles"]
+    cen = Vt[T].mean(axis=1)
+    keep = shapely.contains_xy(outer, cen[:, 0], cen[:, 1])
+    T = T[keep]; cen = cen[keep]
+    if not len(T):
+        return None
+    a3, b3, c3 = Vt[T[:, 0]], Vt[T[:, 1]], Vt[T[:, 2]]
+    cw = ((b3[:, 0] - a3[:, 0]) * (c3[:, 1] - a3[:, 1])
+          - (b3[:, 1] - a3[:, 1]) * (c3[:, 0] - a3[:, 0])) < 0
+    T[cw] = T[cw][:, ::-1]
+    in_inner = shapely.contains_xy(inner, cen[:, 0], cen[:, 1])
+
+    n = len(Vt)
+    verts = np.empty((3 * n, 3))
+    verts[:n, :2] = verts[n:2 * n, :2] = verts[2 * n:, :2] = Vt
+    verts[:n, 2] = top_fn(Vt)
+    verts[n:2 * n, 2] = mid_fn(Vt)
+    verts[2 * n:, 2] = bottom_fn(Vt)
+
+    oa, ob = _once_used_edges(T)                # outer boundary: wall top -> mid
+    ia, ib = _once_used_edges(T[in_inner])      # inner boundary: wall mid -> bottom
+    faces = np.vstack((T,                                       # top, up
+                       T[~in_inner][:, ::-1] + n,               # shoulder, down
+                       T[in_inner][:, ::-1] + 2 * n,            # bottom, down
+                       np.column_stack((oa, ob + n, ob)),
+                       np.column_stack((oa, oa + n, ob + n)),
+                       np.column_stack((ia + n, ib + 2 * n, ib + n)),
+                       np.column_stack((ia + n, ia + 2 * n, ib + 2 * n))))
+    # Columns that need no mid or bottom copy (interior of the inner/outer region)
+    # leave unreferenced vertices behind; reindex them away.
+    used = np.unique(faces)
+    remap = np.empty(3 * n, np.int64)
+    remap[used] = np.arange(len(used))
+    return trimesh.Trimesh(vertices=verts[used], faces=remap[faces], process=False)
 
 
 def build_base_solid(base_outline, boundary_geoms, pockets, pocket_top_fns,
@@ -681,10 +776,11 @@ def build_terrain_meshes(
             DEM like every other class.
         insert_collar_depth_mm: how far below its top surface an insert keeps the
             layout's designed fit. A part the layout gave a relieved body
-            (``layout.insert_bodies``) is built as two stacked prisms: the collar,
-            the part footprint from the DEM down this depth, and the body, the
-            relieved footprint from there to the floor. Only the collar can touch
-            the pocket wall; parts without a body are one prism as ever.
+            (``layout.insert_bodies``) is built as one stepped shell: the part
+            footprint from the DEM down this depth (the collar), then the wall
+            steps inward to the relieved footprint for the rest of the way to
+            the floor. Only the collar can touch the pocket wall; parts without
+            a body are one straight prism as ever.
 
     Returns:
         dict mapping terrain name to (vertices, faces, max_z) or None.
@@ -842,14 +938,14 @@ def build_terrain_meshes(
                 split = split and pmin - drop - insert_collar_depth_mm > bottom_z
             if split:
                 # Collar: the fit band, on the part's own footprint. Body: the
-                # relieved footprint, from the band down to the floor. Two
-                # separately watertight prisms sharing the DEM-shaped interface.
+                # relieved footprint, from the band down to the floor. One
+                # stepped shell whose wall steps inward at the band's underside,
+                # so the insert stays a single connected solid with no internal
+                # interface.
                 mid_fn = (lambda xy, _top=top_fn:
                           _top(xy) - insert_collar_depth_mm)
-                built = (build_region_prism_fast(part, top_fn, mid_fn, frame,
-                                                 resolution),
-                         build_region_prism_fast(relieved, mid_fn, bottom_fn,
-                                                 frame, resolution))
+                built = (build_stepped_prism(part, relieved, top_fn, mid_fn,
+                                             bottom_fn, frame, resolution),)
             else:
                 built = (build_region_prism_fast(part, top_fn, bottom_fn, frame,
                                                  resolution),)
